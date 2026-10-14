@@ -1239,6 +1239,14 @@ namespace {
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
 using m0_internal::Rw07FixedFixtureBinding;
 #include "core/graph/m0_rw07_equal7_single_bindings.inc"
+#include "core/graph/m0_rw07_equal7_chain_bindings.inc"
+std::string M0Equal7ChainIntermediateBytes() {
+  const auto& binding = kRw07CallerEqual7IntermediateBindings[0];
+  const auto bytes = m0_internal::FixedBytes(binding.wire, binding.wire_size);
+  const auto canonical = m0_internal::FixedBytes(binding.canonical, binding.canonical_size);
+  ORT_ENFORCE(m0_internal::FixedCanonicalWire(bytes, binding.message_id) == canonical, "RW07_CHAIN_CANONICAL_BINDING");
+  return canonical;
+}
 std::string M0Equal7SingleBytes(size_t index) {
   ORT_ENFORCE(index < std::size(kRw07CallerEqual7SingleBindings), "RW07_SINGLE_BINDING_INDEX");
   const auto& binding = kRw07CallerEqual7SingleBindings[index];
@@ -1249,11 +1257,12 @@ std::string M0Equal7SingleBytes(size_t index) {
   return bytes;
 }
 #endif
-std::string M0OriginalRecipeBytes(bool equal7_single) {
+std::string M0OriginalRecipeBytes(bool equal7_single, bool equal7_chain = false) {
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
   if (equal7_single) return M0Equal7SingleBytes(0);
+  if (equal7_chain) return m0_internal::CheckedFixedBytes("caller-equal7.model-original");
 #else
-  ORT_ENFORCE(!equal7_single, "RW07_SINGLE_QUALIFICATION_CLOSED");
+  ORT_ENFORCE(!equal7_single && !equal7_chain, "RW07_SINGLE_QUALIFICATION_CLOSED");
 #endif
   return m0_internal::CheckedFixedBytes("nested-depth2.model-original");
 }
@@ -1299,7 +1308,7 @@ M0SyntheticOwnerV1::M0SyntheticOwnerV1(std::shared_ptr<M0SyntheticOwnerReceiptV1
     : recipe_(fixed_recipe), audit_(std::move(audit)), nonce_(M0FreshOwnerNonce()) {
   audit_->owner_nonce = nonce_;
   ONNX_NAMESPACE::ModelProto recipe;
-  ORT_ENFORCE(recipe.ParseFromString(M0OriginalRecipeBytes(recipe_ == Recipe::kEqual7)),
+  ORT_ENFORCE(recipe.ParseFromString(M0OriginalRecipeBytes(recipe_ == Recipe::kEqual7, recipe_ == Recipe::kEqual7Chain)),
               "RW07_FIXED_MODEL_PARSE");
   auto normalized = recipe;
   normalized.clear_opset_import();
@@ -1469,10 +1478,13 @@ void M0SyntheticOwnerV1::ValidateBacking(const Model& model) {
       continue;
     }
     const auto& graph = *entry.graph;
-    ORT_ENFORCE(graph.nodes_.size() == 1 && graph.nodes_[0] &&
-                    graph.nodes_[0]->InputDefs().size() == 1 && graph.nodes_[0]->InputDefs()[0] &&
-                    graph.nodes_[0]->OutputDefs().size() == 1 && graph.nodes_[0]->OutputDefs()[0],
-                "RW07_OWNER_BACKING_NODE_PORTS");
+    ORT_ENFORCE(graph.nodes_.size() == NodeCount(slot), "RW07_OWNER_BACKING_NODE_COUNT");
+    for (size_t index = 0; index < NodeCount(slot); ++index) {
+      const auto* node = graph.nodes_[index].get();
+      ORT_ENFORCE(node && node->InputDefs().size() == 1 && node->InputDefs()[0] &&
+                      node->OutputDefs().size() == 1 && node->OutputDefs()[0],
+                  "RW07_OWNER_BACKING_NODE_PORTS");
+    }
     if (slot == 0) {
       ORT_ENFORCE(entry.backing == &model.model_proto_.graph(), "RW07_OWNER_ROOT_BACKING_LINK");
     } else if (slot < 3) {
@@ -1517,13 +1529,25 @@ void M0SyntheticOwnerV1::ValidateBacking(const Model& model) {
                     : context.inferred_subgraphs.empty(),
                 "RW07_OWNER_INFERRED_CHILD_SET");
     const auto* node = graph.nodes_[0].get();
-    const auto* expected_original = slot < 3 ? &entry.backing->node(0) : nullptr;
+    for (size_t index = 0; index < NodeCount(slot); ++index) {
+      const auto* expected_original = slot < 3 ? &entry.backing->node(static_cast<int>(index)) : nullptr;
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
-    if (retained_descriptor_[slot] ||
-        (issued_generation_ && issued_node_stage_[slot] >= IssuedNodeStage::kChecked)) expected_original = nullptr;
+      if (retained_descriptor_[slot] ||
+          (issued_generation_ && NodeStage(slot, index) >= IssuedNodeStage::kChecked)) expected_original = nullptr;
 #endif
-    ORT_ENFORCE(node->GetOriginalNodeProto() == expected_original,
-                "RW07_OWNER_ORIGINAL_NODE_LINEAGE");
+      ORT_ENFORCE(graph.nodes_[index]->GetOriginalNodeProto() == expected_original,
+                  "RW07_OWNER_ORIGINAL_NODE_LINEAGE");
+    }
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+    ORT_ENFORCE(node_cursor_[slot] <= NodeCount(slot) &&
+                    (node_cursor_[slot] == NodeCount(slot) || NodeStage(slot, node_cursor_[slot]) != IssuedNodeStage::kDone),
+                "RW07_OWNER_NODE_CURSOR");
+    for (size_t index = 0; index < 2; ++index) {
+      if (index < node_cursor_[slot]) ORT_ENFORCE(NodeStage(slot, index) == IssuedNodeStage::kDone, "RW07_OWNER_DONE_PREFIX");
+      if (index > node_cursor_[slot] || index >= NodeCount(slot))
+        ORT_ENFORCE(NodeStage(slot, index) == IssuedNodeStage::kOriginal, "RW07_OWNER_UNVISITED_NODE");
+    }
+#endif
     bool context_cleared = preparation_[slot] == Preparation::kOriginal;
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
     context_cleared |= finalization_[slot] >= Finalization::kContextCleared;
@@ -1543,16 +1567,21 @@ void M0SyntheticOwnerV1::ValidateBacking(const Model& model) {
                       context.node_name_to_index.empty() && context.nodes_with_subgraphs.empty(),
                   "RW07_OWNER_INITIAL_RESOLVE_CONTEXT");
     } else {
-      const auto output = context.output_args.find(node->OutputDefs()[0]->Name());
-      const auto name = context.node_name_to_index.find(node->Name());
-      ORT_ENFORCE(context.output_args.size() == 1 && output != context.output_args.end() &&
-                      output->second.first == node && output->second.second == 0 &&
+      ORT_ENFORCE(context.output_args.size() == NodeCount(slot) &&
                       context.inputs_and_initializers.size() == 1 &&
                       context.inputs_and_initializers.contains(node->InputDefs()[0]->Name()) &&
-                      context.node_name_to_index.size() == 1 && name != context.node_name_to_index.end() &&
-                      name->second == 0 && context.nodes_with_subgraphs.size() == (HasChild(slot) ? 1u : 0u) &&
+                      context.node_name_to_index.size() == NodeCount(slot) &&
+                      context.nodes_with_subgraphs.size() == (HasChild(slot) ? 1u : 0u) &&
                       (!HasChild(slot) || context.nodes_with_subgraphs.contains(const_cast<Node*>(node))),
                   "RW07_OWNER_PREPARED_RESOLVE_CONTEXT");
+      for (size_t index = 0; index < NodeCount(slot); ++index) {
+        const auto* current = graph.nodes_[index].get();
+        const auto output = context.output_args.find(current->OutputDefs()[0]->Name());
+        const auto name = context.node_name_to_index.find(current->Name());
+        ORT_ENFORCE(output != context.output_args.end() && output->second.first == current && output->second.second == 0 &&
+                        name != context.node_name_to_index.end() && name->second == index,
+                    "RW07_OWNER_PREPARED_NODE_CONTEXT");
+      }
     }
     bool retained_lookups = false;
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
@@ -1562,14 +1591,18 @@ void M0SyntheticOwnerV1::ValidateBacking(const Model& model) {
       ORT_ENFORCE(graph.node_arg_to_producer_node_.empty() && graph.node_arg_to_consumer_nodes_.empty(),
                   "RW07_OWNER_PREMATURE_LOOKUPS");
     } else {
-      const auto producer = graph.node_arg_to_producer_node_.find(node->OutputDefs()[0]->Name());
-      const auto consumers = graph.node_arg_to_consumer_nodes_.find(node->InputDefs()[0]->Name());
-      ORT_ENFORCE(graph.node_arg_to_producer_node_.size() == 1 &&
-                      producer != graph.node_arg_to_producer_node_.end() && producer->second == 0 &&
-                      graph.node_arg_to_consumer_nodes_.size() == 1 &&
-                      consumers != graph.node_arg_to_consumer_nodes_.end() &&
-                      consumers->second == std::unordered_set<NodeIndex>{0},
-                  "RW07_OWNER_PREPARED_LOOKUPS");
+      ORT_ENFORCE(graph.node_arg_to_producer_node_.size() == NodeCount(slot) &&
+                      graph.node_arg_to_consumer_nodes_.size() == NodeCount(slot),
+                  "RW07_OWNER_PREPARED_LOOKUP_COUNT");
+      for (size_t index = 0; index < NodeCount(slot); ++index) {
+        const auto* current = graph.nodes_[index].get();
+        const auto producer = graph.node_arg_to_producer_node_.find(current->OutputDefs()[0]->Name());
+        const auto consumers = graph.node_arg_to_consumer_nodes_.find(current->InputDefs()[0]->Name());
+        ORT_ENFORCE(producer != graph.node_arg_to_producer_node_.end() && producer->second == index &&
+                        consumers != graph.node_arg_to_consumer_nodes_.end() &&
+                        consumers->second == std::unordered_set<NodeIndex>{index},
+                    "RW07_OWNER_PREPARED_LOOKUPS");
+      }
     }
   }
 }
@@ -1594,6 +1627,14 @@ void M0SyntheticOwnerV1::ValidateProjection(const Graph* requested, size_t mecha
     // All entries must be live before the independent backing traversal.
     for (size_t listed_slot = 0; listed_slot < entries_.size(); ++listed_slot) {
       const auto& entry = entries_[listed_slot];
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+      if (!Listed(listed_slot))
+        ORT_ENFORCE(node_cursor_[listed_slot] == 0 && NodeStage(listed_slot, 0) == IssuedNodeStage::kOriginal &&
+                        NodeStage(listed_slot, 1) == IssuedNodeStage::kOriginal && !retained_descriptor_[listed_slot] &&
+                        !cached_pass_[listed_slot] && !issued_inferred_child_[listed_slot] && resolve_counts_[listed_slot] == 0 &&
+                        finalization_[listed_slot] == Finalization::kPending && preparation_[listed_slot] == Preparation::kOriginal,
+                    "RW07_ABSENT_SCOPE_HISTORY");
+#endif
       if (Listed(listed_slot))
         ORT_ENFORCE(entry.graph && entry.constructed && !entry.retired, "RW07_OWNER_SCOPE_SET");
       else
@@ -1679,16 +1720,29 @@ void M0SyntheticOwnerV1::ValidateProjection(const Graph* requested, size_t mecha
       ORT_ENFORCE(expected.ParseFromString(entry.original_canonical), "RW07_OWNER_EXPECTED_PARSE");
       const auto original = expected;
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
-      if (retained_descriptor_[slot] || (issued_generation_ && issued_node_stage_[slot] >= IssuedNodeStage::kPublished)) {
-        expected.mutable_output(0)->mutable_type()->CopyFrom(expected.input(0).type());
-      }
-      if (retained_descriptor_[slot] || (issued_generation_ && issued_node_stage_[slot] >= IssuedNodeStage::kDefaulted)) {
-        bool present = false;
-        for (const auto& attr : expected.node(0).attribute()) present |= attr.name() == "marker";
-        if (!present) {
-          auto* marker = expected.mutable_node(0)->add_attribute();
-          ORT_ENFORCE(marker->ParseFromString(m0_internal::CheckedFixedBytes("marker7")), "RW07_ISSUED_MARKER_PARSE");
+      for (size_t index = 0; index < NodeCount(slot); ++index) {
+        if (retained_descriptor_[slot] || (issued_generation_ && NodeStage(slot, index) >= IssuedNodeStage::kPublished)) {
+          if (NodeCount(slot) == 2 && index == 0)
+            expected.mutable_value_info(0)->mutable_type()->CopyFrom(expected.input(0).type());
+          else
+            expected.mutable_output(0)->mutable_type()->CopyFrom(expected.input(0).type());
         }
+        if (retained_descriptor_[slot] || (issued_generation_ && NodeStage(slot, index) >= IssuedNodeStage::kDefaulted)) {
+          bool present = false;
+          for (const auto& attr : expected.node(static_cast<int>(index)).attribute()) present |= attr.name() == "marker";
+          if (!present) {
+            auto* marker = expected.mutable_node(static_cast<int>(index))->add_attribute();
+            ORT_ENFORCE(marker->ParseFromString(m0_internal::CheckedFixedBytes("marker7")), "RW07_ISSUED_MARKER_PARSE");
+          }
+        }
+      }
+#endif
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+      if (recipe_ == Recipe::kEqual7Chain && slot == 0) {
+        if (retained_descriptor_[slot] || (issued_generation_ && NodeStage(slot, 1) >= IssuedNodeStage::kPublished))
+          ORT_ENFORCE(M0GraphCanonical(expected) == m0_internal::CheckedFixedBytes("caller-equal7.expected-live-post"), "RW07_CHAIN_FINAL_PROJECTION");
+        else if (issued_generation_ && NodeStage(slot, 0) >= IssuedNodeStage::kPublished)
+          ORT_ENFORCE(M0GraphCanonical(expected) == M0Equal7ChainIntermediateBytes(), "RW07_CHAIN_A_ONLY_PROJECTION");
       }
 #endif
       if (mechanical_phase != 0 && slot < 3) {
@@ -1712,7 +1766,7 @@ void M0SyntheticOwnerV1::ValidateProjection(const Graph* requested, size_t mecha
                             || retained_descriptor_[slot]
 #endif
                             )
-                               ? std::vector<NodeIndex>{0}
+                               ? (NodeCount(slot) == 2 ? std::vector<NodeIndex>{0, 1} : std::vector<NodeIndex>{0})
                                : std::vector<NodeIndex>{}) &&
                       graph.name_to_initial_tensor_.empty() && graph.ortvalue_initializers_.empty() &&
                       graph.sparse_tensor_names_.empty() && graph.graph_overridable_initializers_.empty() &&
@@ -1741,7 +1795,9 @@ void M0SyntheticOwnerV1::ValidateProjection(const Graph* requested, size_t mecha
         check_ports(graph.graph_inputs_excluding_initializers_, expected.input());
       else
         ORT_ENFORCE(graph.graph_inputs_excluding_initializers_.empty(), "RW07_OWNER_PARENTLESS_INPUT_PHASE");
-      ORT_ENFORCE(graph.value_info_.empty() && expected.value_info_size() == 0, "RW07_OWNER_VALUE_INFO");
+      ORT_ENFORCE(graph.value_info_.size() == static_cast<size_t>(expected.value_info_size()), "RW07_OWNER_VALUE_INFO");
+      for (const auto& value : expected.value_info())
+        ORT_ENFORCE(graph.value_info_.contains(graph.GetNodeArg(value.name())), "RW07_OWNER_VALUE_INFO_IDENTITY");
       InlinedHashMap<std::string, std::string> types;
       for (const auto& value : expected.input()) types.emplace(value.name(), value.SerializeAsString());
       for (const auto& value : expected.output()) types.emplace(value.name(), value.SerializeAsString());
@@ -1761,7 +1817,7 @@ void M0SyntheticOwnerV1::ValidateProjection(const Graph* requested, size_t mecha
         const ONNX_NAMESPACE::OpSchema* expected_op = nullptr;
         int expected_version = -1;
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
-        if (retained_descriptor_[slot] || (issued_generation_ && issued_node_stage_[slot] >= IssuedNodeStage::kSelected)) {
+        if (retained_descriptor_[slot] || (issued_generation_ && NodeStage(slot, static_cast<size_t>(index)) >= IssuedNodeStage::kSelected)) {
           expected_op = Schema(slot);
           expected_version = 1;
         }
@@ -1770,13 +1826,20 @@ void M0SyntheticOwnerV1::ValidateProjection(const Graph* requested, size_t mecha
                         node->InputArgCount() == std::vector<int>{1} && node->SinceVersion() == expected_version && node->Overload() == recipe.overload() &&
                         node->Description() == recipe.doc_string() && node->GetFunctionBody() == nullptr &&
                         node->GetExecutionProviderType().empty() && node->ControlInputs().empty() &&
-                        node->GetInputEdgesCount() == 0 && node->GetOutputEdgesCount() == 0 &&
+                        node->GetInputEdgesCount() == (NodeCount(slot) == 2 && preparation_[slot] >= Preparation::kConnected && index == 1 ? 1u : 0u) &&
+                        node->GetOutputEdgesCount() == (NodeCount(slot) == 2 && preparation_[slot] >= Preparation::kConnected && index == 0 ? 1u : 0u) &&
                         node->Name() == recipe.name() && node->OpType() == recipe.op_type() &&
                         node->Domain() == recipe.domain() && node->Op() == expected_op && node->ImplicitInputDefs().empty() &&
                         node->InputDefs().size() == static_cast<size_t>(recipe.input_size()) &&
                         node->OutputDefs().size() == static_cast<size_t>(recipe.output_size()) &&
                         node->GetAttributes().size() == static_cast<size_t>(recipe.attribute_size()),
                     "RW07_OWNER_NODE_CURRENT");
+        if (NodeCount(slot) == 2 && preparation_[slot] >= Preparation::kConnected) {
+          const auto& edge = index == 0 ? *node->OutputEdgesBegin() : *node->InputEdgesBegin();
+          ORT_ENFORCE(&edge.GetNode() == graph.nodes_[1 - index].get() && edge.GetSrcArgIndex() == 0 &&
+                          edge.GetDstArgIndex() == 0 && graph.nodes_[0]->OutputDefs()[0] == graph.nodes_[1]->InputDefs()[0],
+                      "RW07_CHAIN_EDGE_IDENTITY");
+        }
         for (int port = 0; port < recipe.input_size(); ++port) {
           ORT_ENFORCE(node->InputDefs()[port] == graph.GetNodeArg(recipe.input(port)) && node->InputDefs()[port]->Exists(), "RW07_OWNER_INPUT_SLOT");
         }
@@ -1907,10 +1970,10 @@ void M0SyntheticOwnerV1::ScopeLayer::Check(const Graph& graph) {
               "RW07_ISSUED_SCOPE_JOIN");
   owner.ValidateAll(&graph);
 }
-M0SyntheticOwnerV1::NodeLayer::NodeLayer(ScopeLayer& scope, const Node& node) : scope_(scope), node_(node) {
+M0SyntheticOwnerV1::NodeLayer::NodeLayer(ScopeLayer& scope, const Node& node) : scope_(scope), node_(node), index_(node.Index()) {
   Check();
-  ORT_ENFORCE(scope_.perform_entered_ &&
-                  scope_.permit_.generation_.owner.issued_node_stage_[scope_.slot_] == IssuedNodeStage::kOriginal,
+  ORT_ENFORCE(scope_.perform_entered_ && scope_.permit_.generation_.owner.node_cursor_[scope_.slot_] == index_ &&
+                  scope_.permit_.generation_.owner.NodeStage(scope_.slot_, index_) == IssuedNodeStage::kOriginal,
               "RW07_ISSUED_NODE_ENTRY");
 }
 M0SyntheticOwnerV1::NodeLayer::~NodeLayer() noexcept {
@@ -1919,42 +1982,44 @@ M0SyntheticOwnerV1::NodeLayer::~NodeLayer() noexcept {
 void M0SyntheticOwnerV1::NodeLayer::Check() {
   scope_.Check(*node_.GetContainingGraph());
   auto& owner = scope_.permit_.generation_.owner;
-  ORT_ENFORCE(owner.entries_[scope_.slot_].graph->GetNode(0) == &node_ && owner.issued_audit_, "RW07_ISSUED_NODE_JOIN");
+  ORT_ENFORCE(index_ < owner.NodeCount(scope_.slot_) && owner.entries_[scope_.slot_].graph->GetNode(index_) == &node_ &&
+                  owner.node_cursor_[scope_.slot_] == index_ && owner.issued_audit_,
+              "RW07_ISSUED_NODE_JOIN");
 }
 void M0SyntheticOwnerV1::NodeLayer::Checked() {
   auto& owner = scope_.permit_.generation_.owner;
-  ORT_ENFORCE(!owner.Poisoned() && owner.issued_node_stage_[scope_.slot_] == IssuedNodeStage::kOriginal &&
+  ORT_ENFORCE(!owner.Poisoned() && owner.NodeStage(scope_.slot_, index_) == IssuedNodeStage::kOriginal &&
                   !node_.GetOriginalNodeProto() && !node_.Op() && node_.SinceVersion() == -1,
               "RW07_ISSUED_CHECKER_TRANSITION");
-  owner.issued_node_stage_[scope_.slot_] = IssuedNodeStage::kChecked;
+  owner.NodeStage(scope_.slot_, index_) = IssuedNodeStage::kChecked;
   Check();
   ++owner.issued_audit_->source_checks;
 }
 void M0SyntheticOwnerV1::NodeLayer::Selected() {
   auto& owner = scope_.permit_.generation_.owner;
-  ORT_ENFORCE(!owner.Poisoned() && owner.issued_node_stage_[scope_.slot_] == IssuedNodeStage::kChecked &&
+  ORT_ENFORCE(!owner.Poisoned() && owner.NodeStage(scope_.slot_, index_) == IssuedNodeStage::kChecked &&
                   node_.Op() == owner.Schema(scope_.slot_) && node_.SinceVersion() == 1 &&
                   node_.InputArgCount() == std::vector<int>{1},
               "RW07_ISSUED_SELECTION_TRANSITION");
-  owner.issued_node_stage_[scope_.slot_] = IssuedNodeStage::kSelected;
+  owner.NodeStage(scope_.slot_, index_) = IssuedNodeStage::kSelected;
   Check();
   ++owner.issued_audit_->source_selections;
 }
 void M0SyntheticOwnerV1::NodeLayer::BeforeDefault(const ONNX_NAMESPACE::AttributeProto& attribute) {
   Check();
   auto& owner = scope_.permit_.generation_.owner;
-  ORT_ENFORCE(owner.issued_node_stage_[scope_.slot_] == IssuedNodeStage::kSelected &&
+  ORT_ENFORCE(owner.NodeStage(scope_.slot_, index_) == IssuedNodeStage::kSelected &&
                   attribute.SerializeAsString() == m0_internal::CheckedFixedBytes("marker7") &&
                   !node_.GetAttributes().contains("marker") && !owner.Poisoned(),
               "RW07_ISSUED_DEFAULT_PROVENANCE");
 }
 void M0SyntheticOwnerV1::NodeLayer::Defaulted() {
   auto& owner = scope_.permit_.generation_.owner;
-  ORT_ENFORCE(!owner.Poisoned() && owner.issued_node_stage_[scope_.slot_] == IssuedNodeStage::kSelected &&
+  ORT_ENFORCE(!owner.Poisoned() && owner.NodeStage(scope_.slot_, index_) == IssuedNodeStage::kSelected &&
                   node_.GetAttributes().contains("marker") &&
                   node_.GetAttributes().at("marker").SerializeAsString() == m0_internal::CheckedFixedBytes("marker7"),
               "RW07_ISSUED_DEFAULT_TRANSITION");
-  owner.issued_node_stage_[scope_.slot_] = IssuedNodeStage::kDefaulted;
+  owner.NodeStage(scope_.slot_, index_) = IssuedNodeStage::kDefaulted;
   Check();
   ++owner.issued_audit_->source_defaults;
 }
@@ -1962,25 +2027,25 @@ void M0SyntheticOwnerV1::NodeLayer::CachedSelected() {
   Check();
   auto& owner = scope_.permit_.generation_.owner;
   ORT_ENFORCE(owner.cached_pass_[scope_.slot_] && owner.retained_descriptor_[scope_.slot_] &&
-                  owner.issued_node_stage_[scope_.slot_] == IssuedNodeStage::kOriginal &&
+                  owner.NodeStage(scope_.slot_, index_) == IssuedNodeStage::kOriginal &&
                   !node_.GetOriginalNodeProto() && node_.Op() == owner.Schema(scope_.slot_) &&
                   node_.SinceVersion() == 1,
               "RW07_CACHED_SELECTION");
-  owner.issued_node_stage_[scope_.slot_] = IssuedNodeStage::kSelected;
+  owner.NodeStage(scope_.slot_, index_) = IssuedNodeStage::kSelected;
   Check();
   ++owner.issued_audit_->source_selections;
 }
 void M0SyntheticOwnerV1::NodeLayer::DefaultsVerified() {
   Check();
   auto& owner = scope_.permit_.generation_.owner;
-  if (owner.issued_node_stage_[scope_.slot_] == IssuedNodeStage::kDefaulted) return;
+  if (owner.NodeStage(scope_.slot_, index_) == IssuedNodeStage::kDefaulted) return;
   ORT_ENFORCE(((owner.cached_pass_[scope_.slot_] && owner.retained_descriptor_[scope_.slot_]) ||
-               (owner.recipe_ == Recipe::kEqual7 && scope_.slot_ == 0)) &&
-                  owner.issued_node_stage_[scope_.slot_] == IssuedNodeStage::kSelected &&
+               ((owner.recipe_ == Recipe::kEqual7 || owner.recipe_ == Recipe::kEqual7Chain) && scope_.slot_ == 0)) &&
+                  owner.NodeStage(scope_.slot_, index_) == IssuedNodeStage::kSelected &&
                   node_.GetAttributes().contains("marker") &&
                   node_.GetAttributes().at("marker").SerializeAsString() == m0_internal::CheckedFixedBytes("marker7"),
               "RW07_PRESENT_DEFAULT_PROVENANCE");
-  owner.issued_node_stage_[scope_.slot_] = IssuedNodeStage::kDefaulted;
+  owner.NodeStage(scope_.slot_, index_) = IssuedNodeStage::kDefaulted;
   Check();
   ++owner.finalized_audit_->present_defaults;
 }
@@ -1993,7 +2058,7 @@ void M0SyntheticOwnerV1::FinalizationStep(Graph& graph, PermitGeneration& permit
     while (slot < entries_.size() && entries_[slot].graph != &graph) ++slot;
     const size_t first = issued_root_slot_;
     const size_t end = first == 3 ? 4 : (recipe_ == Recipe::kNested ? 3 : 1);
-    ORT_ENFORCE(slot >= first && slot < end && issued_node_stage_[slot] == IssuedNodeStage::kDone &&
+    ORT_ENFORCE(slot >= first && slot < end && NodesDone(slot) &&
                     no_proto_sync_ && step <= 5,
                 "RW07_FINALIZATION_SCOPE");
     for (size_t other = first; other < end; ++other) {
@@ -2027,7 +2092,7 @@ void M0SyntheticOwnerV1::BeginCachedRepeat(ScopeLayer& layer) {
     for (size_t slot = 0; slot < 3; ++slot) {
       ORT_ENFORCE(retained_descriptor_[slot] && !cached_pass_[slot] && resolve_counts_[slot] == 1 &&
                       finalization_[slot] == Finalization::kCounted && preparation_[slot] == Preparation::kSorted &&
-                      issued_node_stage_[slot] == IssuedNodeStage::kDone,
+                      NodeStage(slot) == IssuedNodeStage::kDone,
                   "RW07_CACHED_RETAINED_HISTORY");
     }
     // Retained descriptors and exact caches were checked before issuing new per-pass state.
@@ -2035,7 +2100,8 @@ void M0SyntheticOwnerV1::BeginCachedRepeat(ScopeLayer& layer) {
       cached_pass_[slot] = true;
       preparation_[slot] = Preparation::kOriginal;
       finalization_[slot] = Finalization::kPending;
-      issued_node_stage_[slot] = IssuedNodeStage::kOriginal;
+      NodeStage(slot) = IssuedNodeStage::kOriginal;
+      node_cursor_[slot] = 0;
       issued_inferred_child_[slot] = false;
       const_cast<Graph*>(entries_[slot].graph)->SetGraphResolveNeeded();
     }
@@ -2047,20 +2113,21 @@ void M0SyntheticOwnerV1::BeginCachedRepeat(ScopeLayer& layer) {
 }
 void M0SyntheticOwnerV1::NodeLayer::Published() {
   auto& owner = scope_.permit_.generation_.owner;
-  ORT_ENFORCE(!owner.Poisoned() && owner.issued_node_stage_[scope_.slot_] == IssuedNodeStage::kInferred &&
+  ORT_ENFORCE(!owner.Poisoned() && owner.NodeStage(scope_.slot_, index_) == IssuedNodeStage::kInferred &&
                   node_.OutputDefs()[0]->TypeAsProto()->SerializeAsString() ==
                       node_.InputDefs()[0]->TypeAsProto()->SerializeAsString(),
               "RW07_ISSUED_PUBLICATION_TRANSITION");
-  owner.issued_node_stage_[scope_.slot_] = IssuedNodeStage::kPublished;
+  owner.NodeStage(scope_.slot_, index_) = IssuedNodeStage::kPublished;
   Check();
   ++owner.issued_audit_->live_publications;
 }
 void M0SyntheticOwnerV1::NodeLayer::Completed() {
   Check();
   auto& owner = scope_.permit_.generation_.owner;
-  ORT_ENFORCE(owner.issued_node_stage_[scope_.slot_] == IssuedNodeStage::kPublished && !completed_,
+  ORT_ENFORCE(owner.NodeStage(scope_.slot_, index_) == IssuedNodeStage::kPublished && !completed_,
               "RW07_ISSUED_NODE_EXIT");
-  owner.issued_node_stage_[scope_.slot_] = IssuedNodeStage::kDone;
+  owner.NodeStage(scope_.slot_, index_) = IssuedNodeStage::kDone;
+  ++owner.node_cursor_[scope_.slot_];
   completed_ = true;
 }
 
@@ -2074,6 +2141,7 @@ class M0SyntheticOwnerFactoryV1 final {
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
   static M0SyntheticIssuedReceiptV1 Issued();
   static M0SyntheticFinalizedReceiptV1 Finalized();
+  static M0SyntheticChainReceiptV1 Chain();
 #endif
 
  private:
@@ -2084,7 +2152,7 @@ class M0SyntheticOwnerFactoryV1 final {
 std::unique_ptr<Model> M0SyntheticOwnerFactoryV1::Make(
     const std::shared_ptr<M0SyntheticOwnerReceiptV1>& audit, size_t failure_slot, M0SyntheticOwnerV1::Recipe recipe) {
   ONNX_NAMESPACE::ModelProto proto;
-  ORT_ENFORCE(proto.ParseFromString(M0OriginalRecipeBytes(recipe == M0SyntheticOwnerV1::Recipe::kEqual7)),
+  ORT_ENFORCE(proto.ParseFromString(M0OriginalRecipeBytes(recipe == M0SyntheticOwnerV1::Recipe::kEqual7, recipe == M0SyntheticOwnerV1::Recipe::kEqual7Chain)),
               "RW07_FIXED_MODEL_PARSE");
   auto owner = std::unique_ptr<M0SyntheticOwnerV1>(new M0SyntheticOwnerV1(audit, recipe));
   owner->fail_after_slot_ = failure_slot;
@@ -2587,6 +2655,139 @@ M0SyntheticIssuedReceiptV1 M0SyntheticOwnerFactoryV1::Issued() {
   }
   return receipt;
 }
+M0SyntheticChainReceiptV1 M0SyntheticOwnerFactoryV1::Chain() {
+  M0SyntheticChainReceiptV1 receipt;
+  ONNX_NAMESPACE::ModelProto original;
+  ONNX_NAMESPACE::GraphProto post;
+  ORT_ENFORCE(original.ParseFromString(m0_internal::CheckedFixedBytes("caller-equal7.model-original")) &&
+                  post.ParseFromString(m0_internal::CheckedFixedBytes("caller-equal7.expected-live-post")),
+              "RW07_CHAIN_NATIVE_BINDINGS");
+  auto expected = original.graph();
+  expected.mutable_value_info(0)->mutable_type()->CopyFrom(expected.input(0).type());
+  const auto intermediate = M0Equal7ChainIntermediateBytes();
+  ORT_ENFORCE(M0GraphCanonical(expected) == intermediate, "RW07_CHAIN_INTERMEDIATE_BINDING");
+  expected.mutable_output(0)->mutable_type()->CopyFrom(expected.input(0).type());
+  ORT_ENFORCE(M0GraphCanonical(expected) == M0GraphCanonical(post), "RW07_CHAIN_POST_BINDING");
+  receipt.native_bindings = 3;
+  // Fresh success, actual second callback failure, and retained two-node mutations.
+  for (size_t variant = 0; variant < 12; ++variant) {
+    auto audit = std::make_shared<M0SyntheticOwnerReceiptV1>();
+    {
+      auto model = Make(audit, 4, M0SyntheticOwnerV1::Recipe::kEqual7Chain);
+      auto function = AddParentless(*model);
+      auto& owner = *model->m0_synthetic_owner_v1_;
+      auto& root = model->MainGraph();
+      M0SyntheticIssuedReceiptV1 local;
+      M0SyntheticFinalizedReceiptV1 finalized;
+      owner.issued_audit_ = &local;
+      owner.finalized_audit_ = &finalized;
+      owner.finalization_route_ = true;
+      if (variant == 1) owner.issued_effect_ = M0SyntheticOwnerV1::IssuedEffect::kSecondNodeFailure;
+      Graph::ResolveOptions options;
+      options.no_proto_sync_required = true;
+      bool denied = false;
+      try {
+        M0SyntheticOwnerV1::PermitGeneration permit(owner);
+        M0SyntheticOwnerV1::ScopeLayer layer(permit, root);
+        ORT_THROW_IF_ERROR(root.ResolveSource(options, &layer));
+        owner.ValidateAll(&root);
+      } catch (const std::exception&) {
+        denied = true;
+      }
+      ORT_ENFORCE(local.source_checks == 2 && local.source_selections == 2 && local.source_defaults == 0 &&
+                      finalized.present_defaults == 2 && local.callbacks == 2 && local.child_joins == 0 &&
+                      local.child_skips == 0 && audit->frame_pushes == 1 && audit->frame_pops == 1,
+                  "RW07_CHAIN_SOURCE_COUNTS");
+      if (variant == 1) {
+        ORT_ENFORCE(denied && owner.Poisoned() && local.live_publications == 1 &&
+                        local.propagation_no_work == 1 && local.saver_no_work == 1 &&
+                        finalized.finalized_scopes == 0 && finalized.finalization_steps == 0 && root.num_resolves_ == 0 &&
+                        owner.NodeStage(0, 0) == M0SyntheticOwnerV1::IssuedNodeStage::kDone &&
+                        owner.NodeStage(0, 1) == M0SyntheticOwnerV1::IssuedNodeStage::kInferred &&
+                        root.GetNodeArg("A")->TypeAsProto()->SerializeAsString() == original.graph().input(0).type().SerializeAsString() &&
+                        root.GetNodeArg("Y")->TypeAsProto()->SerializeAsString() == original.graph().output(0).type().SerializeAsString(),
+                    "RW07_CHAIN_PARTIAL_FAILURE_STATE");
+        const auto before = local.callbacks;
+        bool retry_denied = false;
+        try {
+          M0SyntheticOwnerV1::PermitGeneration permit(owner);
+        } catch (const std::exception&) {
+          retry_denied = true;
+        }
+        ORT_ENFORCE(retry_denied && local.callbacks == before, "RW07_CHAIN_POISONED_RETRY");
+        ++receipt.partial_failures;
+      } else {
+        ORT_ENFORCE(!denied && !owner.Poisoned() && local.live_publications == 2 && local.propagation_no_work == 2 &&
+                        local.saver_no_work == 2 && finalized.finalized_scopes == 1 && finalized.finalization_steps == 5 &&
+                        root.num_resolves_ == 1 && owner.NodesDone(0),
+                    "RW07_CHAIN_COMPLETE_STATE");
+        if (variant >= 2) {
+          switch (variant) {
+            case 2:
+              root.nodes_[1]->GetMutableAttributes()["marker"].set_i(8);
+              break;
+            case 3:
+              root.nodes_[1]->SetOriginalNodeProto(&original.graph().node(1));
+              break;
+            case 4:
+              root.nodes_[1]->MutableInputDefs()[0] = root.GetNodeArg("X");
+              break;
+            case 5:
+              root.nodes_in_topological_order_ = {1, 0};
+              break;
+            case 6:
+              owner.node_cursor_[0] = 1;
+              break;
+            case 7:
+              owner.NodeStage(0, 0) = M0SyntheticOwnerV1::IssuedNodeStage::kOriginal;
+              break;
+            case 8:
+              root.value_info_.clear();
+              break;
+            case 9:
+              owner.NodeStage(1, 0) = M0SyntheticOwnerV1::IssuedNodeStage::kChecked;
+              break;
+            case 10:
+              owner.NodeStage(3, 1) = M0SyntheticOwnerV1::IssuedNodeStage::kChecked;
+              break;
+            case 11:
+              root.nodes_[1]->op_ = owner.sealed_schemas_[1];
+              break;
+          }
+        }
+        bool repeat_denied = false;
+        try {
+          M0SyntheticOwnerV1::PermitGeneration permit(owner);
+          M0SyntheticOwnerV1::ScopeLayer layer(permit, root);
+          ORT_THROW_IF_ERROR(root.ResolveSource(options, &layer));
+          ORT_ENFORCE(!layer.perform_entered_, "RW07_CHAIN_CLEAN_REPEAT_TRAVERSED");
+        } catch (const std::exception&) {
+          repeat_denied = true;
+        }
+        ORT_ENFORCE(local.callbacks == 2 && local.source_checks == 2 && local.source_selections == 2 &&
+                        local.live_publications == 2 && root.num_resolves_ == 1,
+                    "RW07_CHAIN_REPEAT_NO_WORK");
+        if (variant == 0) {
+          ORT_ENFORCE(!repeat_denied && !owner.Poisoned() && finalized.clean_repeats == 1, "RW07_CHAIN_CLEAN_REPEAT");
+          ++receipt.clean_repeats;
+        } else {
+          ORT_ENFORCE(repeat_denied && owner.Poisoned() && finalized.clean_repeats == 0, "RW07_CHAIN_MUTATION_DENIAL");
+          ++receipt.denied_mutations;
+        }
+      }
+      receipt.callbacks += local.callbacks;
+      receipt.publications += local.live_publications;
+      owner.issued_audit_ = nullptr;
+      owner.finalized_audit_ = nullptr;
+    }
+    ORT_ENFORCE(audit->owner_retired && audit->registered == 2 && audit->unregistered == 2 &&
+                    audit->live_at_capture == 0 && audit->frame_pushes == audit->frame_pops,
+                "RW07_CHAIN_RETIREMENT");
+    ++receipt.retired_owners;
+  }
+  return receipt;
+}
+M0SyntheticChainReceiptV1 M0RunFixedSyntheticChainV1() { return M0SyntheticOwnerFactoryV1::Chain(); }
 M0SyntheticFinalizedReceiptV1 M0SyntheticOwnerFactoryV1::Finalized() {
   M0SyntheticFinalizedReceiptV1 receipt;
   ONNX_NAMESPACE::ModelProto single_original;

@@ -3144,7 +3144,7 @@ class DataPropagationContextImpl : public ONNX_NAMESPACE::DataPropagationContext
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
 M0SyntheticOwnerV1::ContextLayer::ContextLayer(NodeLayer& node) : node_(node) {
   Check();
-  ORT_ENFORCE(node_.scope_.permit_.generation_.owner.issued_node_stage_[node_.scope_.slot_] ==
+  ORT_ENFORCE(node_.scope_.permit_.generation_.owner.NodeStage(node_.scope_.slot_, node_.index_) ==
                   IssuedNodeStage::kDefaulted,
               "RW07_ISSUED_CONTEXT_ENTRY");
 }
@@ -3178,7 +3178,7 @@ void M0SyntheticOwnerV1::ContextLayer::EnterCallback(const void* context) {
   Check();
   auto& owner = node_.scope_.permit_.generation_.owner;
   ORT_ENFORCE(context == inference_identity_ && scratch_ && propagation_ && !callback_active_ &&
-                  !callback_finished_ && owner.issued_node_stage_[node_.scope_.slot_] == IssuedNodeStage::kDefaulted &&
+                  !callback_finished_ && owner.NodeStage(node_.scope_.slot_, node_.index_) == IssuedNodeStage::kDefaulted &&
                   node_.node_.Op() == owner.Schema(node_.scope_.slot_) &&
                   scratch_->size() == 1 && (*scratch_)[0].SerializeAsString().empty(),
               "RW07_ISSUED_CALLBACK_ENTRY");
@@ -3194,8 +3194,15 @@ void M0SyntheticOwnerV1::ContextLayer::ExitCallback(const void* context) {
               "RW07_ISSUED_CALLBACK_EXIT");
   callback_active_ = false;
   callback_finished_ = true;
-  owner.issued_node_stage_[node_.scope_.slot_] = IssuedNodeStage::kInferred;
+  owner.NodeStage(node_.scope_.slot_, node_.index_) = IssuedNodeStage::kInferred;
   Check();
+  if (owner.issued_effect_ == IssuedEffect::kSecondNodeFailure && node_.scope_.slot_ == 0 && node_.index_ == 1) {
+    ORT_ENFORCE(owner.recipe_ == Recipe::kEqual7Chain && owner.node_cursor_[0] == 1 &&
+                    owner.NodeStage(0, 0) == IssuedNodeStage::kDone && owner.issued_audit_->live_publications == 1,
+                "RW07_CHAIN_FAILURE_AFTER_A");
+    owner.Poison();
+    ORT_THROW("RW07_CHAIN_SECOND_SCRATCH_FAILURE");
+  }
   if (owner.issued_effect_ == IssuedEffect::kMalformedPropagation && node_.scope_.slot_ == 2)
     (*propagation_)[0].mutable_tensor_type()->mutable_shape();
 }
@@ -3338,7 +3345,7 @@ void M0SyntheticOwnerV1::ChildJoin::Joined(const Node& node, const Graph& child)
   auto& owner = context_.node_.scope_.permit_.generation_.owner;
   const auto parent_slot = context_.node_.scope_.slot_;
   ORT_ENFORCE(entered_ && !joined_ && scope_ && scope_->completed_ && &node == &context_.node_.node_ &&
-                  &child == &child_ && owner.issued_node_stage_[scope_->slot_] == IssuedNodeStage::kDone &&
+                  &child == &child_ && owner.NodesDone(scope_->slot_) &&
                   !owner.issued_inferred_child_[parent_slot] && !owner.Poisoned(),
               "RW07_ISSUED_CHILD_JOIN");
   owner.issued_inferred_child_[parent_slot] = true;
@@ -4186,7 +4193,7 @@ Status Graph::VerifyNodeAndOpMatch(const ResolveOptions& options, M0SyntheticOwn
         ORT_ENFORCE(node.ImplicitInputDefs().empty() && layer->slot_ < 2 && entry.first == "body" &&
                         subgraph == owner.entries_[layer->slot_ + 1].graph &&
                         resolve_context_.inferred_subgraphs.contains(subgraph) &&
-                        owner.issued_node_stage_[layer->slot_ + 1] == M0SyntheticOwnerV1::IssuedNodeStage::kDone,
+                        owner.NodesDone(layer->slot_ + 1),
                     "RW07_ISSUED_CHILD_SKIP_JOIN");
         ++owner.issued_audit_->child_skips;
       }
@@ -4331,8 +4338,7 @@ Status Graph::PerformTypeAndShapeInferencing(const ResolveOptions& options, M0Sy
   layer.Check(*this);
   ORT_RETURN_IF_ERROR(VerifyNodeAndOpMatch(options, &layer));
   layer.Check(*this);
-  ORT_ENFORCE(owning_model_.m0_synthetic_owner_v1_->issued_node_stage_[layer.slot_] ==
-                  M0SyntheticOwnerV1::IssuedNodeStage::kDone,
+  ORT_ENFORCE(owning_model_.m0_synthetic_owner_v1_->NodesDone(layer.slot_),
               "RW07_ISSUED_PERFORM_EXIT");
   layer.completed_ = true;
   if (layer.slot_ == owning_model_.m0_synthetic_owner_v1_->issued_root_slot_) layer.permit_.root_completed_ = true;

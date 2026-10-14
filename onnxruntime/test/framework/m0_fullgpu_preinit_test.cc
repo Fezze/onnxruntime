@@ -34,6 +34,7 @@
 #include "core/session/utils.h"
 #include "gtest/gtest.h"
 #include "test/test_environment.h"
+#include "test/util/include/default_providers.h"
 
 namespace onnxruntime::test {
 ONNX_OPERATOR_SCHEMA(M0PreInitSentinel)
@@ -2773,6 +2774,17 @@ TEST(M0SyntheticPreparationTest, OriginalBackingLineageAndActualSourceTopologySt
   EXPECT_FALSE(receipt.descriptor_permission);
 }
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+TEST(M0SyntheticChainTest, IndexedTwoNodePublicationFailureAndRetainedAuthority) {
+  const auto receipt = M0RunFixedSyntheticChainV1();
+  EXPECT_EQ(receipt.native_bindings, 3u);
+  EXPECT_EQ(receipt.callbacks, 24u);
+  EXPECT_EQ(receipt.publications, 23u);
+  EXPECT_EQ(receipt.clean_repeats, 1u);
+  EXPECT_EQ(receipt.partial_failures, 1u);
+  EXPECT_EQ(receipt.denied_mutations, 10u);
+  EXPECT_EQ(receipt.retired_owners, 12u);
+}
+
 TEST(M0SyntheticFinalizedTest, FixedFinalizationCleanCachedEqual7AndParentlessPreserveExactState) {
   const auto receipt = M0RunFixedSyntheticFinalizedV1();
   EXPECT_EQ(receipt.native_bindings, 2u);
@@ -2819,3 +2831,280 @@ TEST(M0SyntheticIssuedTest, PrivateActualNestedCallbacksJoinDefaultsScratchAndNo
 #endif  // !ORT_NO_EXCEPTIONS
 }  // namespace onnxruntime::test
 #endif  // !ORT_MINIMAL_BUILD
+
+#if !defined(ORT_MINIMAL_BUILD)
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+#include "gtest/gtest.h"
+#include "core/graph/m0_preload_descriptor_adapters_v1.h"
+
+namespace onnxruntime::test {
+namespace {
+namespace adapters = m0_preload_descriptor_v1;
+using ONNX_NAMESPACE::TypeProto;
+constexpr int kFloat = ONNX_NAMESPACE::TensorProto_DataType_FLOAT;
+constexpr int kInt64 = ONNX_NAMESPACE::TensorProto_DataType_INT64;
+
+TypeProto Descriptor(int type, int rank) {
+  TypeProto result;
+  auto* tensor = result.mutable_tensor_type();
+  tensor->set_elem_type(type);
+  auto* shape = tensor->mutable_shape();
+  for (int axis = 0; axis < rank; ++axis) shape->add_dim();
+  return result;
+}
+
+TypeProto Length(int type, int length) {
+  auto result = Descriptor(type, 1);
+  result.mutable_tensor_type()->mutable_shape()->mutable_dim(0)->set_dim_value(length);
+  return result;
+}
+
+void ExpectUnknown(const TypeProto& type, int element_type, int rank) {
+  ASSERT_TRUE(type.has_tensor_type());
+  ASSERT_EQ(type.tensor_type().elem_type(), element_type);
+  ASSERT_TRUE(type.tensor_type().has_shape());
+  ASSERT_EQ(type.tensor_type().shape().dim_size(), rank);
+  for (const auto& dimension : type.tensor_type().shape().dim()) {
+    EXPECT_FALSE(dimension.has_dim_value());
+    EXPECT_FALSE(dimension.has_dim_param());
+  }
+}
+
+TEST(M0PreloadDescriptorAdapters, ExactRecipesProduceUnknownDimensions) {
+  auto input = Descriptor(kFloat, 3);
+  input.mutable_tensor_type()->mutable_shape()->mutable_dim(1)->set_dim_value(512);
+  auto scales = Length(kFloat, 3);
+  auto scalar = Descriptor(kInt64, 0);
+  auto shape2 = Length(kInt64, 2);
+  auto shape3 = Length(kInt64, 3);
+  TypeProto output;
+  ASSERT_TRUE(adapters::ProposeResize19Float3(input, scales, output));
+  ExpectUnknown(output, kFloat, 3);
+  ASSERT_TRUE(adapters::ProposeRange11Int64Scalars(scalar, scalar, scalar, output));
+  ExpectUnknown(output, kInt64, 1);
+  ASSERT_TRUE(adapters::ProposeConstantOfShape20Float2(shape2, output));
+  ExpectUnknown(output, kFloat, 2);
+  ASSERT_TRUE(adapters::ProposeConstantOfShape20Float3(shape3, output));
+  ExpectUnknown(output, kFloat, 3);
+}
+
+TEST(M0PreloadDescriptorAdapters, RepeatedSymbolicAndZeroDescriptorsDeferRuntimeDomain) {
+  auto input = Descriptor(kFloat, 3);
+  auto scales = Length(kFloat, 3);
+  auto shape = Length(kInt64, 2);
+  auto scalar = Descriptor(kInt64, 0);
+  auto output = Descriptor(kInt64, 0);
+  input.mutable_tensor_type()->mutable_shape()->mutable_dim(1)->set_dim_param("duration");
+  ASSERT_TRUE(adapters::ProposeResize19Float3(input, scales, output));
+  ExpectUnknown(output, kFloat, 3);
+  input.mutable_tensor_type()->mutable_shape()->mutable_dim(1)->set_dim_value(0);
+  ASSERT_TRUE(adapters::ProposeResize19Float3(input, scales, output));
+  ExpectUnknown(output, kFloat, 3);
+  ASSERT_TRUE(adapters::ProposeRange11Int64Scalars(scalar, scalar, scalar, output));
+  ExpectUnknown(output, kInt64, 1);
+  ASSERT_TRUE(adapters::ProposeConstantOfShape20Float2(shape, output));
+  ExpectUnknown(output, kFloat, 2);
+  const auto before = output.SerializeAsString();
+  EXPECT_FALSE(adapters::ProposeResize19Float3(input, Descriptor(kFloat, 1), output));
+  EXPECT_EQ(output.SerializeAsString(), before);
+}
+
+TEST(M0PreloadDescriptorAdapters, ResizeRejectsMalformedDescriptorsWithoutMutation) {
+  auto good = Descriptor(kFloat, 3);
+  auto scales = Length(kFloat, 3);
+  auto output = Descriptor(kInt64, 0);
+  const auto before = output.SerializeAsString();
+  for (auto bad : {TypeProto{}, Descriptor(kInt64, 3), Descriptor(kFloat, 2)}) {
+    EXPECT_FALSE(adapters::ProposeResize19Float3(bad, scales, output));
+    EXPECT_EQ(output.SerializeAsString(), before);
+  }
+  auto no_shape = good;
+  no_shape.mutable_tensor_type()->clear_shape();
+  EXPECT_FALSE(adapters::ProposeResize19Float3(no_shape, scales, output));
+  auto negative = good;
+  negative.mutable_tensor_type()->mutable_shape()->mutable_dim(0)->set_dim_value(-1);
+  EXPECT_FALSE(adapters::ProposeResize19Float3(negative, scales, output));
+  for (auto bad : {TypeProto{}, Length(kInt64, 3), Length(kFloat, 0), Length(kFloat, 2),
+                   Descriptor(kFloat, 1), Descriptor(kFloat, 0)}) {
+    EXPECT_FALSE(adapters::ProposeResize19Float3(good, bad, output));
+    EXPECT_EQ(output.SerializeAsString(), before);
+  }
+}
+
+TEST(M0PreloadDescriptorAdapters, RangeChecksEveryPresentScalarSlot) {
+  auto scalar = Descriptor(kInt64, 0);
+  auto output = Descriptor(kFloat, 0);
+  const auto before = output.SerializeAsString();
+  for (auto bad : {TypeProto{}, Descriptor(kFloat, 0), Length(kInt64, 1)}) {
+    EXPECT_FALSE(adapters::ProposeRange11Int64Scalars(bad, scalar, scalar, output));
+    EXPECT_FALSE(adapters::ProposeRange11Int64Scalars(scalar, bad, scalar, output));
+    EXPECT_FALSE(adapters::ProposeRange11Int64Scalars(scalar, scalar, bad, output));
+    EXPECT_EQ(output.SerializeAsString(), before);
+  }
+  auto missing_shape = scalar;
+  missing_shape.mutable_tensor_type()->clear_shape();
+  EXPECT_FALSE(adapters::ProposeRange11Int64Scalars(scalar, missing_shape, scalar, output));
+}
+
+TEST(M0PreloadDescriptorAdapters, FillRequiresExactShapeOfShapeLength) {
+  auto output = Descriptor(kInt64, 0);
+  const auto before = output.SerializeAsString();
+  for (auto bad : {TypeProto{}, Descriptor(kInt64, 1), Length(kFloat, 2), Length(kInt64, 0),
+                   Length(kInt64, -1), Length(kInt64, 4), Descriptor(kInt64, 0)}) {
+    EXPECT_FALSE(adapters::ProposeConstantOfShape20Float2(bad, output));
+    EXPECT_FALSE(adapters::ProposeConstantOfShape20Float3(bad, output));
+    EXPECT_EQ(output.SerializeAsString(), before);
+  }
+  EXPECT_FALSE(adapters::ProposeConstantOfShape20Float2(Length(kInt64, 3), output));
+  EXPECT_FALSE(adapters::ProposeConstantOfShape20Float3(Length(kInt64, 2), output));
+}
+
+TEST(M0PreloadDescriptorAdapters, RejectsOutputAliasingEveryInput) {
+  auto input = Descriptor(kFloat, 3);
+  auto scales = Length(kFloat, 3);
+  EXPECT_FALSE(adapters::ProposeResize19Float3(input, scales, input));
+  EXPECT_FALSE(adapters::ProposeResize19Float3(input, scales, scales));
+  auto a = Descriptor(kInt64, 0);
+  auto b = a;
+  auto c = a;
+  EXPECT_FALSE(adapters::ProposeRange11Int64Scalars(a, b, c, a));
+  EXPECT_FALSE(adapters::ProposeRange11Int64Scalars(a, b, c, b));
+  EXPECT_FALSE(adapters::ProposeRange11Int64Scalars(a, b, c, c));
+  auto shape2 = Length(kInt64, 2);
+  auto shape3 = Length(kInt64, 3);
+  EXPECT_FALSE(adapters::ProposeConstantOfShape20Float2(shape2, shape2));
+  EXPECT_FALSE(adapters::ProposeConstantOfShape20Float3(shape3, shape3));
+}
+
+}  // namespace
+}  // namespace onnxruntime::test
+
+#endif  // !ORT_MINIMAL_BUILD
+
+namespace onnxruntime::test {
+#if defined(USE_WEBGPU) && !defined(ORT_MINIMAL_BUILD) && !defined(ORT_NO_EXCEPTIONS)
+TEST(M0CompiledRegistryMetadataTest, CaptureDefinitionsAndOriginalSchemasWithoutModelOrKernelConstruction) {
+  auto ep = DefaultWebGpuExecutionProvider(false);
+  ASSERT_NE(ep, nullptr) << "Required WebGPU plugin must be available; no skip/fallback";
+  ASSERT_EQ(ep->Type(), kWebGpuExecutionProvider);
+  ASSERT_EQ(ep->GetPreferredLayout(), DataLayout::NCHW);
+  ASSERT_FALSE(ep->IsGraphCaptureEnabled());
+  auto registry = ep->GetKernelRegistry();
+  ASSERT_NE(registry, nullptr);
+  ASSERT_FALSE(registry->IsEmpty());
+  InlinedVector<std::string> definitions;
+  bool observed_int64_add = false;
+  for (const auto& [key, info] : registry->GetKernelCreateMap()) {
+    ASSERT_NE(info.kernel_def, nullptr);
+    ASSERT_TRUE(static_cast<bool>(info.kernel_create_func));
+    const auto& def = *info.kernel_def;
+    ASSERT_EQ(def.Provider(), kWebGpuExecutionProvider);
+    MetadataJsonObject row;
+    row.String("registry_key", key);
+    row.String("implementation_id", info.m0_implementation_id_v1);
+    row.String("op", def.OpName());
+    row.String("domain", def.Domain());
+    row.String("provider", def.Provider());
+    const auto versions = def.SinceVersion();
+    row.Int("since", versions.first);
+    row.Int("end", versions.second);
+    InlinedVector<std::string> constraints;
+    for (const auto& [parameter, types] : def.TypeConstraints()) {
+      InlinedVector<std::string> names;
+      for (auto type : types) {
+        ASSERT_NE(type, nullptr);
+        names.push_back(DataTypeImpl::ToString(type));
+        if (def.OpName() == "Add" && def.Domain().empty() && parameter == "T" &&
+            std::string_view(DataTypeImpl::ToString(type)) == DataTypeImpl::ToString(DataTypeImpl::GetTensorType<int64_t>()))
+          observed_int64_add = true;
+      }
+      std::sort(names.begin(), names.end());
+      MetadataJsonObject constraint;
+      constraint.String("parameter", parameter);
+      constraint.Raw("types", MetadataJsonArray(names, [](const auto& type) { return MetadataJsonString(type); }));
+      constraints.push_back(constraint.Finish());
+    }
+    std::sort(constraints.begin(), constraints.end());
+    row.Raw("constraints", MetadataJsonArray(constraints, [](const auto& value) { return value; }));
+    auto encode_pair = [](const auto& pair) {
+      return '[' + std::to_string(pair.first) + ',' + std::to_string(pair.second) + ']';
+    };
+    auto encode_map = [&](const auto& map) {
+      InlinedVector<std::string> values;
+      for (const auto& pair : map) values.push_back(encode_pair(pair));
+      std::sort(values.begin(), values.end());
+      return MetadataJsonArray(values, [](const auto& value) { return value; });
+    };
+    row.Raw("input_memory", encode_map(def.InputMemoryTypeArgs()));
+    row.Raw("output_memory", encode_map(def.OutputMemoryTypeArgs()));
+    row.Int("default_input_memory", def.DefaultInputMemoryType());
+    row.Int("default_output_memory", def.DefaultOutputMemoryType());
+    row.Raw("alias", MetadataJsonArray(def.Alias(), encode_pair));
+    row.Raw("may_inplace", MetadataJsonArray(def.MayInplace(), encode_pair));
+    row.Raw("variadic_alias", def.VariadicAlias() ? encode_pair(*def.VariadicAlias()) : "null");
+    row.Bool("contiguous_inputs", def.AllocateInputsContiguously());
+    row.Bool("external_outputs", def.HasExternalOutputs());
+    row.Int("execution_queue", def.ExecQueueId());
+    row.Bool("creator_present_not_invoked", true);
+    definitions.push_back(row.Finish());
+  }
+  ASSERT_TRUE(observed_int64_add) << "Configured INT64 support must be observed in actual Add registration";
+  std::sort(definitions.begin(), definitions.end());
+  constexpr const char* original_ops[] = {"Add", "And", "Atan", "Cast", "Clip", "Concat", "ConstantOfShape", "Conv", "ConvTranspose", "Cos", "CumSum", "Div", "Equal", "Exp", "Expand", "Floor", "Gather", "Gemm", "Greater", "GreaterOrEqual", "LSTM", "LayerNormalization", "LeakyRelu", "Less", "MatMul", "Mul", "NonZero", "Pad", "Pow", "Range", "ReduceMean", "ReduceSum", "Reshape", "Resize", "Round", "STFT", "ScatterND", "Shape", "Sigmoid", "Sin", "Slice", "Softmax", "Sqrt", "Squeeze", "Sub", "Tanh", "Transpose", "Unsqueeze", "Where"};
+  SchemaRegistryManager schemas;
+  InlinedVector<std::string> schema_rows;
+  for (const auto* op : original_ops) {
+    const ONNX_NAMESPACE::OpSchema* selected = nullptr;
+    int earliest = 0;
+    schemas.GetSchemaAndHistory(op, 20, "", &selected, &earliest);
+    ASSERT_NE(selected, nullptr) << op;
+    ASSERT_EQ(selected->Name(), op);
+    ASSERT_TRUE(selected->domain().empty());
+    ASSERT_LE(selected->SinceVersion(), 20);
+    MetadataJsonObject row;
+    row.Int("requested_opset", 20);
+    row.Int("earliest", earliest);
+    row.Raw("schema", MetadataSchemaJson(MetadataReadSchema(*selected)));
+    schema_rows.push_back(row.Finish());
+  }
+  ASSERT_EQ(schema_rows.size(), 49u);
+  MetadataJsonObject result;
+  result.String("identity", "rw07-compiled-registry-observation-v1");
+  result.String("classification", "COMPILED_REGISTRY_ONLY_NO_MODEL_FINAL_SELECTION_OR_KERNEL_CONSTRUCTION");
+  result.String("provider_options", "test helper: int64 enabled, NCHW, storage buffer cache disabled");
+  result.Bool("observed_graph_capture_enabled", ep->IsGraphCaptureEnabled());
+  result.String("observed_provider", ep->Type());
+  result.Int("observed_layout", static_cast<int>(ep->GetPreferredLayout()));
+  InlinedVector<std::string> options;
+  for (const auto& [key, value] : ep->GetProviderOptions()) {
+    MetadataJsonObject option;
+    option.String("key", key);
+    option.String("value", value);
+    options.push_back(option.Finish());
+  }
+  std::sort(options.begin(), options.end());
+  result.Raw("observed_provider_options", MetadataJsonArray(options, [](const auto& value) { return value; }));
+  result.Bool("observed_int64_add", observed_int64_add);
+  result.Bool("admission", false);
+  result.Bool("M0_complete", false);
+  result.Raw("kernels", MetadataJsonArray(definitions, [](const auto& value) { return value; }));
+  result.Raw("original_schemas", MetadataJsonArray(schema_rows, [](const auto& value) { return value; }));
+  result.Raw("compile_flags", MetadataConfigJson());
+  const auto bytes = result.Finish() + '\n';
+  ASSERT_LE(bytes.size(), 4u * 1024u * 1024u);
+  constexpr const char* output = "rw07_compiled_registry_v1.json";
+  std::error_code error;
+  ASSERT_FALSE(std::filesystem::exists(output, error));
+  ASSERT_FALSE(error);
+  std::ofstream stream(output, std::ios::binary | std::ios::out | std::ios::trunc);
+  ASSERT_TRUE(stream.is_open());
+  stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  stream.flush();
+  ASSERT_TRUE(stream.good());
+  stream.close();
+  ASSERT_FALSE(stream.fail());
+}
+#endif
+
+}  // namespace onnxruntime::test

@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <memory>
@@ -123,6 +124,16 @@ struct M0SyntheticFinalizedReceiptV1 {
   bool descriptor_permission = false;
 };
 M0SyntheticFinalizedReceiptV1 M0RunFixedSyntheticFinalizedV1();
+struct M0SyntheticChainReceiptV1 {
+  size_t native_bindings = 0;
+  size_t callbacks = 0;
+  size_t publications = 0;
+  size_t clean_repeats = 0;
+  size_t partial_failures = 0;
+  size_t denied_mutations = 0;
+  size_t retired_owners = 0;
+};
+M0SyntheticChainReceiptV1 M0RunFixedSyntheticChainV1();
 #endif
 
 // CLOSED foundation: registration/generation do not authorize descriptor dispatch.
@@ -169,9 +180,11 @@ class M0SyntheticOwnerV1 final {
   };
 
   enum class Recipe { kNested,
-                      kEqual7 };
+                      kEqual7,
+                      kEqual7Chain };
   const Recipe recipe_;
   bool Listed(size_t slot) const noexcept { return recipe_ == Recipe::kNested || slot == 0 || slot == 3; }
+  size_t NodeCount(size_t slot) const noexcept { return recipe_ == Recipe::kEqual7Chain && slot == 0 ? 2 : 1; }
   bool HasChild(size_t slot) const noexcept { return recipe_ == Recipe::kNested && slot < 2; }
   const ONNX_NAMESPACE::OpSchema* Schema(size_t slot) const noexcept { return sealed_schemas_[HasChild(slot) ? 1 : 0]; }
   explicit M0SyntheticOwnerV1(std::shared_ptr<M0SyntheticOwnerReceiptV1> audit, Recipe recipe = Recipe::kNested);
@@ -210,7 +223,8 @@ class M0SyntheticOwnerV1 final {
                             kEngagedInventory,
                             kRepeatedBody,
                             kDirectPerform,
-                            kFinalizationForeignContext };
+                            kFinalizationForeignContext,
+                            kSecondNodeFailure };
   class ContextLayer;
   class ChildJoin;
   class ScopeLayer;
@@ -270,6 +284,7 @@ class M0SyntheticOwnerV1 final {
     void Completed();
     ScopeLayer& scope_;
     const Node& node_;
+    size_t index_ = 0;
     bool completed_ = false;
   };
   class ContextLayer final {
@@ -323,7 +338,14 @@ class M0SyntheticOwnerV1 final {
     bool returned_ = false;
   };
   PermitGeneration* issued_generation_ = nullptr;
-  std::array<IssuedNodeStage, 4> issued_node_stage_{};
+  std::array<std::array<IssuedNodeStage, 2>, 4> issued_node_stage_{};
+  std::array<size_t, 4> node_cursor_{};
+  IssuedNodeStage& NodeStage(size_t slot, size_t index = 0) { return issued_node_stage_.at(slot).at(index); }
+  bool NodesDone(size_t slot) const {
+    return node_cursor_[slot] == NodeCount(slot) &&
+           std::all_of(issued_node_stage_[slot].begin(), issued_node_stage_[slot].begin() + NodeCount(slot),
+                       [](IssuedNodeStage stage) { return stage == IssuedNodeStage::kDone; });
+  }
   M0SyntheticIssuedReceiptV1* issued_audit_ = nullptr;
   std::array<bool, 4> issued_inferred_child_{};
   IssuedEffect issued_effect_ = IssuedEffect::kNone;
