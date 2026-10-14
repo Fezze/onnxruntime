@@ -4,6 +4,7 @@
 #include "core/session/plugin_ep/ep_plugin_provider_interfaces.h"
 
 #include <gsl/gsl>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -269,6 +270,54 @@ PluginExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph_vie
   if (Status status = EpGraph::Create(graph_viewer, ep_graph, true); !status.IsOK()) {
     LOGS(logger, ERROR) << "Failed to create OrtGraph for " << Type() << ": " << status.ToString();
     return {};
+  }
+
+  // M0 RW01 diagnostic: preserve typed runtime nodes before each capability
+  // pass. No graph/provider selection or tensor execution behavior changes.
+  if (Type() == "WebGpuExecutionProvider") {
+    static std::atomic<uint64_t> m0_pass{0};
+    const auto pass = m0_pass.fetch_add(1);
+    constexpr char digits[] = "0123456789abcdef";
+    for (const auto& entry : graph_viewer.GetAllInitializedTensors()) {
+      ONNX_NAMESPACE::GraphProto record;
+      record.set_name(graph_viewer.Name());
+      auto* tensor = record.add_initializer();
+      if (entry.second->ByteSizeLong() <= 4096) {
+        *tensor = *entry.second;
+      } else {
+        tensor->set_name(entry.first);
+        tensor->set_data_type(entry.second->data_type());
+        for (auto dim : entry.second->dims()) tensor->add_dims(dim);
+        tensor->set_doc_string("M0 audit metadata only: payload omitted over 4096 serialized bytes");
+      }
+      const auto bytes = record.SerializeAsString();
+      std::string hex;
+      hex.reserve(bytes.size() * 2);
+      for (unsigned char byte : bytes) { hex += digits[byte >> 4]; hex += digits[byte & 15]; }
+      LOGS(logger, INFO) << "M0_RW01_INIT " << pass << " " << hex;
+    }
+    for (const auto index : graph_viewer.GetNodesInTopologicalOrder()) {
+      const auto* node = graph_viewer.GetNode(index);
+      if (!node) continue;
+      ONNX_NAMESPACE::GraphProto record;
+      record.set_name(graph_viewer.Name());
+      node->ToProto(*record.add_node());
+      std::unordered_set<std::string> seen;
+      auto add_arg = [&](const NodeArg* arg) {
+        if (!arg || !arg->Exists() || !seen.insert(arg->Name()).second) return;
+        auto* value = record.add_value_info();
+        value->set_name(arg->Name());
+        if (arg->TypeAsProto()) *value->mutable_type() = *arg->TypeAsProto();
+      };
+      for (const auto* arg : node->InputDefs()) add_arg(arg);
+      for (const auto* arg : node->OutputDefs()) add_arg(arg);
+      const auto bytes = record.SerializeAsString();
+      std::string hex;
+      hex.reserve(bytes.size() * 2);
+      for (unsigned char byte : bytes) { hex += digits[byte >> 4]; hex += digits[byte & 15]; }
+      LOGS(logger, INFO) << "M0_RW01_NODE " << pass << " " << index << " "
+                         << node->SinceVersion() << " " << hex;
+    }
   }
 
   OrtEpGraphSupportInfo api_graph_support_info(*ep_graph, kernel_lookup);

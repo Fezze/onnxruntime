@@ -26,6 +26,7 @@
 #endif
 #include "core/common/span_utils.h"
 #include "core/common/status.h"
+#include "core/graph/m0_synthetic_owner_v1.h"
 #include "core/common/logging/logging.h"
 #include "core/framework/ort_value.h"
 #include "core/framework/prepacked_weights_container.h"
@@ -586,6 +587,8 @@ class Node {
   // NOTE: This friendship relationship should ONLY be used for calling methods of the Node class and not accessing
   // the data members directly, so that the Node can maintain its internal invariants.
   friend class Graph;
+  friend class M0SyntheticOwnerV1;
+  friend class M0SyntheticOwnerFactoryV1;
   Node(NodeIndex index, Graph& graph);
 
  protected:
@@ -1799,6 +1802,13 @@ class Graph {  // NOLINT(clang-analyzer-optin.performance.Padding): preserve exi
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(Graph);
 
  private:
+  friend class M0SyntheticOwnerV1;
+  friend class M0SyntheticOwnerFactoryV1;
+  const Model& owning_model_;
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  friend class GraphInferencerImpl;
+#endif
+  M0GraphRegistrationV1 m0_registration_v1_;
   int32_t weight_data_type_freq_[ONNX_NAMESPACE::TensorProto_DataType_DataType_ARRAYSIZE] = {0};
 
   void InitializeStateFromModelFileGraphProto();
@@ -1935,6 +1945,18 @@ class Graph {  // NOLINT(clang-analyzer-optin.performance.Padding): preserve exi
   common::Status PerformTopologicalSortAndCheckIsAcyclic();
 
   common::Status PerformTypeAndShapeInferencing(const ResolveOptions& options);
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  common::Status PerformTypeAndShapeInferencing(const ResolveOptions& options,
+                                                M0SyntheticOwnerV1::ScopeLayer& layer);
+  common::Status VerifyNodeAndOpMatch(const ResolveOptions& options,
+                                      M0SyntheticOwnerV1::ScopeLayer* layer);
+  common::Status InferAndVerifyTypeMatch(Node& node, const ONNX_NAMESPACE::OpSchema& op,
+                                         const ResolveOptions& options, M0SyntheticOwnerV1::NodeLayer* layer);
+  static common::Status InferAndVerifySubgraphTypes(const Node& node, Graph& subgraph,
+                                                    const std::vector<const ONNX_NAMESPACE::TypeProto*>& inputs,
+                                                    std::vector<const ONNX_NAMESPACE::TypeProto*>& outputs,
+                                                    const ResolveOptions& options, M0SyntheticOwnerV1::ChildJoin* join);
+#endif
 
   common::Status InferAndVerifyTypeMatch(Node& node, const ONNX_NAMESPACE::OpSchema& op, const ResolveOptions& options);
 
@@ -2048,8 +2070,6 @@ class Graph {  // NOLINT(clang-analyzer-optin.performance.Padding): preserve exi
   }
 
   Status LoadFromModelEditorApiModel(const OrtGraph& api_graph, bool updating_existing_graph = false);
-
-  const Model& owning_model_;
 
   // GraphProto to store name, version, initializer.
   // When serializing <*this> Graph to a GraphProto, the nodes and

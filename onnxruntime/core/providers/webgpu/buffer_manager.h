@@ -12,6 +12,7 @@
 
 #include "core/common/inlined_containers.h"
 #include "core/framework/execution_provider.h"
+#include "core/providers/webgpu/m0_fullgpu_resource_ownership.h"
 
 namespace onnxruntime {
 namespace webgpu {
@@ -105,6 +106,7 @@ class BufferManager {
   void RefreshPendingBuffers(CommandRecordingState& recording, GraphCaptureState graph_capture_state) const;
   // Drop retained references when a recording is abandoned instead of submitted.
   void DiscardPendingBuffers(CommandRecordingState& recording) const;
+  M0FullGpuResourceOwnership& M0OwnershipV2() const;
 
   std::vector<std::pair<size_t, WGPUBuffer>> ExtractCachedBuffers(wgpu::BufferUsage usage);
   void AbsorbCachedBuffers(wgpu::BufferUsage usage,

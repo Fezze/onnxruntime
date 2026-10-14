@@ -169,6 +169,51 @@ class ComputeContext final : public ComputeContextBase {
     return kernel_context_;
   }
 
+  uint32_t M0FullGpuFaultModeV2() const { return ep_.M0FullGpuFaultModeV2(); }
+
+  bool M0FullGpuRegisterTerminalFaultV2(const Tensor& packet) const {
+    if (M0FullGpuFaultModeV2() != 20) return true;
+    M0FullGpuAllocationIdentity id;
+    return M0FullGpuDescribeResourceV2(packet, id) &&
+      webgpu_context_.M0FaultHooksV2().RegisterTerminal(
+        reinterpret_cast<uintptr_t>(packet.DataRaw()), id.generation,
+        kernel_context_.M0FullGpuExtentOwnerEpochV1(), kernel_context_.M0FullGpuExtentRunIdV2());
+  }
+
+  // Opaque allocation administration only: these methods never map or inspect
+  // tensor values. Device guards must validate the corresponding sidecar words.
+  bool M0FullGpuDescribeResourceV2(const Tensor& tensor,
+                                  M0FullGpuAllocationIdentity& out) const {
+    if (tensor.Location().device.Type() != OrtDevice::GPU || !tensor.DataRaw()) return false;
+    return webgpu_context_.M0OwnershipV2().Describe(
+        reinterpret_cast<uintptr_t>(tensor.DataRaw()), out);
+  }
+
+  bool M0FullGpuDescribePairV2(const Tensor& sidecar, const Tensor& carrier,
+                              M0FullGpuAllocationIdentity& out) const {
+    if (sidecar.Location().device.Type() != OrtDevice::GPU ||
+        carrier.Location().device.Type() != OrtDevice::GPU) return false;
+    return webgpu_context_.M0OwnershipV2().DescribePair(
+        reinterpret_cast<uintptr_t>(sidecar.DataRaw()),
+        reinterpret_cast<uintptr_t>(carrier.DataRaw()), out);
+  }
+
+  bool M0FullGpuClaimExtentV2(const Tensor& sidecar, const Tensor& carrier,
+                             uint32_t role, uint32_t producer_instance,
+                             M0FullGpuAllocationIdentity& out) const {
+    M0FullGpuAllocationIdentity sidecar_id, carrier_id;
+    const uint64_t session = kernel_context_.M0FullGpuExtentOwnerEpochV1();
+    const uint64_t run = kernel_context_.M0FullGpuExtentRunIdV2();
+    if (!session || !run || !M0FullGpuDescribeResourceV2(sidecar, sidecar_id) ||
+        !M0FullGpuDescribeResourceV2(carrier, carrier_id)) return false;
+    auto& ownership = webgpu_context_.M0OwnershipV2();
+    if (!ownership.Claim(reinterpret_cast<uintptr_t>(sidecar.DataRaw()),
+                         sidecar_id.generation, session, run, role,
+                         reinterpret_cast<uintptr_t>(carrier.DataRaw()),
+                         carrier_id.generation, producer_instance)) return false;
+    return M0FullGpuDescribePairV2(sidecar, carrier, out);
+  }
+
   //
   // Get input tensor.
   //

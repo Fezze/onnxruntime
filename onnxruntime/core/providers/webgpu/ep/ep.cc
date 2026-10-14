@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "ep.h"
+#include <sstream>
 
 #include "allocator.h"
 #include "factory.h"
@@ -90,6 +91,19 @@ OrtStatus* ORT_API_CALL Ep::GetCapabilityImpl(OrtEp* this_ptr, const OrtGraph* g
     const OrtKernelDef* kernel_def = nullptr;
     RETURN_IF_ERROR(Api().ep.EpGraphSupportInfo_LookUpKernel(graph_support_info, node, &kernel_def));
 
+    LOGS(ep.GetEpLogger(), INFO) << "M0_RW01_LOOKUP index=" << node.GetId()
+                                 << " result=" << (kernel_def ? "found" : "missing");
+    if (kernel_def != nullptr) {
+      Ort::ConstKernelDef definition{kernel_def};
+      std::ostringstream memory;
+      memory << "M0_RW01_MEMORY index=" << node.GetId() << " inputs=";
+      const auto inputs = node.GetInputs();
+      const auto outputs = node.GetOutputs();
+      for (size_t i = 0; i < inputs.size(); ++i) memory << int(definition.GetInputMemType(i)) << ",";
+      memory << " outputs=";
+      for (size_t i = 0; i < outputs.size(); ++i) memory << int(definition.GetOutputMemType(i)) << ",";
+      LOGS(ep.GetEpLogger(), INFO) << memory.str();
+    }
     if (kernel_def == nullptr) {
       LOGS(ep.GetEpLogger(), INFO) << "webgpu kernel not found in registries for Op type: "
                                    << node.GetOperatorType() << " node name: " << node.GetName();
@@ -160,6 +174,8 @@ OrtStatus* ORT_API_CALL Ep::GetCapabilityImpl(OrtEp* this_ptr, const OrtGraph* g
                                                         cpu_preferred_nodes));
 
   for (const auto& node : candidate_nodes) {
+    LOGS(ep.GetEpLogger(), INFO) << "M0_RW01_CAPABILITY name=" << Ort::ConstNode{node}.GetName()
+                                 << " decision=" << (cpu_preferred_nodes.count(node) ? "cpu_preferred" : "candidate_only");
     if (cpu_preferred_nodes.count(node) == 0) {
       RETURN_IF_ERROR(Api().ep.EpGraphSupportInfo_AddSingleNode(graph_support_info, node));
     }
@@ -232,6 +248,19 @@ OrtStatus* ORT_API_CALL Ep::OnRunStartImpl(_In_ OrtEp* this_ptr,
                                     status.ErrorMessage().c_str());
     }
   }
+  for (const char* key : {"m0.fullgpu.actual_session_v2", "m0.fullgpu.actual_run_v2",
+                          "m0.fullgpu.fault_authorized_v2", "m0.fullgpu.diagnostic_fault_mode_v2"}) {
+    const char* value = Api().ort.GetRunConfigEntry(run_options, key);
+    if (value) {
+      auto forwarded = options.config_options.AddConfigEntry(key, value);
+      if (!forwarded.IsOK()) return Api().ort.CreateStatus(static_cast<OrtErrorCode>(forwarded.Code()), forwarded.ErrorMessage().c_str());
+    }
+  }
+  auto ownership = Api().ort.GetRunConfigEntry(run_options, "m0.fullgpu.extent_ownership_v2");
+  if (ownership != nullptr) {
+    auto status = options.config_options.AddConfigEntry("m0.fullgpu.extent_ownership_v2", ownership);
+    if (!status.IsOK()) return Api().ort.CreateStatus(static_cast<OrtErrorCode>(status.Code()), status.ErrorMessage().c_str());
+  }
   auto* ep = static_cast<Ep*>(this_ptr);
   auto status = ep->EpImpl()->OnRunStart(options);
   if (!status.IsOK()) {
@@ -243,11 +272,25 @@ OrtStatus* ORT_API_CALL Ep::OnRunStartImpl(_In_ OrtEp* this_ptr,
 }
 
 OrtStatus* ORT_API_CALL Ep::OnRunEndImpl(_In_ OrtEp* this_ptr,
-                                         _In_ const OrtRunOptions* /*run_options*/,
+                                         _In_ const OrtRunOptions* run_options,
                                          _In_ bool sync_stream) noexcept {
   EXCEPTION_TO_RETURNED_STATUS_BEGIN
   auto* ep = static_cast<Ep*>(this_ptr);
-  auto status = ep->EpImpl()->OnRunEnd(sync_stream, {});
+  onnxruntime::RunOptions options{};
+  for (const char* key : {"m0.fullgpu.actual_session_v2", "m0.fullgpu.actual_run_v2",
+                          "m0.fullgpu.fault_authorized_v2", "m0.fullgpu.diagnostic_fault_mode_v2"}) {
+    const char* value = Api().ort.GetRunConfigEntry(run_options, key);
+    if (value) {
+      auto forwarded = options.config_options.AddConfigEntry(key, value);
+      if (!forwarded.IsOK()) return Api().ort.CreateStatus(static_cast<OrtErrorCode>(forwarded.Code()), forwarded.ErrorMessage().c_str());
+    }
+  }
+  auto ownership = Api().ort.GetRunConfigEntry(run_options, "m0.fullgpu.extent_ownership_v2");
+  if (ownership != nullptr) {
+    auto added = options.config_options.AddConfigEntry("m0.fullgpu.extent_ownership_v2", ownership);
+    if (!added.IsOK()) return Api().ort.CreateStatus(static_cast<OrtErrorCode>(added.Code()), added.ErrorMessage().c_str());
+  }
+  auto status = ep->EpImpl()->OnRunEnd(sync_stream, options);
   if (!status.IsOK()) {
     return Api().ort.CreateStatus(static_cast<OrtErrorCode>(status.Code()),
                                   status.ErrorMessage().c_str());

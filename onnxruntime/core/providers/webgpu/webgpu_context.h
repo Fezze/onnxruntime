@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 #pragma once
+#include "core/providers/webgpu/m0_fullgpu_resource_ownership.h"
+#include "core/providers/webgpu/m0_fullgpu_fault_hooks.h"
 
 #include <atomic>
 #include <functional>
@@ -328,6 +330,9 @@ class WebGpuContext final {
 
   // Context-level managers are shared by sessions and synchronize their buffer caches internally.
   webgpu::BufferManager& BufferManager() const { return *buffer_mgr_; }
+  webgpu::M0FullGpuResourceOwnership& M0OwnershipV2() const { return m0_ownership_v2_; }
+  webgpu::M0FullGpuFaultHooksV2& M0FaultHooksV2() const { return m0_fault_hooks_v2_; }
+  bool M0ProfilingActiveV2() const { return is_profiling_; }
   webgpu::BufferManager& InitializerBufferManager() const { return *initializer_buffer_mgr_; }
 
   inline webgpu::ValidationMode ValidationMode() const {
@@ -489,6 +494,8 @@ class WebGpuContext final {
   std::unordered_set<wgpu::FeatureName> device_features_;
   wgpu::AdapterPropertiesSubgroupMatrixConfigs subgroup_matrix_configs_;
 
+  mutable webgpu::M0FullGpuResourceOwnership m0_ownership_v2_;
+  mutable webgpu::M0FullGpuFaultHooksV2 m0_fault_hooks_v2_;
   std::unique_ptr<webgpu::BufferManager> buffer_mgr_;
   std::unique_ptr<webgpu::BufferManager> initializer_buffer_mgr_;
   std::unique_ptr<ProgramManager> program_mgr_;

@@ -3,6 +3,7 @@
 
 #include "core/providers/webgpu/buffer_manager.h"
 #include "core/providers/webgpu/webgpu_context.h"
+#include <gsl/gsl>
 
 namespace onnxruntime {
 namespace webgpu {
@@ -499,7 +500,12 @@ BufferManager::BufferManager(WebGpuContext& context, BufferCacheMode storage_buf
       default_cache_{CreateBufferCacheManager(default_buffer_cache_mode)} {
 }
 
+M0FullGpuResourceOwnership& BufferManager::M0OwnershipV2() const {
+  return context_.M0OwnershipV2();
+}
+
 void BufferManager::Upload(CommandRecordingState& recording, void* src, WGPUBuffer dst, size_t size) const {
+  LOGS_DEFAULT(INFO) << "M0_RW02_UPLOAD timeline=" << &recording << " bytes=" << size << " dst=" << dst;
   // If the buffer is mapped, we can directly write to it.
   void* mapped_data = wgpuBufferGetMappedRange(dst, 0, WGPU_WHOLE_MAP_SIZE);  // ensure the buffer is mapped
   if (mapped_data) {
@@ -563,20 +569,27 @@ WGPUBuffer BufferManager::Create(CommandRecordingState& recording, size_t size, 
     buffer = cache.TryAcquireCachedBuffer(buffer_size);
   }
   if (buffer) {
+    auto buffer_guard = wgpu::Buffer::Acquire(buffer);
+    const uint64_t generation = M0OwnershipV2().Acquire(reinterpret_cast<uintptr_t>(buffer), size);
+    bool ownership_committed = false;
+    auto ownership_rollback = gsl::finally([&]() {
+      if (!ownership_committed) M0OwnershipV2().Retire(reinterpret_cast<uintptr_t>(buffer), generation);
+    });
+    LOGS_DEFAULT(INFO) << "M0_RW02_ALLOC cached=1 requested=" << size << " actual=" << buffer_size << " handle=" << buffer;
+    LOGS_DEFAULT(INFO) << "M0_RW07_ALLOCATION_ACQUIRE handle=" << buffer << " generation=" << generation << " requested=" << size << " cached=1";
     if (initialize_to_zero) {
       // Plugin plain allocations pass call-local recording and submit only their own clear.
       // AllocOnStream defers the clear on the Session timeline. Built-in allocations use the
       // Session recording and retain their caller-supplied submission policy.
-      auto buffer_guard = wgpu::Buffer::Acquire(buffer);
       ORT_THROW_IF_ERROR(context_.EncodeDeferredDispatches(recording));
       context_.EndComputePass(recording);
       context_.GetCommandEncoder(recording).ClearBuffer(buffer, 0, buffer_size);
       if (submit_zero_initialize) {
         ORT_THROW_IF_ERROR(context_.Flush(*this, recording));
       }
-      return buffer_guard.MoveToCHandle();
     }
-    return buffer;
+    ownership_committed = true;
+    return buffer_guard.MoveToCHandle();
   }
 
   // cache miss, create a new buffer
@@ -587,14 +600,23 @@ WGPUBuffer BufferManager::Create(CommandRecordingState& recording, size_t size, 
     desc.mappedAtCreation = true;  // ensure the buffer is mapped for writing at creation
   }
   buffer = context_.Device().CreateBuffer(&desc).MoveToCHandle();
+  LOGS_DEFAULT(INFO) << "M0_RW02_ALLOC cached=0 requested=" << size << " actual=" << buffer_size << " handle=" << buffer;
 
   ORT_ENFORCE(buffer, "Failed to create GPU buffer: size=", buffer_size, ", usage=", uint64_t(usage), ".");
+  auto buffer_guard = wgpu::Buffer::Acquire(buffer);
+  const uint64_t generation = M0OwnershipV2().Acquire(reinterpret_cast<uintptr_t>(buffer), size);
+  bool ownership_committed = false;
+  auto ownership_rollback = gsl::finally([&]() {
+    if (!ownership_committed) M0OwnershipV2().Retire(reinterpret_cast<uintptr_t>(buffer), generation);
+  });
 
   {
     std::lock_guard<std::mutex> lock{mutex_};
     GetCacheManager(usage).RegisterBuffer(buffer, size);
   }
-  return buffer;
+  LOGS_DEFAULT(INFO) << "M0_RW07_ALLOCATION_ACQUIRE handle=" << buffer << " generation=" << generation << " requested=" << size << " cached=0";
+  ownership_committed = true;
+  return buffer_guard.MoveToCHandle();
 }
 
 bool BufferManager::SupportsUMA() const {
@@ -609,6 +631,13 @@ bool BufferManager::SupportsUMA() const {
 void BufferManager::Release(WGPUBuffer buffer, const CommandRecordingState* recording) const {
   EnforceBufferUnmapped(context_, buffer);
   std::lock_guard<std::mutex> lock{mutex_};
+  M0FullGpuAllocationIdentity identity;
+  ORT_ENFORCE(M0OwnershipV2().Describe(reinterpret_cast<uintptr_t>(buffer), identity) &&
+              M0OwnershipV2().Retire(reinterpret_cast<uintptr_t>(buffer), identity.generation),
+              "RW07 GPU allocation release identity missing");
+  context_.M0FaultHooksV2().RetireTerminal(reinterpret_cast<uintptr_t>(buffer), identity.generation);
+  LOGS_DEFAULT(INFO) << "M0_RW07_ALLOCATION_RETIRE handle=" << buffer << " generation=" << identity.generation
+                    << " requested=" << identity.requested_bytes;
   auto& cache = GetCacheManager(buffer);
   // Keep reusable buffers out of the cache while this recording has unsubmitted work.
   // Graph caches also need this protection from streamless allocations.
@@ -626,6 +655,7 @@ void BufferManager::Release(WGPUBuffer buffer, const CommandRecordingState* reco
 }
 
 void BufferManager::Download(CommandRecordingState& recording, WGPUBuffer src, void* dst, size_t size) const {
+  LOGS_DEFAULT(INFO) << "M0_RW02_DOWNLOAD_BEGIN timeline=" << &recording << " bytes=" << size << " src=" << src;
   // Encode pending deferred dispatches before recording the readback; the flush below submits both
   // in order.
   ORT_THROW_IF_ERROR(context_.EncodeDeferredDispatches(recording));
@@ -648,26 +678,80 @@ void BufferManager::Download(CommandRecordingState& recording, WGPUBuffer src, v
   struct MapAsyncResult {
     wgpu::MapAsyncStatus status{};
     std::string message{};
-  } map_async_result;
+    bool callback_exception = false;
+    wgpu::Buffer staging;
+    wgpu::Buffer source;
+  };
+  auto map_async_result = std::make_shared<MapAsyncResult>();
+  map_async_result->staging = staging_buffer;
+  wgpuBufferAddRef(src);
+  map_async_result->source = wgpu::Buffer::Acquire(src);
 
-  ORT_THROW_IF_ERROR(context_.Wait(
+  M0FullGpuAllocationIdentity source_identity;
+  const bool injected_invalid_map = M0OwnershipV2().Describe(reinterpret_cast<uintptr_t>(src), source_identity) &&
+    context_.M0FaultHooksV2().ConsumeInvalidTerminalMap(reinterpret_cast<uintptr_t>(src), source_identity.generation);
+  if (injected_invalid_map) { LOGS_DEFAULT(INFO) << "M0_RW07_ACTUAL_INVALID_MAP_BEGIN src=" << src
+      << " generation=" << source_identity.generation << " allocation_bytes=" << buffer_size
+      << " requested_map_bytes=" << (buffer_size + 8); }
+  auto pop_injected_scope = [&]() -> Status {
+    struct ScopeResult {
+      wgpu::PopErrorScopeStatus pop{};
+      wgpu::ErrorType error{};
+      bool received = false, callback_exception = false;
+      std::string message;
+    };
+    auto scope = std::make_shared<ScopeResult>();
+    const auto waited = context_.Wait(context_.Device().PopErrorScope(wgpu::CallbackMode::WaitAnyOnly,
+      [scope](wgpu::PopErrorScopeStatus pop, wgpu::ErrorType error, wgpu::StringView message) noexcept {
+        scope->pop = pop; scope->error = error; scope->received = true;
+        try { scope->message = std::string{std::string_view(message)}; }
+        catch (...) { scope->callback_exception = true; }
+      }));
+    if (!waited.IsOK() || !scope->received || scope->callback_exception ||
+        scope->pop != wgpu::PopErrorScopeStatus::Success ||
+        (scope->error != wgpu::ErrorType::Validation && scope->error != wgpu::ErrorType::NoError)) {
+      context_.M0OwnershipV2().Poison();
+      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07 unknown injected map scope completion");
+    }
+    LOGS_DEFAULT(INFO) << "M0_RW07_ACTUAL_INVALID_MAP_SCOPE pop=" << static_cast<int>(scope->pop)
+      << " error=" << static_cast<int>(scope->error) << " message=" << scope->message;
+    return Status::OK();
+  };
+  bool injected_scope_pending = false;
+  auto injected_scope_cleanup = gsl::finally([&]() noexcept {
+    if (!injected_scope_pending) return;
+    try { if (!pop_injected_scope().IsOK()) context_.M0OwnershipV2().Poison(); }
+    catch (...) { context_.M0OwnershipV2().Poison(); }
+  });
+  if (injected_invalid_map) { context_.PushErrorScope(wgpu::ErrorFilter::Validation); injected_scope_pending = true; }
+  const auto map_wait_status = context_.Wait(
       staging_buffer.MapAsync(
-          wgpu::MapMode::Read, 0, buffer_size, wgpu::CallbackMode::WaitAnyOnly,
+          wgpu::MapMode::Read, 0, injected_invalid_map ? buffer_size + 8 : buffer_size, wgpu::CallbackMode::WaitAnyOnly,
           // Note: Don't throw from a Dawn callback.
-          [](wgpu::MapAsyncStatus status, wgpu::StringView message,
-             MapAsyncResult* result) noexcept {
-            result->status = status;
-            if (auto message_sv = static_cast<std::string_view>(message);
-                !message_sv.empty()) {
-              result->message = std::string{message_sv};
-            }
-          },
-          &map_async_result)));
+          [map_async_result](wgpu::MapAsyncStatus status, wgpu::StringView message) noexcept {
+            map_async_result->status = status;
+            try {
+              if (auto message_sv = static_cast<std::string_view>(message); !message_sv.empty())
+                map_async_result->message = std::string{message_sv};
+            } catch (...) { map_async_result->callback_exception = true; }
+          }));
+  if (!map_wait_status.IsOK()) context_.M0OwnershipV2().Poison();
+  ORT_THROW_IF_ERROR(map_wait_status);
+  if (injected_scope_pending) {
+    injected_scope_pending = false;
+    try { ORT_THROW_IF_ERROR(pop_injected_scope()); }
+    catch (...) { context_.M0OwnershipV2().Poison(); throw; }
+  }
+  ORT_ENFORCE(!map_async_result->callback_exception, "RW07 map callback metadata allocation failed");
 
-  ORT_ENFORCE(map_async_result.status == wgpu::MapAsyncStatus::Success,
+  if (injected_invalid_map) { LOGS_DEFAULT(INFO) << "M0_RW07_ACTUAL_INVALID_MAP_CALLBACK src=" << src
+      << " generation=" << source_identity.generation << " status=" << static_cast<int>(map_async_result->status)
+      << " message=" << map_async_result->message << " wait_completed=1 source_staging_retained=1"; }
+  ORT_ENFORCE(map_async_result->status == wgpu::MapAsyncStatus::Success,
               "Failed to download data from buffer. wgpu::MapAsyncStatus value: ",
-              static_cast<int>(map_async_result.status), ", message: ", map_async_result.message);
+              static_cast<int>(map_async_result->status), ", message: ", map_async_result->message);
 
+  LOGS_DEFAULT(INFO) << "M0_RW02_DOWNLOAD_COMPLETE timeline=" << &recording << " src=" << src << " status=success";
   auto mapped_data = staging_buffer.GetConstMappedRange();
   memcpy(dst, mapped_data, size);
   staging_buffer.Unmap();

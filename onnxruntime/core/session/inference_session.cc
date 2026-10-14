@@ -492,6 +492,11 @@ void InferenceSession::SetLoggingManager(const SessionOptions& session_options,
 
 void InferenceSession::ConstructorCommon(const SessionOptions& session_options,
                                          const Environment& session_env) {
+  if (m0_fullgpu_strict_requested_v1_) {
+    ORT_THROW_IF_ERROR(M0FullGpuValidateIngressAuthoritiesV1(session_options));
+    const auto model_config = Env::Default().GetEnvironmentVar(inference_session_utils::kOrtLoadConfigFromModelEnvVar);
+    ORT_ENFORCE(model_config.empty() || model_config == "0", "RW07_PREINIT_DENY_ENVIRONMENT");
+  }
   auto status = FinalizeSessionOptions(session_options, model_proto_, is_model_proto_parsed_, session_options_);
   ORT_ENFORCE(status.IsOK(), "Could not finalize session options while constructing the inference session. Error Message: ",
               status.ErrorMessage());
@@ -840,6 +845,7 @@ InferenceSession::InferenceSession(const SessionOptions& session_options, const 
 #if !defined(ORT_MINIMAL_BUILD)
       graph_transformer_mgr_(session_options.max_num_graph_transformation_steps),
 #endif
+      m0_fullgpu_strict_requested_v1_(M0FullGpuPreinitRequestedV1(session_options)),
       environment_(session_env) {
   // Initialize assets of this session instance
   ConstructorCommon(session_options, session_env);
@@ -853,6 +859,7 @@ InferenceSession::InferenceSession(const SessionOptions& session_options,
 #if !defined(ORT_MINIMAL_BUILD)
       graph_transformer_mgr_(session_options.max_num_graph_transformation_steps),
 #endif
+      m0_fullgpu_strict_requested_v1_(M0FullGpuPreinitRequestedV1(session_options)),
       external_intra_op_thread_pool_(external_intra_op_thread_pool),
       external_inter_op_thread_pool_(external_inter_op_thread_pool),
       environment_(session_env) {
@@ -865,7 +872,9 @@ InferenceSession::InferenceSession(const SessionOptions& session_options, const 
                                    const PathString& model_uri)
     : model_location_(model_uri),
       graph_transformer_mgr_(session_options.max_num_graph_transformation_steps),
+      m0_fullgpu_strict_requested_v1_(M0FullGpuPreinitRequestedV1(session_options)),
       environment_(session_env) {
+  ORT_THROW_IF_ERROR(M0FullGpuCheckPreloadV1(session_options));
   auto status = Model::Load(model_location_, model_proto_);
   ORT_ENFORCE(status.IsOK(), "Given model could not be parsed while creating inference session. Error message: ",
               status.ErrorMessage());
@@ -885,7 +894,9 @@ InferenceSession::InferenceSession(const SessionOptions& session_options,
 InferenceSession::InferenceSession(const SessionOptions& session_options, const Environment& session_env,
                                    std::istream& model_istream)
     : graph_transformer_mgr_(session_options.max_num_graph_transformation_steps),
+      m0_fullgpu_strict_requested_v1_(M0FullGpuPreinitRequestedV1(session_options)),
       environment_(session_env) {
+  ORT_THROW_IF_ERROR(M0FullGpuCheckPreloadV1(session_options));
   Status st = Model::Load(model_istream, &model_proto_);
   ORT_ENFORCE(st.IsOK(), "Could not parse model successfully while constructing the inference session");
   is_model_proto_parsed_ = true;
@@ -896,7 +907,9 @@ InferenceSession::InferenceSession(const SessionOptions& session_options, const 
 InferenceSession::InferenceSession(const SessionOptions& session_options, const Environment& session_env,
                                    const void* model_data, int model_data_len)
     : graph_transformer_mgr_(session_options.max_num_graph_transformation_steps),
+      m0_fullgpu_strict_requested_v1_(M0FullGpuPreinitRequestedV1(session_options)),
       environment_(session_env) {
+  ORT_THROW_IF_ERROR(M0FullGpuCheckPreloadV1(session_options));
   const bool result = model_proto_.ParseFromArray(model_data, model_data_len);
   ORT_ENFORCE(result, "Could not parse model successfully while constructing the inference session");
   is_model_proto_parsed_ = true;
@@ -984,6 +997,7 @@ InferenceSession::~InferenceSession() {
 }
 
 common::Status InferenceSession::RegisterExecutionProvider(const std::shared_ptr<IExecutionProvider>& p_exec_provider) {
+  ORT_RETURN_IF_ERROR(M0FullGpuCheckIngressV1());
   if (p_exec_provider == nullptr) {
     return Status(common::ONNXRUNTIME, common::FAIL, "Received nullptr for exec provider");
   }
@@ -1081,6 +1095,7 @@ common::Status InferenceSession::RegisterExecutionProvider(const std::shared_ptr
 // Custom Op support
 #if !defined(ORT_MINIMAL_BUILD) || defined(ORT_MINIMAL_BUILD_CUSTOM_OPS)
 common::Status InferenceSession::AddCustomOpDomains(gsl::span<OrtCustomOpDomain* const> op_domains) {
+  ORT_RETURN_IF_ERROR(M0FullGpuCheckIngressV1());
   std::shared_ptr<CustomRegistry> custom_registry;
   ORT_RETURN_IF_ERROR_SESSIONID_(CreateCustomRegistry(op_domains, custom_registry));
   ORT_RETURN_IF_ERROR_SESSIONID_(RegisterCustomRegistry(custom_registry));
@@ -1088,6 +1103,7 @@ common::Status InferenceSession::AddCustomOpDomains(gsl::span<OrtCustomOpDomain*
 }
 
 common::Status InferenceSession::RegisterCustomRegistry(std::shared_ptr<CustomRegistry> custom_registry) {
+  ORT_RETURN_IF_ERROR(M0FullGpuCheckIngressV1());
   if (custom_registry == nullptr) {
     return Status(common::ONNXRUNTIME, common::FAIL, "Received nullptr for custom registry");
   }
@@ -1113,6 +1129,7 @@ common::Status InferenceSession::RegisterCustomRegistry(std::shared_ptr<CustomRe
 #if !defined(ORT_MINIMAL_BUILD)
 common::Status InferenceSession::RegisterGraphTransformer(
     std::unique_ptr<onnxruntime::GraphTransformer> p_graph_transformer, TransformerLevel level) {
+  ORT_RETURN_IF_ERROR(M0FullGpuCheckIngressV1());
   if (p_graph_transformer == nullptr) {
     return Status(common::ONNXRUNTIME, common::FAIL, "Received nullptr for graph transformer");
   }
@@ -1175,6 +1192,7 @@ common::Status InferenceSession::SaveToOrtFormat(const std::filesystem::path& fi
 
 common::Status InferenceSession::LoadWithLoader(std::function<common::Status(std::shared_ptr<Model>&)> loader,
                                                 const std::string& event_name) {
+  ORT_RETURN_IF_ERROR(M0FullGpuCheckIngressV1());
   Status status = Status::OK();
   TimePoint tp{};
 #if defined(ORT_USE_TELEMETRY)
@@ -1249,7 +1267,7 @@ common::Status InferenceSession::LoadOnnxModel(const PathString& model_uri) {
 
     const bool strict_shape_type_inference = session_options_.config_options.GetConfigOrDefault(
                                                  kOrtSessionOptionsConfigStrictShapeTypeInference, "0") == "1";
-    ModelOptions model_opts{true, strict_shape_type_inference, check_load_cancellation_fn_};
+    ModelOptions model_opts{true, strict_shape_type_inference, check_load_cancellation_fn_, m0_fullgpu_strict_requested_v1_};
 
     // When set, the external initializers folder overrides the model's own directory as the
     // base for resolving external data. The model bytes are still read from model_uri.
@@ -1283,6 +1301,7 @@ common::Status InferenceSession::FilterEnabledOptimizers(InlinedHashSet<std::str
 #endif  // !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
 
 common::Status InferenceSession::Load(const PathString& model_uri) {
+  ORT_RETURN_IF_ERROR(M0FullGpuCheckIngressV1());
   std::string model_type = session_options_.config_options.GetConfigOrDefault(kOrtSessionOptionsConfigLoadModelFormat, "");
   bool has_explicit_type = !model_type.empty();
 
@@ -1311,6 +1330,7 @@ common::Status InferenceSession::Load(const std::string& model_uri) {
 #endif
 
 common::Status InferenceSession::Load(const void* model_data, int model_data_len) {
+  ORT_RETURN_IF_ERROR(M0FullGpuCheckIngressV1());
   std::string model_type = session_options_.config_options.GetConfigOrDefault(kOrtSessionOptionsConfigLoadModelFormat, "");
   bool has_explicit_type = !model_type.empty();
 
@@ -1353,7 +1373,7 @@ common::Status InferenceSession::Load(const void* model_data, int model_data_len
 
     return onnxruntime::Model::Load(std::move(model_proto), model_location_, model,
                                     HasLocalSchema() ? &custom_schema_registries_ : nullptr, *session_logger_,
-                                    ModelOptions{true, strict_shape_type_inference, check_load_cancellation_fn_});
+                                    ModelOptions{true, strict_shape_type_inference, check_load_cancellation_fn_, m0_fullgpu_strict_requested_v1_});
   };
 
   return LoadWithLoader(loader, "model_loading_array");
@@ -1393,6 +1413,7 @@ Status GetGqaValueLayout(const ConfigOptions& config_options, std::string& layou
 #if !defined(ORT_MINIMAL_BUILD)
 
 common::Status InferenceSession::LoadOnnxModel(ModelProto model_proto) {
+  ORT_RETURN_IF_ERROR(M0FullGpuCheckIngressV1());
   if (is_model_proto_parsed_) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL,
                            "ModelProto corresponding to the model to be loaded has already been parsed. "
@@ -1418,17 +1439,19 @@ common::Status InferenceSession::LoadOnnxModel(ModelProto model_proto) {
     // This call will move model_proto to the constructed model instance
     return onnxruntime::Model::Load(std::move(model_proto), model_location_, model,
                                     HasLocalSchema() ? &custom_schema_registries_ : nullptr, *session_logger_,
-                                    ModelOptions{true, strict_shape_type_inference, check_load_cancellation_fn_});
+                                    ModelOptions{true, strict_shape_type_inference, check_load_cancellation_fn_, m0_fullgpu_strict_requested_v1_});
   };
 
   return LoadWithLoader(loader, "model_loading_proto");
 }
 
 common::Status InferenceSession::LoadOnnxModel(std::unique_ptr<ModelProto> p_model_proto) {
+  ORT_RETURN_IF_ERROR(M0FullGpuCheckIngressV1());
   return LoadOnnxModel(std::move(*p_model_proto));
 }
 
 common::Status InferenceSession::Load(std::istream& model_istream, bool allow_released_opsets_only) {
+  ORT_RETURN_IF_ERROR(M0FullGpuCheckIngressV1());
   if (is_model_proto_parsed_) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL,
                            "ModelProto corresponding to the model to be loaded has already been parsed. "
@@ -1450,7 +1473,7 @@ common::Status InferenceSession::Load(std::istream& model_istream, bool allow_re
 #endif
     const bool strict_shape_type_inference = session_options_.config_options.GetConfigOrDefault(
                                                  kOrtSessionOptionsConfigStrictShapeTypeInference, "0") == "1";
-    ModelOptions model_opts{allow_released_opsets_only, strict_shape_type_inference, check_load_cancellation_fn_};
+    ModelOptions model_opts{allow_released_opsets_only, strict_shape_type_inference, check_load_cancellation_fn_, m0_fullgpu_strict_requested_v1_};
 
     PathString external_data_model_path = GetExternalInitializersFolderModelPath(session_options_.config_options);
     if (!external_data_model_path.empty()) {
@@ -1466,6 +1489,7 @@ common::Status InferenceSession::Load(std::istream& model_istream, bool allow_re
 }
 
 common::Status InferenceSession::Load() {
+  ORT_RETURN_IF_ERROR(M0FullGpuCheckIngressV1());
   if (!is_model_proto_parsed_) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL,
                            "ModelProto corresponding to the model to be loaded has not been parsed yet. "
@@ -1493,13 +1517,14 @@ common::Status InferenceSession::Load() {
     // Pass on ownership of the parsed ModelProto to the Model instance (its job here is done by this stage)
     return Model::Load(std::move(this->model_proto_), model_location_, model,
                        HasLocalSchema() ? &custom_schema_registries_ : nullptr, *session_logger_,
-                       ModelOptions{allow_released_opsets_only, strict_shape_type_inference, check_load_cancellation_fn_});
+                       ModelOptions{allow_released_opsets_only, strict_shape_type_inference, check_load_cancellation_fn_, m0_fullgpu_strict_requested_v1_});
   };
 
   return LoadWithLoader(loader, "model_loading_from_saved_proto");
 }
 
 common::Status InferenceSession::Load(const OrtModel& model_editor_api_model) {
+  ORT_RETURN_IF_ERROR(M0FullGpuCheckIngressV1());
   std::lock_guard<std::mutex> l(session_mutex_);
 
   if (is_model_loaded_) {  // already loaded
@@ -1522,7 +1547,7 @@ common::Status InferenceSession::Load(const OrtModel& model_editor_api_model) {
   ORT_RETURN_IF_ERROR(Model::LoadFromModelEditorApiModel(model_editor_api_model,
                                                          HasLocalSchema() ? &custom_schema_registries_ : nullptr,
                                                          ModelOptions{true, strict_shape_type_inference,
-                                                                      check_load_cancellation_fn_},
+                                                                      check_load_cancellation_fn_, m0_fullgpu_strict_requested_v1_},
                                                          *session_logger_, tmp_model));
 
   model_ = std::move(tmp_model);
@@ -1533,6 +1558,7 @@ common::Status InferenceSession::Load(const OrtModel& model_editor_api_model) {
 }
 
 common::Status InferenceSession::ApplyUpdates(const OrtModel& model_editor_api_model) {
+  ORT_RETURN_IF_ERROR(M0FullGpuCheckIngressV1());
   std::lock_guard<std::mutex> l(session_mutex_);
 
   if (!is_model_loaded_) {
@@ -2191,6 +2217,7 @@ Status InferenceSession::LoadOrtModel(const void* model_data, int model_data_len
 }
 
 Status InferenceSession::LoadOrtModelWithLoader(std::function<Status()> load_ort_format_model_bytes) {
+  ORT_RETURN_IF_ERROR(M0FullGpuCheckIngressV1());
 #if defined(_WIN32) || defined(ORT_USE_TELEMETRY)
   const Env& env = Env::Default();
 #endif
@@ -2309,9 +2336,9 @@ Status InferenceSession::LoadOrtModelWithLoader(std::function<Status()> load_ort
 #if !defined(ORT_MINIMAL_BUILD)
   ORT_RETURN_IF_ERROR(Model::LoadFromOrtFormat(*fbs_model,
                                                HasLocalSchema() ? &custom_schema_registries_ : nullptr,
-                                               load_options, *session_logger_, tmp_model));
+                                               load_options, *session_logger_, tmp_model, m0_fullgpu_strict_requested_v1_));
 #else
-  ORT_RETURN_IF_ERROR(Model::LoadFromOrtFormat(*fbs_model, load_options, *session_logger_, tmp_model));
+  ORT_RETURN_IF_ERROR(Model::LoadFromOrtFormat(*fbs_model, load_options, *session_logger_, tmp_model, m0_fullgpu_strict_requested_v1_));
 #endif
 
   ORT_RETURN_IF_ERROR(SaveModelMetadata(*tmp_model));
@@ -2526,6 +2553,7 @@ static bool ModelHasFP16Inputs(const Graph& graph) {
 #endif
 
 common::Status InferenceSession::AddPrePackedWeightsContainer(PrepackedWeightsContainer* prepacked_weights_container) {
+  ORT_RETURN_IF_ERROR(M0FullGpuCheckIngressV1());
   if (prepacked_weights_container == nullptr) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
                            "The provided PrePackedWeightsContainer instance to be added to the session is null");
@@ -2714,6 +2742,9 @@ common::Status InferenceSession::HasInvalidCombinationOfExecutionProviders() con
 }
 
 common::Status InferenceSession::Initialize() {
+  // Before capability discovery, transforms or initializer conversion. The
+  // post-CreatePlan seam independently denies direct SessionState entry.
+  ORT_RETURN_IF_ERROR(M0FullGpuCheckIngressV1());
   const auto start_timing = [this]() {
     TimePoint start_time{};
 #if defined(ORT_USE_TELEMETRY)
@@ -3339,6 +3370,18 @@ const SessionOptions& InferenceSession::GetSessionOptions() const {
   return session_options_;
 }
 
+common::Status InferenceSession::M0FullGpuCheckIngressV1() const {
+  // Late opt-in cannot undo an ordinary load; late opt-out cannot erase intent.
+  ORT_RETURN_IF_NOT(M0FullGpuPreinitRequestedV1(session_options_) == m0_fullgpu_strict_requested_v1_,
+                    "RW07_PREINIT_DENY_INTENT_MUTATION");
+  if (!m0_fullgpu_strict_requested_v1_) return Status::OK();
+  ORT_RETURN_IF_ERROR(M0FullGpuValidatePreinitOptionsV1(session_options_));
+  ORT_RETURN_IF_ERROR(M0FullGpuValidateIngressAuthoritiesV1(session_options_));
+  const auto model_config = Env::Default().GetEnvironmentVar(inference_session_utils::kOrtLoadConfigFromModelEnvVar);
+  ORT_RETURN_IF_NOT(model_config.empty() || model_config == "0", "RW07_PREINIT_DENY_ENVIRONMENT");
+  return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07_PRELOAD_DENY_UNREVIEWED_CONTRACT");
+}
+
 SessionOptions& InferenceSession::GetMutableSessionOptions() {
   return session_options_;
 }
@@ -3754,6 +3797,54 @@ Status InferenceSession::RunImpl(const RunOptions& run_options,
   Status retval = Status::OK();
   const Env& env = Env::Default();
 
+  // Source-private strict extent diagnostics opt in explicitly. No change to
+  // ordinary Session concurrency. The scope covers provider start, execution,
+  // checked completion and all cleanup/exception paths below.
+  const bool m0_extent_ownership_v2 = session_options_.config_options.GetConfigOrDefault(
+      "m0.fullgpu.extent_ownership_v2", "0") == "1";
+  std::unique_ptr<M0FullGpuRunScope> m0_run_scope;
+  ORT_RETURN_IF_NOT(m0_extent_ownership_v2 ||
+      (run_options.config_options.GetConfigOrDefault("m0.fullgpu.extent_ownership_v2", "0") == "0" &&
+       run_options.config_options.GetConfigOrDefault("m0.fullgpu.diagnostic_fault_mode_v2", "0") == "0" &&
+       run_options.config_options.GetConfigOrDefault("m0.fullgpu.fault_authorized_v2", "0") == "0"),
+       "RW07 caller cannot forge strict Session or diagnostic authority");
+  if (m0_extent_ownership_v2) {
+    ORT_RETURN_IF_NOT(is_inited_ && session_state_, "RW07 strict Run needs initialized Session");
+    ORT_RETURN_IF_NOT(session_options_.execution_mode == ExecutionMode::ORT_SEQUENTIAL,
+                      "RW07 strict extent Run requires sequential execution");
+    ORT_RETURN_IF_NOT(run_options.config_options.GetConfigOrDefault(
+                          "m0.fullgpu.extent_ownership_v2", "0") == "1",
+                      "RW07 strict Run completion option missing");
+    ORT_RETURN_IF_NOT(run_options.config_options.GetConfigOrDefault(
+                          kOrtRunOptionsConfigDisableSynchronizeExecutionProviders, "0") == "0",
+                      "RW07 strict Run cannot disable checked completion");
+    m0_run_scope = std::make_unique<M0FullGpuRunScope>(session_state_->M0FullGpuRunOwnerV2());
+    if (!m0_run_scope->Id()) {
+      LOGS(*session_logger_, INFO) << "M0_RW07_RUN_OWNER_DENIED session="
+        << session_state_->M0FullGpuExtentOwnerEpochV1() << " reason=busy_or_poisoned no_provider_start=1";
+      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07 strict Session busy or completion poisoned");
+    }
+    LOGS(*session_logger_, INFO) << "M0_RW07_RUN_OWNER_BEGIN session="
+      << session_state_->M0FullGpuExtentOwnerEpochV1() << " run=" << m0_run_scope->Id();
+  }
+
+  // Providers receive actual opaque owner IDs from this acquired core scope.
+  // Caller-supplied config cannot impersonate another Session/Run. This copy
+  // changes provider administration only; graph execution uses original options.
+  std::unique_ptr<RunOptions> m0_provider_options;
+  if (m0_extent_ownership_v2) {
+    m0_provider_options = std::make_unique<RunOptions>(run_options);
+    auto& config = m0_provider_options->config_options;
+    const bool faults_authorized = session_options_.config_options.GetConfigOrDefault(
+        "m0.fullgpu.diagnostic_faults_v2", "0") == "1";
+    ORT_RETURN_IF_ERROR(config.AddConfigEntry("m0.fullgpu.actual_session_v2",
+        std::to_string(session_state_->M0FullGpuExtentOwnerEpochV1()).c_str()));
+    ORT_RETURN_IF_ERROR(config.AddConfigEntry("m0.fullgpu.actual_run_v2",
+        std::to_string(m0_run_scope->Id()).c_str()));
+    ORT_RETURN_IF_ERROR(config.AddConfigEntry("m0.fullgpu.fault_authorized_v2", faults_authorized ? "1" : "0"));
+  }
+  const RunOptions& m0_callback_options = m0_provider_options ? *m0_provider_options : run_options;
+
   int graph_annotation_id = 0;
   const std::string& graph_annotation_str =
       run_options.config_options.GetConfigOrDefault(kOrtRunOptionsConfigCudaGraphAnnotation, "");
@@ -3775,6 +3866,7 @@ Status InferenceSession::RunImpl(const RunOptions& run_options,
 
   // Check if this Run() can skip normal execution and replay a previously captured graph.
   if (cached_execution_provider_for_graph_replay_.IsGraphCaptured(graph_annotation_id)) {
+    ORT_RETURN_IF_NOT(!m0_extent_ownership_v2, "RW07 strict extent graph replay uncertified");
     LOGS(*session_logger_, INFO) << "Replaying the captured "
                                  << cached_execution_provider_for_graph_replay_.Type()
                                  << " graph for this model with tag: " << run_options.run_tag
@@ -3788,6 +3880,21 @@ Status InferenceSession::RunImpl(const RunOptions& run_options,
   } else {
     InlinedVector<IExecutionProvider*> exec_providers_to_stop;
     exec_providers_to_stop.reserve(execution_providers_.NumProviders());
+    size_t m0_provider_stop_index = 0;
+    // Exceptions must not silently leave a started provider's timeline active.
+    // Unknown cleanup outcomes permanently deny future strict Runs on this
+    // Session; an ID retirement is never a claim of successful GPU completion.
+    auto m0_provider_cleanup = gsl::finally([&]() noexcept {
+      if (!m0_extent_ownership_v2) return;
+      for (; m0_provider_stop_index < exec_providers_to_stop.size(); ++m0_provider_stop_index) {
+        try {
+          const auto status = exec_providers_to_stop[m0_provider_stop_index]->OnRunEnd(true, m0_callback_options);
+          if (!status.IsOK()) session_state_->M0FullGpuRunOwnerV2().Poison();
+        } catch (...) {
+          session_state_->M0FullGpuRunOwnerV2().Poison();
+        }
+      }
+    });
 
     ORT_TRY {
       if (!is_inited_) {
@@ -3845,8 +3952,8 @@ Status InferenceSession::RunImpl(const RunOptions& run_options,
       // TODO: only call OnRunStart for all providers in-use
       for (auto& xp : execution_providers_) {
         // call OnRunStart and add to exec_providers_to_stop if successful
-        auto start_func = [&xp, &exec_providers_to_stop, &run_options]() {
-          auto status = xp->OnRunStart(run_options);
+        auto start_func = [&xp, &exec_providers_to_stop, &m0_callback_options]() {
+          auto status = xp->OnRunStart(m0_callback_options);
           if (status.IsOK())
             exec_providers_to_stop.push_back(xp.get());
 
@@ -3896,8 +4003,12 @@ Status InferenceSession::RunImpl(const RunOptions& run_options,
 
       // info all execution providers InferenceSession:Run ended
       for (auto* xp : exec_providers_to_stop) {
+        // Mark invoked before the call: an exception is an unknown outcome,
+        // not permission to repeat a provider end callback already entered.
+        if (m0_extent_ownership_v2) ++m0_provider_stop_index;
         bool synchronize_execution_providers = run_options.config_options.GetConfigOrDefault(kOrtRunOptionsConfigDisableSynchronizeExecutionProviders, "0") == "0";
-        auto status = xp->OnRunEnd(synchronize_execution_providers, run_options);
+        auto status = xp->OnRunEnd(synchronize_execution_providers, m0_callback_options);
+        if (m0_extent_ownership_v2 && !status.IsOK()) session_state_->M0FullGpuRunOwnerV2().Poison();
         ORT_CHECK_AND_SET_RETVAL(status);
       }
 
@@ -3929,11 +4040,13 @@ Status InferenceSession::RunImpl(const RunOptions& run_options,
 #endif
     }
     ORT_CATCH(const std::exception& e) {
+      if (m0_extent_ownership_v2) session_state_->M0FullGpuRunOwnerV2().Poison();
       ORT_HANDLE_EXCEPTION([&]() {
         retval = Status(common::ONNXRUNTIME, common::FAIL, e.what());
       });
     }
     ORT_CATCH(...) {
+      if (m0_extent_ownership_v2) session_state_->M0FullGpuRunOwnerV2().Poison();
       retval = Status(common::ONNXRUNTIME, common::RUNTIME_EXCEPTION, "Encountered unknown exception in Run()");
     }
 

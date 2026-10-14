@@ -2211,7 +2211,7 @@ TEST(AllocationPlannerTest, AvoidReuseOfPackedSubByteBufferForFullByteTensor) {
     return t;
   };
 
-  auto create_model = [&]() -> Model {
+  auto create_model = [&]() -> ModelProto {
     Model model("packed_subbyte_reuse", false, ModelMetaData(), PathString(),
                 IOnnxRuntimeOpSchemaRegistryList(), {{kOnnxDomain, 21}}, {},
                 DefaultLoggingManager().DefaultLogger());
@@ -2239,7 +2239,7 @@ TEST(AllocationPlannerTest, AvoidReuseOfPackedSubByteBufferForFullByteTensor) {
     graph.SetInputs({&X});
     graph.SetOutputs({&Y});
     EXPECT_STATUS_OK(graph.Resolve());
-    return model;
+    return model.ToProto();
   };
 
   SessionOptions so;
@@ -2248,7 +2248,7 @@ TEST(AllocationPlannerTest, AvoidReuseOfPackedSubByteBufferForFullByteTensor) {
   InferenceSession sess{so, GetEnvironment()};
 
   std::string serialized;
-  ASSERT_TRUE(create_model().ToProto().SerializeToString(&serialized));
+  ASSERT_TRUE(create_model().SerializeToString(&serialized));
   std::stringstream sstr(serialized);
   ASSERT_STATUS_OK(sess.Load(sstr));
   ASSERT_STATUS_OK(sess.Initialize());

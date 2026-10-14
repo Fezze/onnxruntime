@@ -1,2 +1,4 @@
 OrtGetApiBase
 OrtSessionOptionsAppendExecutionProvider_CPU
+OrtM0FullGpuExtentOwnerEpochV1
+OrtM0FullGpuExtentRunIdV2

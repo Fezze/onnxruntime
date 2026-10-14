@@ -46,7 +46,8 @@ std::unique_ptr<ONNX_NAMESPACE::OpSchema> CreateSchema(const std::string& functi
                                                        const std::unordered_map<std::string, int>& domain_version_map,
                                                        const SchemaRegistryManager& schema_registry,
                                                        const logging::Logger& logger,
-                                                       bool allow_released_opsets_only);
+                                                       bool allow_released_opsets_only,
+                                                       const Model* owning_model = nullptr);
 
 /** Get the unique id for function. This is used as a key to find the
  * relevant model local function from it's container.

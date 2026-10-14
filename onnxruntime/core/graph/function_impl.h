@@ -38,6 +38,8 @@ class FunctionImpl final : public Function {
   onnxruntime::Graph& MutableBody() override;
 
  private:
+  friend class M0SyntheticOwnerV1;
+  friend class M0SyntheticOwnerFactoryV1;
   // onnxruntime::Model body_;
   ONNX_NAMESPACE::GraphProto function_storage_proto_;
   onnxruntime::Graph function_body_graph_;

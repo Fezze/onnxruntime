@@ -82,6 +82,8 @@ with open(args.output, "w") as file:
 
 with open(args.output_source, "w") as file:
     file.write("#include <onnxruntime_c_api.h>\n")
+    if "OrtM0FullGpuExtentOwnerEpochV1" in provider_symbols:
+        file.write('#include "core/session/m0_fullgpu_extent_owner.h"\n')
     for c in args.config:
         # WinML adapter should not be exported in platforms other than Windows.
         # Exporting OrtGetWinMLAdapter is exported without issues using .def file when compiling for Windows

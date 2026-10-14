@@ -29,6 +29,8 @@
 #include "core/framework/fuse_nodes_funcs.h"
 #include "core/framework/kernel_registry_manager.h"
 #include "core/framework/mem_pattern.h"
+#include "core/framework/m0_fullgpu_run_ownership.h"
+#include "core/framework/m0_fullgpu_preinit_admission.h"
 #include "core/framework/ort_value.h"
 #include "core/framework/node_index_info.h"
 #include "core/framework/op_kernel.h"
@@ -257,6 +259,15 @@ class SessionState {
                                        MemoryPatternGroup mem_patterns) const;
 
   bool GetUseDeterministicCompute() const { return sess_options_.use_deterministic_compute; }
+
+  // Source-private RW07 v1 generation. Never reused, even if a Session address
+  // or stream address is later recycled. This does not certify a resource role.
+  uint64_t M0FullGpuExtentOwnerEpochV1() const { return m0_fullgpu_extent_owner_epoch_v1_; }
+  uint64_t M0FullGpuExtentRunIdV2() const { return m0_fullgpu_run_ownership_v2_.Active(); }
+  M0FullGpuRunOwnership& M0FullGpuRunOwnerV2() const { return m0_fullgpu_run_ownership_v2_; }
+  const M0FullGpuPreinitSnapshotV1* M0FullGpuPreinitSnapshot() const {
+    return m0_fullgpu_preinit_snapshot_v1_.get();
+  }
 
   /**
   Get enable memory pattern flag
@@ -490,6 +501,9 @@ class SessionState {
 #if !defined(ORT_MINIMAL_BUILD)
   WorkspaceReservationMap workspace_reservations_;
 #endif
+  uint64_t m0_fullgpu_extent_owner_epoch_v1_ = 0;
+  std::unique_ptr<M0FullGpuPreinitSnapshotV1> m0_fullgpu_preinit_snapshot_v1_;
+  mutable M0FullGpuRunOwnership m0_fullgpu_run_ownership_v2_;
   Graph& graph_;
   std::optional<GraphViewer> graph_viewer_;  // GraphViewer for const access to Graph
 

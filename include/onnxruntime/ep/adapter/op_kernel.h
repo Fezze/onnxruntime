@@ -13,6 +13,9 @@
 #include <vector>
 #include <gsl/gsl>
 #include <gsl/span>
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
 
 #include "core/common/inlined_containers.h"
 #include "core/framework/allocator.h"
@@ -198,6 +201,47 @@ struct OpKernelContext {
     }
 
     return context_.GetSyncStream();
+  }
+
+  // RW07 source-private v1 ownership bridge. Resolve from the actual core API
+  // supplying this context, never from an arbitrary globally visible library.
+  // An unavailable/version-mismatched bridge returns zero and denies use.
+  uint64_t M0FullGpuExtentOwnerEpochV1() const {
+#if defined(__linux__)
+    if (CurrentOrtApiVersion() < 28) return 0;
+    const auto api_function = Ort::GetApi().KernelContext_GetSyncStream;
+    Dl_info info{};
+    if (!api_function || !dladdr(reinterpret_cast<void*>(api_function), &info) || !info.dli_fname) return 0;
+    void* core = dlopen(info.dli_fname, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+    if (!core) return 0;
+    using Query = int (ORT_API_CALL*)(const OrtKernelContext*, uint32_t, uint64_t*);
+    auto query = reinterpret_cast<Query>(dlsym(core, "OrtM0FullGpuExtentOwnerEpochV1"));
+    uint64_t epoch = 0;
+    const bool available = query && query(context_.GetOrtKernelContext(), 1, &epoch) == 1;
+    dlclose(core);
+    return available ? epoch : 0;
+#else
+    return 0;
+#endif
+  }
+
+  uint64_t M0FullGpuExtentRunIdV2() const {
+#if defined(__linux__)
+    if (CurrentOrtApiVersion() < 28) return 0;
+    const auto api_function = Ort::GetApi().KernelContext_GetSyncStream;
+    Dl_info info{};
+    if (!api_function || !dladdr(reinterpret_cast<void*>(api_function), &info) || !info.dli_fname) return 0;
+    void* core = dlopen(info.dli_fname, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+    if (!core) return 0;
+    using Query = int (ORT_API_CALL*)(const OrtKernelContext*, uint32_t, uint64_t*);
+    auto query = reinterpret_cast<Query>(dlsym(core, "OrtM0FullGpuExtentRunIdV2"));
+    uint64_t run_id = 0;
+    const bool available = query && query(context_.GetOrtKernelContext(), 2, &run_id) == 1;
+    dlclose(core);
+    return available ? run_id : 0;
+#else
+    return 0;
+#endif
   }
 
  private:

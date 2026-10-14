@@ -95,6 +95,13 @@ class KernelDef {
     return it->second;
   }
 
+  // Source-private diagnostics must retain exact declarations as well as
+  // effective memory types for the actual present/absent slots.
+  const MemTypeMap& InputMemoryTypeArgs() const { return input_memory_type_args_; }
+  const MemTypeMap& OutputMemoryTypeArgs() const { return output_memory_type_args_; }
+  OrtMemType DefaultInputMemoryType() const { return default_inputs_mem_type_; }
+  OrtMemType DefaultOutputMemoryType() const { return default_outputs_mem_type_; }
+
   int ExecQueueId() const {
     return exec_queue_id_;
   }

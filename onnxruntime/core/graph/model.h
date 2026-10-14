@@ -13,6 +13,8 @@
 
 #include "core/framework/session_options.h"
 #include "core/graph/graph_viewer.h"
+#include "core/graph/m0_callback_policy_v1.h"
+#include "core/graph/m0_synthetic_owner_v1.h"
 #include "core/graph/ort_format_load_options.h"
 #include "core/session/onnxruntime_c_api.h"
 #if !defined(ORT_MINIMAL_BUILD)
@@ -41,11 +43,15 @@ struct ModelOptions {
 
   CheckLoadCancellationFn check_load_cancellation_fn;
 
+  // Requests additional denial only; never authorizes callbacks.
+  bool m0_callback_deny_requested_v1 = false;
+
   ModelOptions(bool allow_released_opsets_only, bool strict_shape_type_inference,
-               CheckLoadCancellationFn check_load_cancellation_fn)
+               CheckLoadCancellationFn check_load_cancellation_fn, bool callback_deny_requested = false)
       : allow_released_opsets_only(allow_released_opsets_only),
         strict_shape_type_inference(strict_shape_type_inference),
-        check_load_cancellation_fn(std::move(check_load_cancellation_fn)) {}
+        check_load_cancellation_fn(std::move(check_load_cancellation_fn)),
+        m0_callback_deny_requested_v1(callback_deny_requested) {}
 
   ModelOptions(bool allow_released_opsets_only, bool strict_shape_type_inference)
       : allow_released_opsets_only(allow_released_opsets_only),
@@ -60,6 +66,17 @@ struct ModelOptions {
 class Model {
  public:
   static constexpr Version kNoVersion = INT64_MAX;
+
+  common::Status M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel channel) const {
+    if (m0_callback_policy_v1_.Deny(channel)) {
+      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07_CALLBACK_DENY_UNREVIEWED_OWNER");
+    }
+    if (m0_synthetic_owner_v1_ && channel != M0CallbackPolicyV1::Channel::kConstruction &&
+        m0_synthetic_owner_v1_->DenyCallback()) {
+      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07_SYNTHETIC_DESCRIPTOR_GATE_CLOSED");
+    }
+    return common::Status::OK();
+  }
 
 #if !defined(ORT_MINIMAL_BUILD)
   explicit Model(const std::string& graph_name,
@@ -358,11 +375,27 @@ class Model {
 #endif
                                           const OrtFormatLoadOptions& load_options,
                                           const logging::Logger& logger,
-                                          std::unique_ptr<Model>& model);
+                                          std::unique_ptr<Model>& model,
+                                          bool callback_deny_requested = false);
 
   Model();
 
  private:
+  friend class Graph;
+  friend class M0GraphRegistrationV1;
+  friend class M0SyntheticOwnerV1;
+  friend class M0SyntheticOwnerFactoryV1;
+#if !defined(ORT_MINIMAL_BUILD)
+  Model(ONNX_NAMESPACE::ModelProto&& model_proto, const PathString& model_path,
+        const IOnnxRuntimeOpSchemaRegistryList* local_registries,
+        const logging::Logger& logger, const ModelOptions& options,
+        std::unique_ptr<M0SyntheticOwnerV1> synthetic_owner);
+#endif
+  // Const handle established before protobuf/schema/Graph construction, destroyed last.
+  const std::unique_ptr<M0SyntheticOwnerV1> m0_synthetic_owner_v1_;
+  // Must precede all per-model schema, function and graph work.
+  const M0CallbackPolicyV1 m0_callback_policy_v1_;
+
   // Model data.
 #if !defined(ORT_MINIMAL_BUILD)
   ONNX_NAMESPACE::ModelProto model_proto_;

@@ -218,6 +218,13 @@ class OpKernelContext {
   virtual KernelPilot* GetKernelPilot() const { return nullptr; }
 #endif
 
+ public:
+  // Private pinned-runtime RW07 interface v1. This is ownership metadata only;
+  // no model value or logical extent is exposed. Unknown contexts deny use.
+  // Appended after existing virtuals to retain their slots.
+  virtual uint64_t M0FullGpuExtentOwnerEpochV1() const { return 0; }
+  virtual uint64_t M0FullGpuExtentRunIdV2() const { return 0; }
+
  private:
   ORT_DISALLOW_COPY_AND_ASSIGNMENT(OpKernelContext);
   int GetInputArgIndex(int index) const;

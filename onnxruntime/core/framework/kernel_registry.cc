@@ -216,10 +216,19 @@ Status KernelRegistry::TryFindKernelImpl(const Node& node,
               std::ostream_iterator<std::string>(oss, "\n"));
     oss << ")";
 
+    if (expected_provider == "WebGpuExecutionProvider") {
+      LOGS(logger, INFO) << "M0_RW01_KERNEL_RESTRICTION index=" << node.Index()
+                         << " name=" << node.Name() << " reason=" << oss.str();
+    }
     VLOGS(logger, 2) << "TryFindKernel failed, Reason: " << oss.str();
     return Status(common::ONNXRUNTIME, common::FAIL, oss.str());
   }
 
+  if (expected_provider == "WebGpuExecutionProvider") {
+    LOGS(logger, INFO) << "M0_RW01_KERNEL_NO_REGISTRATION index=" << node.Index()
+                       << " name=" << node.Name() << " domain=" << node.Domain()
+                       << " op=" << node.OpType() << " since=" << node.SinceVersion();
+  }
   return Status(common::ONNXRUNTIME, common::FAIL, "Kernel not found");
 }
 

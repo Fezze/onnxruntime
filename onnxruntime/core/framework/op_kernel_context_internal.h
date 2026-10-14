@@ -53,6 +53,13 @@ class OpKernelContextInternal : public OpKernelContext {
     return session_state_.GetUseDeterministicCompute();
   }
 
+  uint64_t M0FullGpuExtentOwnerEpochV1() const override {
+    return session_state_.M0FullGpuExtentOwnerEpochV1();
+  }
+  uint64_t M0FullGpuExtentRunIdV2() const override {
+    return session_state_.M0FullGpuExtentRunIdV2();
+  }
+
 #if !defined(ORT_MINIMAL_BUILD)
   KernelPilot* GetKernelPilot() const override {
     kernel_pilot_ = session_state_.GetKernelPilot(GetKernel());

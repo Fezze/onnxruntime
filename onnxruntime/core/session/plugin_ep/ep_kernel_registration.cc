@@ -287,6 +287,7 @@ static Status CopyEpKernelRegistry(const OrtKernelRegistry* ep_registry,
   for (const auto& [key, src_create_info] : src_registry->GetKernelCreateMap()) {
     auto dst_kernel_def = std::make_unique<KernelDef>(*src_create_info.kernel_def);
     KernelCreateInfo dst_create_info(std::move(dst_kernel_def), src_create_info.kernel_create_func);
+    dst_create_info.m0_implementation_id_v1 = src_create_info.m0_implementation_id_v1;
 
     ORT_RETURN_IF_ERROR(dst_registry->Register(std::move(dst_create_info)));
   }

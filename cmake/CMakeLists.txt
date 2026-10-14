@@ -284,6 +284,14 @@ option(onnxruntime_ENABLE_TRAINING "Enable full training functionality. Includes
 option(onnxruntime_ENABLE_TRAINING_APIS "Enable ort training apis." OFF)
 option(onnxruntime_ENABLE_TRAINING_OPS "Include training operators but no training session support." OFF)
 option(onnxruntime_ENABLE_TRAINING_E2E_TESTS "Enable training end-to-end tests." OFF)
+option(onnxruntime_M0_DESCRIPTOR_QUALIFICATION "Compile fixed private M0 descriptor qualification routes" OFF)
+if(onnxruntime_M0_DESCRIPTOR_QUALIFICATION)
+  if(onnxruntime_MINIMAL_BUILD OR onnxruntime_EXTENDED_MINIMAL_BUILD OR onnxruntime_DISABLE_EXCEPTIONS OR
+     onnxruntime_ENABLE_TRAINING OR onnxruntime_ENABLE_TRAINING_APIS OR
+     onnxruntime_ENABLE_TRAINING_OPS OR onnxruntime_ENABLE_TRAINING_E2E_TESTS)
+    message(FATAL_ERROR "M0 descriptor qualification requires nonminimal, exceptions-enabled, training-disabled source")
+  endif()
+endif()
 option(onnxruntime_ENABLE_CPU_FP16_OPS "Build with advanced instruction sets" ON)
 option(onnxruntime_USE_NCCL "Build with NCCL support" OFF)
 
@@ -722,6 +730,12 @@ set(ONNXRUNTIME_INCLUDE_DIR ${REPO_ROOT}/include/onnxruntime)
 
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/external)
 include(external/onnxruntime_external_deps.cmake)
+
+if(onnxruntime_M0_DESCRIPTOR_QUALIFICATION)
+  # Keep the shared owner header identical in all ORT targets, including graph
+  # and tests, without changing the already configured external dependencies.
+  add_compile_definitions(ORT_M0_DESCRIPTOR_QUALIFICATION=1)
+endif()
 
 set(ORT_WARNING_FLAGS)
 if (WIN32)

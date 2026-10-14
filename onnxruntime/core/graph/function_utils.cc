@@ -10,6 +10,7 @@
 #include "onnx/shape_inference/implementation.h"
 #include "core/graph/function_impl.h"
 #include "core/graph/model_load_utils.h"
+#include "core/graph/model.h"
 
 namespace onnxruntime {
 namespace function_utils {
@@ -309,7 +310,11 @@ std::unique_ptr<ONNX_NAMESPACE::OpSchema> CreateSchema(const std::string& functi
                                                        const std::unordered_map<std::string, int>& domain_version_map,
                                                        const SchemaRegistryManager& schema_registry,
                                                        const logging::Logger& logger,
-                                                       bool allow_released_opsets_only) {
+                                                       bool allow_released_opsets_only,
+                                                       const Model* owning_model) {
+  if (owning_model) {
+    ORT_THROW_IF_ERROR(owning_model->M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kFunction));
+  }
   std::string func_identifier = function_utils::GetFunctionIdentifier(function_domain, function_name, function_overload);
   auto iter = model_local_functions.find(func_identifier);
   if (iter == model_local_functions.end()) {
@@ -378,7 +383,10 @@ std::unique_ptr<ONNX_NAMESPACE::OpSchema> CreateSchema(const std::string& functi
 
   // model_local_functions is a member of Model instance and will be alive at the time this is invoked.
   op_schema->TypeAndShapeInferenceFunction(
-      [onnx_func_proto, func_domain_to_version = std::move(func_domain_to_version), &model_local_functions](ONNX_NAMESPACE::InferenceContext& ctx) {
+      [onnx_func_proto, func_domain_to_version = std::move(func_domain_to_version), &model_local_functions, owning_model](ONNX_NAMESPACE::InferenceContext& ctx) {
+        if (owning_model) {
+          ORT_THROW_IF_ERROR(owning_model->M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kFunction));
+        }
         auto* schema_registry = ONNX_NAMESPACE::OpSchemaRegistry::Instance();
 
         // https://github.com/microsoft/onnxruntime/issues/17061

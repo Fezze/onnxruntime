@@ -26,6 +26,7 @@
 #include "core/session/allocator_adapters.h"
 #include "core/session/utils.h"
 #include "core/session/custom_ops.h"
+#include "core/session/m0_fullgpu_extent_owner.h"
 #include "core/session/inference_session.h"
 #include "core/session/onnxruntime_type_conversion.h"
 #include "core/session/ort_apis.h"
@@ -1503,3 +1504,25 @@ common::Status CreateCustomRegistry(gsl::span<OrtCustomOpDomain* const> op_domai
 
 }  // namespace onnxruntime
 #endif  // ENABLE_CUSTOM_OP_API
+
+// RW07 private ABI v1. Deliberately independent of the public OrtApi table.
+// Only trusted live kernel contexts are accepted by this internal caller path.
+extern "C" ORT_EXPORT int ORT_API_CALL OrtM0FullGpuExtentOwnerEpochV1(
+    const OrtKernelContext* context, uint32_t version, uint64_t* epoch) noexcept {
+  if (!epoch) return 0;
+  *epoch = 0;
+  if (!context || version != 1) return 0;
+  const auto* native_context = reinterpret_cast<const onnxruntime::OpKernelContext*>(context);
+  *epoch = native_context->M0FullGpuExtentOwnerEpochV1();
+  return *epoch ? 1 : 0;
+}
+
+extern "C" ORT_EXPORT int ORT_API_CALL OrtM0FullGpuExtentRunIdV2(
+    const OrtKernelContext* context, uint32_t version, uint64_t* run_id) noexcept {
+  if (!run_id) return 0;
+  *run_id = 0;
+  if (!context || version != 2) return 0;
+  const auto* native_context = reinterpret_cast<const onnxruntime::OpKernelContext*>(context);
+  *run_id = native_context->M0FullGpuExtentRunIdV2();
+  return *run_id ? 1 : 0;
+}

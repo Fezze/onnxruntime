@@ -3,6 +3,7 @@
 
 #include "core/framework/session_state.h"
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <sstream>
@@ -97,6 +98,18 @@ class StreamCommandHandleRegistryImpl : public IStreamCommandHandleRegistry {
 };
 #endif
 
+// Ownership identity only, shared by kernels in the same SessionState. The
+// counter saturates and throws rather than wrapping into a previously used ID.
+static uint64_t NextM0FullGpuExtentOwnerEpochV1() {
+  static std::atomic<uint64_t> next{0};
+  uint64_t current = next.load(std::memory_order_relaxed);
+  for (;;) {
+    ORT_ENFORCE(current != UINT64_MAX, "RW07 extent ownership epoch exhausted");
+    if (next.compare_exchange_weak(current, current + 1, std::memory_order_relaxed))
+      return current + 1;
+  }
+}
+
 SessionState::SessionState(Graph& graph,
                            const ExecutionProviders& execution_providers,
                            concurrency::ThreadPool* thread_pool,
@@ -124,6 +137,7 @@ SessionState::SessionState(Graph& graph,
       stream_handles_registry_(std::make_unique<StreamCommandHandleRegistryImpl>())
 #endif
 {
+  m0_fullgpu_extent_owner_epoch_v1_ = NextM0FullGpuExtentOwnerEpochV1();
   enable_mem_pattern_ = sess_options_.enable_mem_pattern &&
                         sess_options_.execution_mode == ExecutionMode::ORT_SEQUENTIAL;
   if (parent_allocators) {
@@ -1970,6 +1984,149 @@ Status SessionState::FinalizeSessionStateImpl(const std::basic_string<PATH_CHAR_
                                               Logger(),
                                               p_seq_exec_plan_);
   ORT_RETURN_IF_ERROR(status);
+
+  if (M0FullGpuPreinitRequestedV1(session_options)) {
+    ORT_RETURN_IF_ERROR(M0FullGpuValidatePreinitOptionsV1(session_options));
+    auto observed = std::make_unique<M0FullGpuPreinitSnapshotV1>();
+    observed->session_epoch = M0FullGpuExtentOwnerEpochV1();
+    observed->owned_plan = &*p_seq_exec_plan_;
+    const auto append_slots = [this](const auto& args, auto& slots) {
+      for (const auto* arg : args) {
+        M0FullGpuPreinitSlotV1 slot;
+        slot.present = arg && arg->Exists();
+        if (arg) {
+          slot.name = arg->Name();
+          if (slot.present) ORT_ENFORCE(ort_value_name_idx_map_.GetIdx(slot.name, slot.value_index).IsOK());
+          if (arg->TypeAsProto()) slot.type_proto = arg->TypeAsProto()->SerializeAsString();
+        }
+        slots.push_back(std::move(slot));
+      }
+    };
+    for (const auto& node : graph_viewer_->Nodes()) {
+      M0FullGpuPreinitNodeV1 row;
+      row.index = node.Index();
+      row.since_version = node.SinceVersion();
+      row.input_arg_counts = node.InputArgCount();
+      ONNX_NAMESPACE::NodeProto proto;
+      node.ToProto(proto);
+      row.node_proto = proto.SerializeAsString();
+      row.provider = node.GetExecutionProviderType();
+      const auto resolved = kernel_create_info_map_.find(node.Index());
+      if (resolved != kernel_create_info_map_.end() && resolved->second) {
+        const auto* info = resolved->second.get();
+        row.implementation_id = info->m0_implementation_id_v1;
+        auto& kernel = row.kernel;
+        kernel.selected_create_info = info;
+        kernel.selected_definition = info->kernel_def.get();
+        if (info->kernel_def) {
+          const auto& def = *info->kernel_def;
+          kernel.op_name = def.OpName();
+          kernel.domain = def.Domain();
+          kernel.provider = def.Provider();
+          def.SinceVersion(&kernel.version_start, &kernel.version_end);
+          kernel.execution_queue = def.ExecQueueId();
+          kernel.default_input_memory = def.DefaultInputMemoryType();
+          kernel.default_output_memory = def.DefaultOutputMemoryType();
+          kernel.contiguous_inputs = def.AllocateInputsContiguously();
+          kernel.external_outputs = def.HasExternalOutputs();
+          kernel.may_inplace = def.MayInplace();
+          kernel.aliases = def.Alias();
+          kernel.has_variadic_alias = def.VariadicAlias().has_value();
+          if (kernel.has_variadic_alias) kernel.variadic_alias = *def.VariadicAlias();
+          for (const auto& entry : def.TypeConstraints()) {
+            auto types = DataTypeImpl::ToString(entry.second);
+            std::sort(types.begin(), types.end());
+            kernel.type_constraints.emplace_back(entry.first, std::move(types));
+          }
+          std::sort(kernel.type_constraints.begin(), kernel.type_constraints.end());
+          for (const auto& entry : def.InputMemoryTypeArgs())
+            kernel.input_memory.emplace_back(entry.first, entry.second);
+          for (const auto& entry : def.OutputMemoryTypeArgs())
+            kernel.output_memory.emplace_back(entry.first, entry.second);
+          std::sort(kernel.input_memory.begin(), kernel.input_memory.end());
+          std::sort(kernel.output_memory.begin(), kernel.output_memory.end());
+#ifdef ENABLE_STRIDED_TENSORS
+          kernel.may_strided_inputs = def.MayStridedInput();
+          kernel.may_strided_outputs = def.MayStridedOutput();
+#endif
+        }
+      }
+      append_slots(node.InputDefs(), row.inputs);
+      append_slots(node.OutputDefs(), row.outputs);
+      append_slots(node.ImplicitInputDefs(), row.implicit_inputs);
+      if (resolved != kernel_create_info_map_.end() && resolved->second && resolved->second->kernel_def) {
+        const auto& def = *resolved->second->kernel_def;
+        for (size_t i = 0; i < row.inputs.size(); ++i) {
+          row.inputs[i].effective_memory_type = def.InputMemoryType(i);
+          row.inputs[i].effective_memory_available = true;
+        }
+        for (size_t i = 0; i < row.outputs.size(); ++i) {
+          row.outputs[i].effective_memory_type = def.OutputMemoryType(i);
+          row.outputs[i].effective_memory_available = true;
+        }
+      }
+      observed->nodes.push_back(std::move(row));
+    }
+    for (size_t i = 0; i < p_seq_exec_plan_->allocation_plan.size(); ++i) {
+      const auto& resource = p_seq_exec_plan_->allocation_plan[i];
+      M0FullGpuPreinitResourceV1 row;
+      row.value_index = static_cast<int>(i);
+      row.allocation_kind = static_cast<int>(resource.alloc_kind);
+      row.reused_buffer = resource.reused_buffer;
+      row.device_type = resource.location.Type();
+      row.memory_type = resource.location.MemType();
+      row.device_id = resource.location.Id();
+      row.vendor_id = resource.location.Vendor();
+      ORT_ENFORCE(ort_value_name_idx_map_.GetName(row.value_index, row.value_name).IsOK());
+      if (resource.value_type) row.value_type = DataTypeImpl::ToString(resource.value_type);
+      row.lifetime_starts = resource.program_counter.Starts();
+      row.lifetime_ends = resource.program_counter.Ends();
+#ifdef ENABLE_STRIDED_TENSORS
+      row.is_strided_tensor = resource.is_strided_tensor;
+#endif
+      observed->resources.push_back(std::move(row));
+    }
+    observed->initializer_order = p_seq_exec_plan_->initializer_allocation_order;
+    observed->activation_order = p_seq_exec_plan_->activation_allocation_order;
+    append_slots(graph_viewer_->GetInputsIncludingInitializers(), observed->graph_inputs);
+    append_slots(graph_viewer_->GetOutputs(), observed->graph_outputs);
+    for (const auto& entry : graph_viewer_->GetAllInitializedTensors()) {
+      M0FullGpuPreinitInitializerV1 row;
+      row.name = entry.first;
+      row.owned_tensor_proto = entry.second;
+      ORT_ENFORCE(entry.second != nullptr);
+      ORT_ENFORCE(ort_value_name_idx_map_.GetIdx(row.name, row.value_index).IsOK());
+      row.data_type = entry.second->data_type();
+      row.data_location = entry.second->data_location();
+      row.encoded_bytes = entry.second->ByteSizeLong();
+      row.raw_data_bytes = entry.second->raw_data().size();
+      row.dimensions.assign(entry.second->dims().begin(), entry.second->dims().end());
+      row.constant = graph_viewer_->IsConstantInitializer(row.name, false);
+      observed->initializers.push_back(std::move(row));
+    }
+    std::sort(observed->initializers.begin(), observed->initializers.end(),
+              [](const auto& a, const auto& b) { return a.name < b.name; });
+    for (size_t stream = 0; stream < p_seq_exec_plan_->execution_plan.size(); ++stream) {
+      const auto& logic_stream = p_seq_exec_plan_->execution_plan[stream];
+      if (!logic_stream) continue;
+      for (const auto& step : logic_stream->steps_)
+        observed->execution_steps.push_back({stream, step->GetNodeIndex(), step->ToString()});
+    }
+    for (const auto& entry : p_seq_exec_plan_->value_to_stream_map)
+      observed->value_streams.emplace_back(entry.first, entry.second);
+    std::sort(observed->value_streams.begin(), observed->value_streams.end());
+    for (const auto& action : p_seq_exec_plan_->release_actions)
+      observed->release_actions.emplace_back(action.value_index, action.ref_count);
+    observed->node_release_list = p_seq_exec_plan_->node_release_list;
+    m0_fullgpu_preinit_snapshot_v1_ = std::move(observed);
+    LOGS(Logger(), INFO) << "M0_RW07_PREINIT_DENIED session=" << M0FullGpuExtentOwnerEpochV1()
+        << " nodes=" << m0_fullgpu_preinit_snapshot_v1_->nodes.size()
+        << " resources=" << m0_fullgpu_preinit_snapshot_v1_->resources.size()
+        << " before_final_initializer_allocation=1 before_kernel_construction=1 before_prepack=1";
+    // No complete-model source/input/resource certificate is built into this
+    // revision. Observing a plan or naming an implementation cannot admit it.
+    return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07_PREINIT_DENY_UNREVIEWED_CONTRACT");
+  }
 
   if (session_options.IsLoadCancellationFlagSet()) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, MODEL_LOAD_CANCELED,

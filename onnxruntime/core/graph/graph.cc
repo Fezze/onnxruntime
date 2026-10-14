@@ -58,6 +58,11 @@ using namespace ONNX_NAMESPACE;
 using namespace ONNX_NAMESPACE::Utils;
 using namespace ::onnxruntime::common;
 
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+#include <thread>
+#include "core/graph/m0_fixed_wire_v1.h"
+#endif
+
 namespace onnxruntime {
 
 #if !defined(ORT_MINIMAL_BUILD)
@@ -604,6 +609,7 @@ const std::filesystem::path& Node::ModelPath() const noexcept {
 #if !defined(ORT_MINIMAL_BUILD)
 
 bool Node::CanBeInlined() const {
+  ORT_THROW_IF_ERROR(graph_->GetModel().M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kFunction));
   if (func_body_ || func_template_)
     return true;
   if (!op_) return false;
@@ -615,6 +621,7 @@ bool Node::CanBeInlined() const {
 }
 
 bool Node::TryGetFunctionProto(ONNX_NAMESPACE::FunctionProto& onnx_function_proto) const {
+  ORT_THROW_IF_ERROR(graph_->GetModel().M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kFunction));
   if (func_template_) {
     onnx_function_proto = *func_template_->onnx_func_proto_;
     return true;
@@ -1286,6 +1293,7 @@ Graph::Graph(const Model& owning_model,
              const logging::Logger& logger,
              bool strict_shape_type_inference)
     : owning_model_(owning_model),
+      m0_registration_v1_(owning_model, this, graph_proto, parent_graph, parent_node),
       graph_proto_(graph_proto),
 #if !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
       runtime_optimizations_ptr_(std::make_unique<RuntimeOptimizationRecordContainer>()),
@@ -1300,6 +1308,7 @@ Graph::Graph(const Model& owning_model,
       logger_(logger),
       strict_shape_type_inference_(strict_shape_type_inference),
       is_loaded_from_model_file_(GraphLoadedFromModelFile(graph_proto_)) {
+  ORT_THROW_IF_ERROR(owning_model_.M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kConstruction));
   ORT_ENFORCE(graph_proto != nullptr, "graph_proto cannot be null");
   ArgNameToTypeMap name_to_type_map;
   const auto& model_path = ModelPath();
@@ -1500,6 +1509,7 @@ Graph::Graph(const Model& owning_model,
   if (is_loaded_from_model_file_) {
     InitializeStateFromModelFileGraphProto();
   }
+  m0_registration_v1_.Finish();
 }
 
 Graph::Graph(Graph& parent_graph, const Node& parent_node, ONNX_NAMESPACE::GraphProto& subgraph_proto)
@@ -2701,11 +2711,37 @@ class GraphInferencerImpl : public ONNX_NAMESPACE::GraphInferencer {
       : node_(node), graph_(graph), inferencing_func_(inferencing_func), options_(options) {
   }
 
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  using OwnedChildJoin = std::unique_ptr<M0SyntheticOwnerV1::ChildJoin, void (*)(M0SyntheticOwnerV1::ChildJoin*)>;
+  GraphInferencerImpl(const Node& node, Graph& graph, SubgraphInferencingFunc& inferencing_func,
+                      const Graph::ResolveOptions& options, OwnedChildJoin join)
+      : node_(node), graph_(graph), inferencing_func_(inferencing_func), options_(options), issued_join_(std::move(join)) {}
+#endif
   // Perform inferencing on the graph contained in GraphInferencer.
   // Returns the graph output types post-inferencing.
   // We ignore input_data currently as the inferencing happens prior to receiving user input.
   std::vector<const TypeProto*> doInferencing(const std::vector<const TypeProto*>& input_types,
-                                              const std::vector<const TensorProto*>& /*input_data*/) override {
+                                              const std::vector<const TensorProto*>& input_data) override {
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+    if (issued_join_) {
+      auto& join = *issued_join_;
+      if (join.entered_ || join.returned_) {
+        join.context_.node_.scope_.permit_.generation_.owner.Poison();
+        ORT_THROW("RW07_ISSUED_CHILD_REUSE");
+      }
+      ORT_ENFORCE(input_data.empty(), "RW07_ISSUED_CHILD_PAYLOAD");
+      auto& permit = join.context_.node_.scope_.permit_;
+      M0SyntheticOwnerV1::ScopeLayer scope(permit, graph_);
+      join.Enter(scope, input_types);
+      std::vector<const TypeProto*> outputs;
+      ORT_THROW_IF_ERROR(Graph::InferAndVerifySubgraphTypes(node_, graph_, input_types, outputs, options_, &join));
+      join.Returned();
+      return outputs;
+    }
+#else
+    ORT_UNUSED_PARAMETER(input_data);
+#endif
+    ORT_THROW_IF_ERROR(graph_.GetModel().M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kRecursiveInference));
     std::vector<const TypeProto*> output_types;
 
     auto status = inferencing_func_(node_, graph_, input_types, output_types, options_);
@@ -2722,6 +2758,9 @@ class GraphInferencerImpl : public ONNX_NAMESPACE::GraphInferencer {
   Graph& graph_;
   SubgraphInferencingFunc& inferencing_func_;
   const Graph::ResolveOptions& options_;
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  OwnedChildJoin issued_join_{nullptr, nullptr};
+#endif
 };
 
 // An implementation of the InferenceContext interface required by operator-specific
@@ -2733,24 +2772,43 @@ class InferenceContextImpl : public ONNX_NAMESPACE::InferenceContext {
   InferenceContextImpl(Node& node,
                        SubgraphInferencingFunc subgraph_inferencing_func,
                        const Graph& graph,
-                       const Graph::ResolveOptions& options) noexcept
+                       const Graph::ResolveOptions& options
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+                       ,
+                       M0SyntheticOwnerV1::ContextLayer* layer = nullptr
+#endif
+                       )
       : node_(node),
         subgraph_inferencing_func_(subgraph_inferencing_func),
         graph_(graph),
         options_(options) {
     node_output_types_.resize(node.OutputDefs().size());
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+    issued_layer_ = layer;
+    if (issued_layer_) issued_layer_->BindInference(this, node_output_types_);
+#endif
   }
 
   void RunInferencing() {
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+    if (issued_layer_)
+      issued_layer_->EnterCallback(this);
+    else
+#endif
+      ORT_THROW_IF_ERROR(graph_.GetModel().M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kSchemaInference));
     auto schema = node_.Op();
     if (nullptr != schema) {
       schema->GetTypeAndShapeInferenceFunction()(*this);
     }
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+    if (issued_layer_) issued_layer_->ExitCallback(this);
+#endif
   }
 
   std::vector<TypeProto> InferredOutputTypes() const { return node_output_types_; }
 
   const AttributeProto* getAttribute(const std::string& name) const override {
+    ORT_THROW_IF_ERROR(node_.GetContainingGraph()->GetModel().M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kAttribute));
     auto& attribute_value_map = node_.GetAttributes();
     auto iter = attribute_value_map.find(name);
     if (iter == attribute_value_map.end()) {
@@ -2764,6 +2822,9 @@ class InferenceContextImpl : public ONNX_NAMESPACE::InferenceContext {
   }
 
   const TypeProto* getInputType(size_t index) const override {
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+    if (issued_layer_) issued_layer_->DescriptorAccess(this, index);
+#endif
     const TypeProto* type = nullptr;
     auto p_node_arg = node_.InputDefs().at(index);
     if ((nullptr != p_node_arg) && p_node_arg->Exists()) {
@@ -2778,6 +2839,9 @@ class InferenceContextImpl : public ONNX_NAMESPACE::InferenceContext {
   }
 
   TypeProto* getOutputType(size_t index) override {
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+    if (issued_layer_) issued_layer_->DescriptorAccess(this, index);
+#endif
     if (index >= node_output_types_.size()) {
       fail_type_inference("output index ", index, " is out of range; node has ",
                           node_output_types_.size(), " outputs");
@@ -2786,6 +2850,9 @@ class InferenceContextImpl : public ONNX_NAMESPACE::InferenceContext {
   }
 
   bool hasOutput(size_t index) override {
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+    if (issued_layer_) issued_layer_->DescriptorAccess(this, index);
+#endif
     if (index >= node_.OutputDefs().size()) {
       return false;
     }
@@ -2795,6 +2862,7 @@ class InferenceContextImpl : public ONNX_NAMESPACE::InferenceContext {
   }
 
   const TensorProto* getInputData(size_t index) const override {
+    ORT_THROW_IF_ERROR(graph_.GetModel().M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kInputData));
     // A schema-optional input that's omitted (not even an empty placeholder) shrinks InputDefs(),
     // so callers can pass an index the node doesn't actually have.
     if (index >= getNumInputs()) {
@@ -2890,16 +2958,38 @@ class InferenceContextImpl : public ONNX_NAMESPACE::InferenceContext {
 
   // ORT does not implement partial data propagation yet so just return nullptr.
   const TensorShapeProto* getSymbolicInput(size_t) const override {
+    ORT_THROW_IF_ERROR(graph_.GetModel().M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kInputData));
     return nullptr;
   }
 
   GraphInferencer* getGraphAttributeInferencer(const std::string& attribute_name) override {
     GraphInferencer* graph_inferencer = nullptr;
 
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+    if (issued_layer_) {
+      issued_layer_->BodyAccess(this, attribute_name);
+      issued_layer_->CallbackEffect(*this);
+      issued_layer_->Check();
+    } else
+#endif
+      ORT_THROW_IF_ERROR(graph_.GetModel().M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kRecursiveInference));
     auto* subgraph = node_.GetMutableGraphAttribute(attribute_name);
 
     if (subgraph) {
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+      std::unique_ptr<GraphInferencerImpl> inferencer;
+      if (issued_layer_) {
+        auto retire_join = [](M0SyntheticOwnerV1::ChildJoin* value) { delete value; };
+        auto join = std::unique_ptr<M0SyntheticOwnerV1::ChildJoin, void (*)(M0SyntheticOwnerV1::ChildJoin*)>(
+            new M0SyntheticOwnerV1::ChildJoin(*issued_layer_, *subgraph), retire_join);
+        inferencer = std::make_unique<GraphInferencerImpl>(node_, *subgraph, subgraph_inferencing_func_, options_,
+                                                           std::move(join));
+      } else {
+        inferencer = std::make_unique<GraphInferencerImpl>(node_, *subgraph, subgraph_inferencing_func_, options_);
+      }
+#else
       auto inferencer = std::make_unique<GraphInferencerImpl>(node_, *subgraph, subgraph_inferencing_func_, options_);
+#endif
       graph_inferencer = inferencer.get();
       graph_inferencers_.push_back(std::move(inferencer));
     } else {
@@ -2913,10 +3003,14 @@ class InferenceContextImpl : public ONNX_NAMESPACE::InferenceContext {
   // XXX: When we changed and kept sparse constant initializers in sparse form,
   // we would adjust this method
   const SparseTensorProto* getInputSparseData(size_t) const override {
+    ORT_THROW_IF_ERROR(graph_.GetModel().M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kInputData));
     return nullptr;
   }
 
  private:
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  M0SyntheticOwnerV1::ContextLayer* issued_layer_ = nullptr;
+#endif
   Node& node_;
   // node_output_types_ will be populated by the operator-specific shape inference.
   std::vector<TypeProto> node_output_types_;
@@ -2938,11 +3032,21 @@ class InferenceContextImpl : public ONNX_NAMESPACE::InferenceContext {
 // https://github.com/onnx/onnx/blob/main/onnx/defs/shape_inference.h#L117-L127
 class DataPropagationContextImpl : public ONNX_NAMESPACE::DataPropagationContext {
  public:
-  DataPropagationContextImpl(Node& node) noexcept : node_(node) {
+  DataPropagationContextImpl(Node& node
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+                             ,
+                             M0SyntheticOwnerV1::ContextLayer* layer = nullptr
+#endif
+                             ) : node_(node) {
     node_output_types_.resize(node.OutputDefs().size());
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+    issued_layer_ = layer;
+    if (issued_layer_) issued_layer_->BindPropagation(this, node_output_types_);
+#endif
   }
 
   const AttributeProto* getAttribute(const std::string& name) const override {
+    ORT_THROW_IF_ERROR(node_.GetContainingGraph()->GetModel().M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kAttribute));
     auto& attribute_value_map = node_.GetAttributes();
     auto iter = attribute_value_map.find(name);
     if (iter == attribute_value_map.end()) {
@@ -2982,6 +3086,7 @@ class DataPropagationContextImpl : public ONNX_NAMESPACE::DataPropagationContext
   }
 
   const TensorShapeProto* getInputData(size_t index) override {
+    ORT_THROW_IF_ERROR(node_.GetContainingGraph()->GetModel().M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kOnnxPropagation));
     if (index >= getNumInputs()) {
       return nullptr;
     }
@@ -3005,6 +3110,7 @@ class DataPropagationContextImpl : public ONNX_NAMESPACE::DataPropagationContext
   }
 
   void addOutputData(size_t index, TensorShapeProto&& tsp) override {
+    ORT_THROW_IF_ERROR(node_.GetContainingGraph()->GetModel().M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kOnnxPropagation));
     if (index >= node_output_types_.size()) return;
 
     TypeProto& type_proto = node_output_types_[index];
@@ -3012,6 +3118,13 @@ class DataPropagationContextImpl : public ONNX_NAMESPACE::DataPropagationContext
   }
 
   void RunInferencing() {
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+    if (issued_layer_) {
+      issued_layer_->PropagationNoWork(this);
+      return;
+    }
+#endif
+    ORT_THROW_IF_ERROR(node_.GetContainingGraph()->GetModel().M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kOnnxPropagation));
     auto* schema = node_.Op();
     if (nullptr != schema) {
       schema->GetDataPropagationFunction()(*this);
@@ -3021,13 +3134,233 @@ class DataPropagationContextImpl : public ONNX_NAMESPACE::DataPropagationContext
   const std::vector<TypeProto>& InferredOutputTypes() const { return node_output_types_; }
 
  private:
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  M0SyntheticOwnerV1::ContextLayer* issued_layer_ = nullptr;
+#endif
   Node& node_;
   std::vector<TypeProto> node_output_types_;
 };
 
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+M0SyntheticOwnerV1::ContextLayer::ContextLayer(NodeLayer& node) : node_(node) {
+  Check();
+  ORT_ENFORCE(node_.scope_.permit_.generation_.owner.issued_node_stage_[node_.scope_.slot_] ==
+                  IssuedNodeStage::kDefaulted,
+              "RW07_ISSUED_CONTEXT_ENTRY");
+}
+M0SyntheticOwnerV1::ContextLayer::~ContextLayer() noexcept {
+  if (callback_active_ || !callback_finished_ || !propagation_finished_ || !saver_finished_)
+    node_.scope_.permit_.generation_.owner.Poison();
+}
+void M0SyntheticOwnerV1::ContextLayer::Check() {
+  node_.Check();
+  ORT_ENFORCE(node_.node_.InputDefs().size() == 1 && node_.node_.OutputDefs().size() == 1 &&
+                  node_.node_.InputDefs()[0] && node_.node_.OutputDefs()[0] &&
+                  node_.node_.InputDefs()[0]->Exists() && node_.node_.OutputDefs()[0]->Exists(),
+              "RW07_ISSUED_CONTEXT_CARDINALITY");
+}
+void M0SyntheticOwnerV1::ContextLayer::BindInference(const void* context, std::vector<TypeProto>& outputs) {
+  Check();
+  ORT_ENFORCE(context && !inference_identity_ && outputs.size() == 1 && outputs[0].SerializeAsString().empty(),
+              "RW07_ISSUED_SCRATCH_BINDING");
+  inference_identity_ = context;
+  scratch_ = &outputs;
+}
+void M0SyntheticOwnerV1::ContextLayer::BindPropagation(const void* context, std::vector<TypeProto>& outputs) {
+  Check();
+  ORT_ENFORCE(context && inference_identity_ && !propagation_identity_ && &outputs != scratch_ &&
+                  outputs.size() == 1 && outputs[0].SerializeAsString().empty(),
+              "RW07_ISSUED_DP_BINDING");
+  propagation_identity_ = context;
+  propagation_ = &outputs;
+}
+void M0SyntheticOwnerV1::ContextLayer::EnterCallback(const void* context) {
+  Check();
+  auto& owner = node_.scope_.permit_.generation_.owner;
+  ORT_ENFORCE(context == inference_identity_ && scratch_ && propagation_ && !callback_active_ &&
+                  !callback_finished_ && owner.issued_node_stage_[node_.scope_.slot_] == IssuedNodeStage::kDefaulted &&
+                  node_.node_.Op() == owner.sealed_schemas_[node_.scope_.slot_ < 2 ? 1 : 0] &&
+                  scratch_->size() == 1 && (*scratch_)[0].SerializeAsString().empty(),
+              "RW07_ISSUED_CALLBACK_ENTRY");
+  callback_active_ = true;
+  ++owner.issued_audit_->callbacks;
+}
+void M0SyntheticOwnerV1::ContextLayer::ExitCallback(const void* context) {
+  Check();
+  auto& owner = node_.scope_.permit_.generation_.owner;
+  ORT_ENFORCE(context == inference_identity_ && callback_active_ && !callback_finished_ && scratch_->size() == 1 &&
+                  (*scratch_)[0].SerializeAsString() == node_.node_.InputDefs()[0]->TypeAsProto()->SerializeAsString() &&
+                  (node_.scope_.slot_ == 2 || owner.issued_inferred_child_[node_.scope_.slot_]) && !owner.Poisoned(),
+              "RW07_ISSUED_CALLBACK_EXIT");
+  callback_active_ = false;
+  callback_finished_ = true;
+  owner.issued_node_stage_[node_.scope_.slot_] = IssuedNodeStage::kInferred;
+  Check();
+  if (owner.issued_effect_ == IssuedEffect::kMalformedPropagation && node_.scope_.slot_ == 2)
+    (*propagation_)[0].mutable_tensor_type()->mutable_shape();
+}
+void M0SyntheticOwnerV1::ContextLayer::DescriptorAccess(const void* context, size_t index) {
+  Check();
+  ORT_ENFORCE(context == inference_identity_ && callback_active_ && !callback_finished_ && index == 0 &&
+                  scratch_ && scratch_->size() == 1 && !node_.scope_.permit_.generation_.owner.Poisoned(),
+              "RW07_ISSUED_DESCRIPTOR_SLOT");
+}
+void M0SyntheticOwnerV1::ContextLayer::BodyAccess(const void* context, const std::string& name) {
+  DescriptorAccess(context, 0);
+  auto& owner = node_.scope_.permit_.generation_.owner;
+  const auto slot = node_.scope_.slot_;
+  ORT_ENFORCE(slot < 2 && name == "body" && !body_issued_, "RW07_ISSUED_BODY_ENTRY");
+  const auto& attributes = node_.node_.GetAttributes();
+  const auto body = attributes.find("body");
+  const auto& children = node_.node_.GetAttributeNameToSubgraphMap();
+  const auto child = children.find("body");
+  ORT_ENFORCE(body != attributes.end() && body->second.has_g() && child != children.end() &&
+                  child->second.get() == owner.entries_[slot + 1].graph &&
+                  &body->second.g() == owner.entries_[slot + 1].backing &&
+                  body->second.g().SerializeAsString() == owner.entries_[slot + 1].original_backing,
+              "RW07_ISSUED_BODY_BACKING_JOIN");
+  body_issued_ = true;
+}
+void M0SyntheticOwnerV1::ContextLayer::PropagationNoWork(const void* context) {
+  Check();
+  auto& owner = node_.scope_.permit_.generation_.owner;
+  ORT_ENFORCE(context == propagation_identity_ && callback_finished_ && !callback_active_ &&
+                  !propagation_finished_ && !node_.node_.Op()->has_data_propagation_function() &&
+                  propagation_ && propagation_->size() == node_.node_.OutputDefs().size(),
+              "RW07_ISSUED_DP_NO_WORK_ENTRY");
+  for (const auto& type : *propagation_) {
+    ORT_ENFORCE(type.value_case() == TypeProto::VALUE_NOT_SET && !type.has_denotation() &&
+                    type.SerializeAsString().empty(),
+                "RW07_ISSUED_DP_ACTUAL_EMPTY_TYPE");
+  }
+  ORT_ENFORCE(!owner.Poisoned(), "RW07_ISSUED_DP_POISON");
+  propagation_finished_ = true;
+  ++owner.issued_audit_->propagation_no_work;
+  if (owner.issued_effect_ == IssuedEffect::kEngagedInventory && node_.scope_.slot_ == 2)
+    const_cast<NodeArg*>(node_.node_.OutputDefs()[0])->GetMutableInferredShapeValues().emplace();
+}
+void M0SyntheticOwnerV1::ContextLayer::SaverNoWork(const Node& node, const void* output, size_t index,
+                                                   const std::vector<TypeProto>& outputs) {
+  Check();
+  auto& owner = node_.scope_.permit_.generation_.owner;
+  ORT_ENFORCE(propagation_finished_ && !saver_finished_ && &outputs == propagation_ &&
+                  &node == &node_.node_ && index == 0 && node.OutputDefs().size() == 1 &&
+                  output == node.OutputDefs()[index] && outputs.size() == 1 &&
+                  outputs[index].value_case() == TypeProto::VALUE_NOT_SET && !outputs[index].has_denotation() &&
+                  outputs[index].SerializeAsString().empty(),
+              "RW07_ISSUED_SAVER_NO_WORK_JOIN");
+  // Check the whole inventory before any ordinary saver factory or payload lambda.
+  for (const auto& entry : owner.entries_) {
+    for (const auto& pair : entry.graph->node_args_) {
+      ORT_ENFORCE(pair.second && !pair.second->GetInferredShapeScalarValue().has_value() &&
+                      !pair.second->GetInferredShapeValues().has_value(),
+                  "RW07_ISSUED_SAVER_INVENTORY");
+    }
+  }
+  ORT_ENFORCE(!owner.Poisoned(), "RW07_ISSUED_SAVER_POISON");
+  saver_finished_ = true;
+  ++owner.issued_audit_->saver_no_work;
+}
+void M0SyntheticOwnerV1::ContextLayer::CallbackEffect(InferenceContextImpl& context) {
+  Check();
+  auto& owner = node_.scope_.permit_.generation_.owner;
+  if (node_.scope_.slot_ != 0) return;
+  switch (owner.issued_effect_) {
+    case IssuedEffect::kConflict: {
+      bool denied = false;
+      const auto validations_before = owner.audit_->full_validations;
+      const auto frames_before = owner.audit_->frame_pushes;
+      std::thread worker([&owner, &denied]() {
+        Generation conflict(owner);
+        denied = !conflict.acquired && owner.Poisoned();
+      });
+      worker.join();
+      ORT_ENFORCE(denied && owner.Poisoned() && owner.audit_->full_validations == validations_before &&
+                      owner.audit_->frame_pushes == frames_before,
+                  "RW07_ISSUED_CONFLICT_CONTROL");
+      break;
+    }
+    case IssuedEffect::kPayload:
+      (void)context.getInputData(std::numeric_limits<size_t>::max());
+      break;
+    case IssuedEffect::kSparse:
+      (void)context.getInputSparseData(std::numeric_limits<size_t>::max());
+      break;
+    case IssuedEffect::kSymbolic:
+      (void)context.getSymbolicInput(std::numeric_limits<size_t>::max());
+      break;
+    case IssuedEffect::kAttribute:
+      (void)context.getAttribute("marker");
+      break;
+    case IssuedEffect::kFunction:
+      (void)node_.node_.CanBeInlined();
+      break;
+    case IssuedEffect::kPropagationRead:
+      (void)static_cast<DataPropagationContextImpl*>(const_cast<void*>(propagation_identity_))->getInputData(std::numeric_limits<size_t>::max());
+      break;
+    case IssuedEffect::kPropagationWrite:
+      static_cast<DataPropagationContextImpl*>(const_cast<void*>(propagation_identity_))->addOutputData(std::numeric_limits<size_t>::max(), TensorShapeProto{});
+      break;
+    case IssuedEffect::kRepeatedBody:
+      (void)context.getGraphAttributeInferencer("body");
+      break;
+    case IssuedEffect::kDirectPerform:
+      ORT_THROW_IF_ERROR(const_cast<Graph*>(node_.node_.GetContainingGraph())->PerformTypeAndShapeInferencing({}));
+      break;
+    default:
+      break;
+  }
+}
+M0SyntheticOwnerV1::ChildJoin::ChildJoin(ContextLayer& context, Graph& child) : context_(context), child_(child) {
+  context_.Check();
+  auto& owner = context_.node_.scope_.permit_.generation_.owner;
+  ORT_ENFORCE(context_.callback_active_ && context_.body_issued_ && context_.node_.scope_.slot_ < 2 &&
+                  &child == owner.entries_[context_.node_.scope_.slot_ + 1].graph,
+              "RW07_ISSUED_CHILD_ISSUE");
+}
+M0SyntheticOwnerV1::ChildJoin::~ChildJoin() noexcept {
+  if (!returned_) context_.node_.scope_.permit_.generation_.owner.Poison();
+}
+void M0SyntheticOwnerV1::ChildJoin::Enter(ScopeLayer& scope, const std::vector<const TypeProto*>& inputs) {
+  auto& owner = context_.node_.scope_.permit_.generation_.owner;
+  ORT_ENFORCE(!entered_ && context_.callback_active_ && &scope.permit_ == &context_.node_.scope_.permit_ &&
+                  scope.slot_ == context_.node_.scope_.slot_ + 1 && scope.frame_.graph == &child_ &&
+                  inputs.size() == 1 && inputs[0] == context_.node_.node_.InputDefs()[0]->TypeAsProto() &&
+                  !owner.Poisoned(),
+              "RW07_ISSUED_CHILD_ENTER");
+  scope.Check(child_);
+  scope_ = &scope;
+  entered_ = true;
+}
+void M0SyntheticOwnerV1::ChildJoin::Joined(const Node& node, const Graph& child) {
+  auto& owner = context_.node_.scope_.permit_.generation_.owner;
+  const auto parent_slot = context_.node_.scope_.slot_;
+  ORT_ENFORCE(entered_ && !joined_ && scope_ && scope_->completed_ && &node == &context_.node_.node_ &&
+                  &child == &child_ && owner.issued_node_stage_[scope_->slot_] == IssuedNodeStage::kDone &&
+                  !owner.issued_inferred_child_[parent_slot] && !owner.Poisoned(),
+              "RW07_ISSUED_CHILD_JOIN");
+  owner.issued_inferred_child_[parent_slot] = true;
+  scope_->Check(child_);
+  joined_ = true;
+  ++owner.issued_audit_->child_joins;
+}
+void M0SyntheticOwnerV1::ChildJoin::Returned() {
+  auto& owner = context_.node_.scope_.permit_.generation_.owner;
+  ORT_ENFORCE(entered_ && joined_ && !returned_ && scope_, "RW07_ISSUED_CHILD_RETURN");
+  scope_->Check(child_);
+  if (owner.issued_effect_ == IssuedEffect::kNestedFailure && scope_->slot_ == 2) {
+    owner.Poison();
+    ORT_THROW("RW07_ISSUED_LATE_NESTED_FAILURE");
+  }
+  returned_ = true;
+  scope_ = nullptr;
+}
+#endif
+
 Status Graph::SaveShapeValuesFromDataPropagation(const Node& node,
                                                  NodeArg& output_def,
                                                  const TypeProto& onnx_inferred_type_after_data_propagation) const {
+  ORT_RETURN_IF_ERROR(owning_model_.M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kOrtPropagation));
   // Helper function to get the input value if it's a initializer.
   auto get_initialized_input_values_func = [&](const std::string& input_name, TensorShapeVector& input_values,
                                                int& num_dims)
@@ -3168,6 +3501,25 @@ Status Graph::InferAndVerifySubgraphTypes(const Node& node, Graph& subgraph,
                                           const std::vector<const TypeProto*>& input_types,
                                           std::vector<const TypeProto*>& output_types,
                                           const Graph::ResolveOptions& options) {
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  return InferAndVerifySubgraphTypes(node, subgraph, input_types, output_types, options, nullptr);
+}
+Status Graph::InferAndVerifySubgraphTypes(const Node& node, Graph& subgraph,
+                                          const std::vector<const TypeProto*>& input_types,
+                                          std::vector<const TypeProto*>& output_types,
+                                          const Graph::ResolveOptions& options, M0SyntheticOwnerV1::ChildJoin* join) {
+  if (join) {
+    ORT_ENFORCE(join->entered_ && join->scope_ && !join->joined_ && &join->child_ == &subgraph &&
+                    &join->context_.node_.node_ == &node && node.ImplicitInputDefs().empty() &&
+                    input_types.size() == 1 && input_types[0] == node.InputDefs()[0]->TypeAsProto() &&
+                    output_types.empty(),
+                "RW07_ISSUED_CHILD_INPUT_JOIN");
+    join->scope_->Check(subgraph);
+  } else
+#endif
+  {
+    ORT_RETURN_IF_ERROR(subgraph.GetModel().M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kRecursiveInference));
+  }
   auto status = Status::OK();
 
   output_types.clear();
@@ -3238,7 +3590,12 @@ Status Graph::InferAndVerifySubgraphTypes(const Node& node, Graph& subgraph,
 
   // now that we have handled the input types, do the type/shape inferencing for the subgraph
   // to flow the type/shape info through it
-  status = subgraph.PerformTypeAndShapeInferencing(options);
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  if (join)
+    status = subgraph.PerformTypeAndShapeInferencing(options, *join->scope_);
+  else
+#endif
+    status = subgraph.PerformTypeAndShapeInferencing(options);
   ORT_RETURN_IF_ERROR(status);
 
   // Record that this subgraph had type/shape inferencing (and thus node/op verification via
@@ -3249,6 +3606,9 @@ Status Graph::InferAndVerifySubgraphTypes(const Node& node, Graph& subgraph,
   if (subgraph.parent_graph_ != nullptr) {
     subgraph.parent_graph_->resolve_context_.inferred_subgraphs.insert(&subgraph);
   }
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  if (join) join->Joined(node, subgraph);
+#endif
 
   auto& subgraph_outputs = subgraph.GetOutputs();
   for (const auto* output : subgraph_outputs) {
@@ -3271,6 +3631,13 @@ Status Graph::UpdateShapeInference(Node& node) {
 // Implementation of type-inference and type-checking for a single node
 GSL_SUPPRESS(f .23)  // spurious warning about inferred_type never being checked for null
 Status Graph::InferAndVerifyTypeMatch(Node& node, const OpSchema& op, const ResolveOptions& options) {
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  return InferAndVerifyTypeMatch(node, op, options, nullptr);
+}
+Status Graph::InferAndVerifyTypeMatch(Node& node, const OpSchema& op, const ResolveOptions& options,
+                                      M0SyntheticOwnerV1::NodeLayer* layer) {
+  if (layer) layer->Check();
+#endif
   auto& node_name = node.Name();
 
   // if we're building a graph we permit outer scope node args to have no type
@@ -3362,9 +3729,20 @@ Status Graph::InferAndVerifyTypeMatch(Node& node, const OpSchema& op, const Reso
   // handle type/shape inferencing for it.
   // Once that completes, the outputs from the node containing the subgraph will be updated, and the final values
   // returned here.
-  SubgraphInferencingFunc func(Graph::InferAndVerifySubgraphTypes);
+  SubgraphInferencingFunc func([](const Node& n, Graph& g, const std::vector<const TypeProto*>& inputs,
+                                  std::vector<const TypeProto*>& outputs, const ResolveOptions& resolve_options) {
+    return Graph::InferAndVerifySubgraphTypes(n, g, inputs, outputs, resolve_options);
+  });
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  auto retire_context = [](M0SyntheticOwnerV1::ContextLayer* value) { delete value; };
+  std::unique_ptr<M0SyntheticOwnerV1::ContextLayer, decltype(retire_context)> context_layer(
+      layer ? new M0SyntheticOwnerV1::ContextLayer(*layer) : nullptr, retire_context);
+  InferenceContextImpl context(node, func, *this, options, context_layer.get());
+  DataPropagationContextImpl data_propagation_context(node, context_layer.get());
+#else
   InferenceContextImpl context(node, func, *this, options);
   DataPropagationContextImpl data_propagation_context(node);
+#endif
 
   {
     auto status = Status::OK();
@@ -3391,6 +3769,14 @@ Status Graph::InferAndVerifyTypeMatch(Node& node, const OpSchema& op, const Reso
 
   const auto& onnx_inferred_types_after_data_propagation(data_propagation_context.InferredOutputTypes());
 
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  if (context_layer) {
+    context_layer->Check();
+    ORT_ENFORCE(onnx_inferred_types.size() == 1 && onnx_inferred_types_after_data_propagation.size() == 1 &&
+                    node.OutputDefs().size() == 1,
+                "RW07_ISSUED_OUTPUT_CARDINALITY");
+  }
+#endif
   // Infer and verify node output arg type information.
   int i = -1;
   for (auto& output_def : node.MutableDefinitions().output_defs) {
@@ -3409,9 +3795,16 @@ Status Graph::InferAndVerifyTypeMatch(Node& node, const OpSchema& op, const Reso
     const TypeProto& onnx_inferred_type = onnx_inferred_types[i];
     const TypeProto& onnx_inferred_type_after_data_propagation = onnx_inferred_types_after_data_propagation[i];
 
-    ORT_RETURN_IF_ERROR(SaveShapeValuesFromDataPropagation(node,
-                                                           *output_def,
-                                                           onnx_inferred_type_after_data_propagation));
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+    if (context_layer) {
+      context_layer->SaverNoWork(node, output_def, static_cast<size_t>(i), onnx_inferred_types_after_data_propagation);
+    } else
+#endif
+    {
+      ORT_RETURN_IF_ERROR(SaveShapeValuesFromDataPropagation(node,
+                                                             *output_def,
+                                                             onnx_inferred_type_after_data_propagation));
+    }
 
     DataType existing_type = output_def->Type();
     DataType inferred_type = nullptr;
@@ -3456,9 +3849,18 @@ Status Graph::InferAndVerifyTypeMatch(Node& node, const OpSchema& op, const Reso
         // If the original tensor has shape information, need to set it back.
         if (output_def->Shape()) {
           auto old_shape = *output_def->Shape();
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+          if (context_layer) context_layer->Check();
+#endif
           output_def->SetType(inferred_type);
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+          if (context_layer) context_layer->Check();
+#endif
           output_def->SetShape(old_shape);
         } else {
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+          if (context_layer) context_layer->Check();
+#endif
           output_def->SetType(inferred_type);
         }
       } else
@@ -3468,14 +3870,21 @@ Status Graph::InferAndVerifyTypeMatch(Node& node, const OpSchema& op, const Reso
                           ") does not match expected type (" + *inferred_type + ").");
     }
 
-    if (existing_type == nullptr)
+    if (existing_type == nullptr) {
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+      if (context_layer) context_layer->Check();
+#endif
       output_def->SetType(inferred_type);
+    }
 
     // Update output-shape if it was inferred:
     // HasShape()/GetShape() work for tensor types
     // if the behavior changes the below may need adjustment
     if (utils::HasShape(onnx_inferred_type)) {
       if (output_def->Shape() == nullptr) {
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+        if (context_layer) context_layer->Check();
+#endif
         output_def->SetShape(utils::GetShape(onnx_inferred_type));
       } else {
         // we need to merge the shapes as a subgraph may have placeholder dimensions to represent the rank
@@ -3497,11 +3906,17 @@ Status Graph::InferAndVerifyTypeMatch(Node& node, const OpSchema& op, const Reso
           *merge_target.mutable_sparse_tensor_type()->mutable_shape() = *output_def->Shape();
         }
 #endif
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+        if (context_layer) context_layer->Check();
+#endif
         auto status = MergeShapeInfo(output_def->Name(), onnx_inferred_type, merge_target,
                                      strict_shape_type_inference_, logger_);
         if (!status.IsOK()) {
           return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Node:", node_name, " ", status.ErrorMessage());
         }
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+        if (context_layer) context_layer->Check();
+#endif
         // we may have cleared the shape if there was a mismatch so handle that
         if (utils::HasShape(merge_target))
           output_def->SetShape(utils::GetShape(merge_target));
@@ -3511,6 +3926,9 @@ Status Graph::InferAndVerifyTypeMatch(Node& node, const OpSchema& op, const Reso
     }
   }
 
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  if (layer) layer->Published();
+#endif
   return Status::OK();
 }
 
@@ -3588,6 +4006,13 @@ common::Status Graph::TypeCheckInputsAndInitializers() {
 }
 
 Status Graph::VerifyNodeAndOpMatch(const ResolveOptions& options) {
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  return VerifyNodeAndOpMatch(options, nullptr);
+}
+
+Status Graph::VerifyNodeAndOpMatch(const ResolveOptions& options, M0SyntheticOwnerV1::ScopeLayer* layer) {
+  if (layer) layer->Check(*this);
+#endif
   CheckerContext ctx;
   ctx.set_ir_version(gsl::narrow_cast<int>(IrVersion()));
   ctx.set_opset_imports(DomainToVersionMap());
@@ -3622,6 +4047,11 @@ Status Graph::VerifyNodeAndOpMatch(const ResolveOptions& options) {
   for (auto node_index : nodes_in_topological_order_) {
     // Node verification.
     auto& node = *GetNode(node_index);
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+    auto retire_layer = [](M0SyntheticOwnerV1::NodeLayer* value) { delete value; };
+    std::unique_ptr<M0SyntheticOwnerV1::NodeLayer, decltype(retire_layer)> node_layer(
+        layer ? new M0SyntheticOwnerV1::NodeLayer(*layer, node) : nullptr, retire_layer);
+#endif
 
     const auto& node_name = node.Name();
 
@@ -3650,6 +4080,9 @@ Status Graph::VerifyNodeAndOpMatch(const ResolveOptions& options) {
         ORT_RETURN_IF_ERROR(status);
       }
 
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+      if (node_layer) node_layer->Checked();
+#endif
       SetOpSchemaFromRegistryForNode(node);
 
       if (!node.op_) {
@@ -3677,6 +4110,9 @@ Status Graph::VerifyNodeAndOpMatch(const ResolveOptions& options) {
     }
 
     ORT_RETURN_IF_ERROR(node.UpdateInputArgCount());
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+    if (node_layer) node_layer->Selected();
+#endif
 
     // currently an Op is required by ValidateVersion, so we use gsl::not_null to validate that.
     // This may change in the future to allow a null Op
@@ -3694,7 +4130,13 @@ Status Graph::VerifyNodeAndOpMatch(const ResolveOptions& options) {
           if (utils::HasName(attr_def.second.default_value)) {
             assert(attr_def.first == attr_def.second.default_value.name());
             // Set default value to the node attributes.
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+            if (node_layer) node_layer->BeforeDefault(attr_def.second.default_value);
+#endif
             node.AddAttributeProto(attr_def.second.default_value);
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+            if (node_layer) node_layer->Defaulted();
+#endif
           }
           // TODO: Handle optional attribute but no default value specified in op definition.
         } else {
@@ -3708,7 +4150,15 @@ Status Graph::VerifyNodeAndOpMatch(const ResolveOptions& options) {
       }
     }
 
-    NO_CHANGE_ON_SYNC_FLAG(ORT_RETURN_IF_ERROR(InferAndVerifyTypeMatch(node, *p_op, options)));
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+    if (node_layer) {
+      NO_CHANGE_ON_SYNC_FLAG(ORT_RETURN_IF_ERROR(InferAndVerifyTypeMatch(node, *p_op, options, node_layer.get())));
+      node_layer->Completed();
+    } else
+#endif
+    {
+      NO_CHANGE_ON_SYNC_FLAG(ORT_RETURN_IF_ERROR(InferAndVerifyTypeMatch(node, *p_op, options)));
+    }
 
     // Accumulate output names of the iterated Node
     for (const auto& output : node.OutputDefs()) {
@@ -3721,6 +4171,18 @@ Status Graph::VerifyNodeAndOpMatch(const ResolveOptions& options) {
     auto& node = *GetNode(node_index);
     for (auto& entry : node.GetAttributeNameToMutableSubgraphMap()) {
       Graph* subgraph = entry.second;
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+      if (layer) {
+        layer->Check(*this);
+        auto& owner = *owning_model_.m0_synthetic_owner_v1_;
+        ORT_ENFORCE(node.ImplicitInputDefs().empty() && layer->slot_ < 2 && entry.first == "body" &&
+                        subgraph == owner.entries_[layer->slot_ + 1].graph &&
+                        resolve_context_.inferred_subgraphs.contains(subgraph) &&
+                        owner.issued_node_stage_[layer->slot_ + 1] == M0SyntheticOwnerV1::IssuedNodeStage::kDone,
+                    "RW07_ISSUED_CHILD_SKIP_JOIN");
+        ++owner.issued_audit_->child_skips;
+      }
+#endif
 
       // Propagate type info from outer scope implicit inputs to the subgraph's NodeArgs.
       // This is needed when the op's type/shape inference function does not invoke subgraph
@@ -3754,7 +4216,13 @@ Status Graph::VerifyNodeAndOpMatch(const ResolveOptions& options) {
     }
   }
 
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  if (layer) layer->Check(*this);
+#endif
   ORT_RETURN_IF_ERROR(CleanUpShapeValuesFromDataPropagation());
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  if (layer) layer->Check(*this);
+#endif
 
   return Status::OK();
 }
@@ -3826,6 +4294,7 @@ Status Graph::InitInputsInitializersOutputs() {
 }
 
 Status Graph::PerformTypeAndShapeInferencing(const ResolveOptions& options) {
+  ORT_RETURN_IF_ERROR(owning_model_.M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kRecursiveInference));
   ORT_RETURN_IF_ERROR(TypeCheckInputsAndInitializers());
 
   // type/shape inferencing on the nodes is done recursively as we need subgraph outputs
@@ -3845,7 +4314,30 @@ Status Graph::PerformTypeAndShapeInferencing(const ResolveOptions& options) {
   return Status::OK();
 }
 
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+Status Graph::PerformTypeAndShapeInferencing(const ResolveOptions& options, M0SyntheticOwnerV1::ScopeLayer& layer) {
+  layer.Check(*this);
+  ORT_ENFORCE(!layer.perform_entered_ && !options.override_types, "RW07_ISSUED_PERFORM_ENTRY");
+  layer.perform_entered_ = true;
+  ORT_RETURN_IF_ERROR(TypeCheckInputsAndInitializers());
+  layer.Check(*this);
+  ORT_RETURN_IF_ERROR(VerifyNodeAndOpMatch(options, &layer));
+  layer.Check(*this);
+  ORT_ENFORCE(owning_model_.m0_synthetic_owner_v1_->issued_node_stage_[layer.slot_] ==
+                  M0SyntheticOwnerV1::IssuedNodeStage::kDone,
+              "RW07_ISSUED_PERFORM_EXIT");
+  layer.completed_ = true;
+  if (layer.slot_ == 0) layer.permit_.root_completed_ = true;
+  return Status::OK();
+}
+#endif
+
 Status Graph::Resolve(const ResolveOptions& options) {
+  // Deny before parent redirection, discovery or the clean-graph success shortcut.
+  if (owning_model_.m0_synthetic_owner_v1_) {
+    return owning_model_.m0_synthetic_owner_v1_->ResolveClosed(this);
+  }
+  ORT_RETURN_IF_ERROR(owning_model_.M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kResolve));
   if (parent_graph_) {
     // Resolve must start at the top level graph in-order to handle outer scope
     // connections correctly, so recurse up to that level to start
@@ -6944,6 +7436,7 @@ Graph::Graph(const Model& owning_model,
              const logging::Logger& logger,
              bool strict_shape_type_inference)
     : owning_model_(owning_model),
+      m0_registration_v1_(owning_model, this, nullptr, parent_graph, parent_node),
       graph_proto_(&deserialized_proto_data_),
 #if !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
       runtime_optimizations_ptr_(std::make_unique<RuntimeOptimizationRecordContainer>()),
@@ -6959,10 +7452,12 @@ Graph::Graph(const Model& owning_model,
       logger_(logger),
       strict_shape_type_inference_(strict_shape_type_inference),
       is_loaded_from_model_file_(true) {  // true as the Graph isn't manually constructed from scratch
+  ORT_THROW_IF_ERROR(owning_model_.M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kConstruction));
 }
 
 common::Status Graph::LoadFromOrtFormat(const onnxruntime::fbs::Graph& fbs_graph,
                                         const OrtFormatLoadOptions& load_options) {
+  ORT_RETURN_IF_ERROR(owning_model_.M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kConstruction));
   // We deserialize the graph from ORT format in the following order:
   // 1. Deserialize the initializers and sparse initializers. Convert sparse to dense.
   // 2. Deserialize the NodeArgs

@@ -450,8 +450,64 @@ static const BuildKernelCreateInfoFn build_kernel_create_info_function_table[] =
     BuildKernelCreateInfo<class ONNX_OPERATOR_VERSIONED_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kOnnxDomain, 16, 19, GridSample)>,
 };
 
+KernelCreateInfo CreateM0IndexRegionKernelInfo();
+KernelCreateInfo CreateM0V2IndexRegionKernelInfo();
+KernelCreateInfo CreateM0ShapeRegionKernelInfo(const char* name);
+KernelCreateInfo CreateM0ShapeConsumerKernelInfo();
+KernelCreateInfo CreateM0FullGpuDurationExtentKernelInfo();
+KernelCreateInfo CreateM0FullGpuDurationExtentV2KernelInfo();
+KernelCreateInfo CreateM0FullGpuDurationExtentV3KernelInfo();
+KernelCreateInfo CreateM0FullGpuDurationNeonAuditV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuDurationNeonAuditV2KernelInfo();
+KernelCreateInfo CreateM0FullGpuAlignmentExtentKernelInfo();
+KernelCreateInfo CreateM0FullGpuAlignmentExtentV2KernelInfo();
+KernelCreateInfo CreateM0FullGpuConvExtentKernelInfo();
+KernelCreateInfo CreateM0FullGpuConvExtentV2KernelInfo();
+KernelCreateInfo CreateM0FullGpuRecurrenceExtentKernelInfo();
+KernelCreateInfo CreateM0FullGpuResizeNearestExtentKernelInfo();
+KernelCreateInfo CreateM0FullGpuResizeLinearExtentKernelInfo();
+KernelCreateInfo CreateM0FullGpuTemporalProjectionExtentKernelInfo();
+KernelCreateInfo CreateM0FullGpuFrameProjectionExtentKernelInfo();
+KernelCreateInfo CreateM0FullGpuReconstructionExtentKernelInfo();
+KernelCreateInfo CreateM0FullGpuTerminalPacketV3KernelInfo();
+KernelCreateInfo CreateM0FullGpuDurationExtentV4KernelInfo();
+KernelCreateInfo CreateM0FullGpuFrameProjectionExtentV2KernelInfo();
+KernelCreateInfo CreateM0FullGpuFrameProjectionFaultExtentV2KernelInfo();
+KernelCreateInfo CreateM0FullGpuReconstructionExtentV2KernelInfo();
+KernelCreateInfo CreateM0FullGpuTerminalPacketV4KernelInfo();
+KernelCreateInfo CreateM0FullGpuTerminalPacketKernelInfo();
+KernelCreateInfo CreateM0FullGpuTerminalPacketV2KernelInfo();
+
 std::unique_ptr<KernelRegistry> RegisterKernels(bool enable_graph_capture, bool enable_int64) {
   auto kernel_registry = std::make_unique<KernelRegistry>();
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0IndexRegionKernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0V2IndexRegionKernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0ShapeRegionKernelInfo("ShapeRegionV1")));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0ShapeRegionKernelInfo("ShapeAuditRegionV1")));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0ShapeConsumerKernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuDurationExtentKernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuDurationExtentV2KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuDurationExtentV3KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuDurationNeonAuditV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuDurationNeonAuditV2KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuAlignmentExtentKernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuAlignmentExtentV2KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuConvExtentKernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuConvExtentV2KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuRecurrenceExtentKernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuResizeNearestExtentKernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuResizeLinearExtentKernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuTemporalProjectionExtentKernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuFrameProjectionExtentKernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuReconstructionExtentKernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuTerminalPacketV3KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuDurationExtentV4KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuFrameProjectionExtentV2KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuFrameProjectionFaultExtentV2KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuReconstructionExtentV2KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuTerminalPacketV4KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuTerminalPacketKernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuTerminalPacketV2KernelInfo()));
 
   for (auto& function_table_entry : build_kernel_create_info_function_table) {
     KernelCreateInfo info = function_table_entry();
@@ -891,15 +947,82 @@ std::unique_ptr<profiling::EpProfiler> WebGpuExecutionProvider::GetProfiler() {
 }
 
 Status WebGpuExecutionProvider::OnRunStart(const onnxruntime::RunOptions& run_options) {
+  const bool strict_ownership = run_options.config_options.GetConfigOrDefault("m0.fullgpu.extent_ownership_v2", "0") == "1";
+  if (strict_ownership) {
+    ORT_RETURN_IF_NOT(!IsGraphCaptureEnabled(), "RW07 strict ownership graph capture uncertified");
+    ORT_RETURN_IF_NOT(!context_.M0OwnershipV2().Poisoned(), "RW07 strict GPU context completion poisoned");
+  }
+  m0_fault_mode_v2_ = 0;
+  m0_fault_session_v2_ = m0_fault_run_v2_ = 0;
+  bool m0_scope_pushed = false, m0_profiling_attempted = false, m0_start_committed = false;
+  bool m0_fault_registered = false;
+  auto m0_start_rollback = gsl::finally([&]() noexcept {
+    if (!strict_ownership || m0_start_committed) return;
+    bool profiling_collected = false, scope_popped = false;
+    if (m0_profiling_attempted) {
+      try { context_.CollectProfilingData(); profiling_collected = true; }
+      catch (...) { context_.M0OwnershipV2().Poison(); }
+    }
+    if (m0_scope_pushed) {
+      try {
+        const auto popped = context_.PopErrorScope(); scope_popped = popped.IsOK();
+        if (!scope_popped) context_.M0OwnershipV2().Poison();
+      } catch (...) { context_.M0OwnershipV2().Poison(); }
+    }
+    run_active_.store(false);
+    try { LOGS_DEFAULT(INFO) << "M0_RW07_LIFECYCLE_START_CLEANUP session=" << m0_fault_session_v2_
+      << " run=" << m0_fault_run_v2_ << " scope_pushed=" << m0_scope_pushed << " scope_popped=" << scope_popped
+      << " profile_attempted=" << m0_profiling_attempted << " profile_collected=" << profiling_collected
+      << " profiling_active=" << context_.M0ProfilingActiveV2() << " routing_reset=" << !graph_buffer_mgr_active_
+      << " run_active_after_cleanup=" << run_active_.load() << " context_poisoned=" << context_.M0OwnershipV2().Poisoned(); }
+    catch (...) { context_.M0OwnershipV2().Poison(); }
+    if (m0_fault_registered) {
+      try { if (!context_.M0FaultHooksV2().End(m0_fault_session_v2_, m0_fault_run_v2_)) context_.M0OwnershipV2().Poison(); }
+      catch (...) { context_.M0OwnershipV2().Poison(); }
+      m0_fault_run_v2_ = 0;
+    }
+    run_active_.store(false);
+    try { LOGS_DEFAULT(INFO) << "M0_RW07_RUN_START_ROLLBACK context_poisoned=" << context_.M0OwnershipV2().Poisoned(); }
+    catch (...) { context_.M0OwnershipV2().Poison(); }
+  });
+  const bool fault_authorized = strict_ownership && run_options.config_options.GetConfigOrDefault(
+      "m0.fullgpu.fault_authorized_v2", "0") == "1";
+  webgpu::M0FullGpuFaultModeV2 fault_mode;
+  ORT_RETURN_IF_NOT(webgpu::M0FullGpuParseFaultModeV2(run_options.config_options.GetConfigOrDefault(
+      "m0.fullgpu.diagnostic_fault_mode_v2", "0"), fault_authorized, fault_mode),
+      "RW07 uncertified diagnostic fault option");
+  if (fault_authorized) {
+    const auto session_id = run_options.config_options.GetConfigOrDefault("m0.fullgpu.actual_session_v2", "");
+    const auto run_id = run_options.config_options.GetConfigOrDefault("m0.fullgpu.actual_run_v2", "");
+    ORT_RETURN_IF_NOT(TryParseStringWithClassicLocale<uint64_t>(session_id, m0_fault_session_v2_) &&
+      TryParseStringWithClassicLocale<uint64_t>(run_id, m0_fault_run_v2_),
+      "RW07 actual diagnostic fault owner unavailable");
+    m0_fault_registered = context_.M0FaultHooksV2().Begin(m0_fault_session_v2_, m0_fault_run_v2_, fault_mode, true);
+    ORT_RETURN_IF_NOT(m0_fault_registered, "RW07 actual diagnostic fault owner registration failed");
+    m0_fault_mode_v2_ = static_cast<uint32_t>(fault_mode);
+    LOGS_DEFAULT(INFO) << "M0_RW07_FAULT_RUN_BEGIN session=" << m0_fault_session_v2_
+      << " run=" << m0_fault_run_v2_ << " mode=" << m0_fault_mode_v2_;
+  }
   if (context_.ValidationMode() >= ValidationMode::Basic) {
     context_.PushErrorScope();
+    m0_scope_pushed = true;
+    if (m0_fault_mode_v2_ == 10) { LOGS_DEFAULT(INFO) << "M0_RW07_LIFECYCLE_CHECKPOINT session="
+      << m0_fault_session_v2_ << " run=" << m0_fault_run_v2_ << " checkpoint=10 injected=1 scope_pushed=1"; }
+    if (m0_fault_run_v2_) context_.M0FaultHooksV2().ThrowIfRequested(m0_fault_session_v2_, m0_fault_run_v2_,
+      webgpu::M0FullGpuFaultCheckpointV2::AfterPushScope);
   }
 
   // Start profiling if session-level or run-level profiling is enabled. The CPU time
   // base used to align GPU timestamps is pushed into the context by
   // WebGpuProfiler::StartProfiling, so no timepoint is threaded through here.
-  if ((session_profiler_ && session_profiler_->Enabled()) || run_options.enable_profiling) {
+  if ((session_profiler_ && session_profiler_->Enabled()) || run_options.enable_profiling || m0_fault_mode_v2_ == 11) {
+    m0_profiling_attempted = true;
     context_.StartProfiling();
+    if (m0_fault_mode_v2_ == 11) { LOGS_DEFAULT(INFO) << "M0_RW07_LIFECYCLE_CHECKPOINT session="
+      << m0_fault_session_v2_ << " run=" << m0_fault_run_v2_ << " checkpoint=11 injected=1 profiling_attempted=1 profiling_active="
+      << context_.M0ProfilingActiveV2(); }
+    if (m0_fault_run_v2_) context_.M0FaultHooksV2().ThrowIfRequested(m0_fault_session_v2_, m0_fault_run_v2_,
+      webgpu::M0FullGpuFaultCheckpointV2::AfterProfilingAttempt);
   }
 
   if (IsGraphCaptureEnabled()) {
@@ -937,15 +1060,60 @@ Status WebGpuExecutionProvider::OnRunStart(const onnxruntime::RunOptions& run_op
   }
 
   run_active_.store(true);
+  m0_start_committed = true;
   return Status::OK();
 }
 
-Status WebGpuExecutionProvider::OnRunEnd(bool /* sync_stream */, const onnxruntime::RunOptions& run_options) {
+Status WebGpuExecutionProvider::OnRunEnd(bool sync_stream, const onnxruntime::RunOptions& run_options) {
   // When capturing, flushing creates the replay-ready CapturedCommandInfo entries before
   // CaptureEnd() detaches their external storage.
-  Status flush_status = context_.Flush(BufferManager(), *recording_);
+  const bool strict_ownership = run_options.config_options.GetConfigOrDefault(
+      "m0.fullgpu.extent_ownership_v2", "0") == "1";
+  auto m0_fault_end = gsl::finally([&]() noexcept {
+    if (!m0_fault_run_v2_) return;
+    try {
+      const bool ended = context_.M0FaultHooksV2().End(m0_fault_session_v2_, m0_fault_run_v2_);
+      LOGS_DEFAULT(INFO) << "M0_RW07_FAULT_RUN_END session=" << m0_fault_session_v2_
+        << " run=" << m0_fault_run_v2_ << " ended=" << ended;
+      if (!ended) context_.M0OwnershipV2().Poison();
+    } catch (...) { context_.M0OwnershipV2().Poison(); }
+    m0_fault_run_v2_ = 0;
+    m0_fault_mode_v2_ = 0;
+  });
+  bool m0_end_committed = false;
+  bool m0_end_scope_pending = context_.ValidationMode() >= ValidationMode::Basic;
+  auto m0_end_failure = gsl::finally([&]() noexcept {
+    if (!strict_ownership || m0_end_committed) return;
+    context_.M0OwnershipV2().Poison();
+    graph_buffer_mgr_active_ = false;
+    run_active_.store(false);
+    bool profiling_collected = false, scope_popped = false;
+    if ((session_profiler_ && session_profiler_->Enabled()) || run_options.enable_profiling) {
+      try { context_.CollectProfilingData(); profiling_collected = true; } catch (...) {}
+    }
+    if (m0_end_scope_pending) {
+      try { scope_popped = context_.PopErrorScope().IsOK(); } catch (...) {}
+    }
+    try { LOGS_DEFAULT(INFO) << "M0_RW07_LIFECYCLE_END_CLEANUP session=" << m0_fault_session_v2_
+      << " run=" << m0_fault_run_v2_ << " scope_popped=" << scope_popped << " profile_collected=" << profiling_collected
+      << " profiling_active=" << context_.M0ProfilingActiveV2() << " routing_reset=" << !graph_buffer_mgr_active_
+      << " run_active=" << run_active_.load() << " context_poisoned=" << context_.M0OwnershipV2().Poisoned(); }
+    catch (...) {}
+  });
+  ORT_RETURN_IF_NOT(!strict_ownership || sync_stream, "RW07 strict ownership requires checked completion");
+  Status flush_status = strict_ownership
+      ? context_.FlushAndWaitChecked(BufferManager(), *recording_)
+      : context_.Flush(BufferManager(), *recording_);
+  if (strict_ownership && flush_status.IsOK()) {
+    LOGS_DEFAULT(INFO) << "M0_RW07_RUN_QUEUE_COMPLETE timeline=" << recording_.get();
+    if (m0_fault_mode_v2_ == 12) { LOGS_DEFAULT(INFO) << "M0_RW07_LIFECYCLE_CHECKPOINT session="
+      << m0_fault_session_v2_ << " run=" << m0_fault_run_v2_ << " checkpoint=12 injected=1 checked_queue_complete=1"; }
+    if (m0_fault_run_v2_) context_.M0FaultHooksV2().ThrowIfRequested(m0_fault_session_v2_, m0_fault_run_v2_,
+      webgpu::M0FullGpuFaultCheckpointV2::AfterCheckedEnd);
+  }
 
   if (!flush_status.IsOK()) {
+    if (strict_ownership) context_.M0OwnershipV2().Poison();
     if (IsGraphCaptureEnabled()) {
       context_.CaptureEnd(*recording_);
       auto commands_it = captured_graphs_.find(current_graph_annotation_id_);
@@ -956,6 +1124,7 @@ Status WebGpuExecutionProvider::OnRunEnd(bool /* sync_stream */, const onnxrunti
     }
     graph_buffer_mgr_active_ = false;
     if (context_.ValidationMode() >= ValidationMode::Basic) {
+      m0_end_scope_pending = false;
       static_cast<void>(context_.PopErrorScope());
     }
     run_active_.store(false);
@@ -991,8 +1160,12 @@ Status WebGpuExecutionProvider::OnRunEnd(bool /* sync_stream */, const onnxrunti
   run_active_.store(false);
 
   if (context_.ValidationMode() >= ValidationMode::Basic) {
-    return context_.PopErrorScope();
+    m0_end_scope_pending = false;
+    const auto scope_status = context_.PopErrorScope();
+    m0_end_committed = scope_status.IsOK();
+    return scope_status;
   } else {
+    m0_end_committed = true;
     return Status::OK();
   }
 }

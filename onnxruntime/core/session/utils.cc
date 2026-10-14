@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "core/framework/error_code_helper.h"
+#include "core/framework/m0_fullgpu_preinit_admission.h"
 #include "core/framework/execution_provider.h"
 #include "core/framework/provider_options.h"
 #include "core/common/narrow.h"
@@ -236,6 +237,9 @@ static OrtStatus* CreateSessionAndLoadSingleModelImpl(_In_ const OrtSessionOptio
                                                       _In_opt_ const void* model_data,
                                                       size_t model_data_length,
                                                       std::unique_ptr<onnxruntime::InferenceSession>& sess) {
+  if (options) {
+    ORT_API_RETURN_IF_STATUS_NOT_OK(M0FullGpuCheckPreloadV1(options->value));
+  }
   // quick check here to decide load path. InferenceSession will provide error message for invalid values.
   // TODO: Could move to a helper
   const Env& os_env = Env::Default();  // OS environment (!= ORT environment)
@@ -357,6 +361,9 @@ static OrtStatus* CreateSessionAndLoadModelImpl(_In_ const OrtSessionOptions* op
                                                 _In_opt_ const void* model_data,
                                                 size_t model_data_length,
                                                 std::unique_ptr<onnxruntime::InferenceSession>& sess) {
+  if (options) {
+    ORT_API_RETURN_IF_STATUS_NOT_OK(M0FullGpuCheckPreloadV1(options->value));
+  }
   if (model_path != nullptr) {
     std::error_code ec;
     if (std::filesystem::is_directory(model_path, ec) && !ec) {
@@ -377,6 +384,9 @@ static OrtStatus* CreateSessionAndLoadModelImpl(_In_ const OrtSessionOptions* op
                                                 const onnxruntime::Environment& env,
                                                 _In_ const OrtModel* model,
                                                 std::unique_ptr<onnxruntime::InferenceSession>& sess) {
+  if (options) {
+    ORT_API_RETURN_IF_STATUS_NOT_OK(M0FullGpuCheckPreloadV1(options->value));
+  }
   if (model == nullptr) {
     return OrtApis::CreateStatus(ORT_INVALID_ARGUMENT, "OrtModel pointer is null");
   }
@@ -464,6 +474,9 @@ OrtStatus* CreateSessionAndLoadModel(_In_ const OrtSessionOptions* options,
                                      _In_opt_ const void* model_data,
                                      size_t model_data_length,
                                      std::unique_ptr<onnxruntime::InferenceSession>& sess) {
+  if (options) {
+    ORT_API_RETURN_IF_STATUS_NOT_OK(M0FullGpuCheckPreloadV1(options->value));
+  }
   return CreateSessionAndLoadModelImpl(options, env->GetEnvironment(), model_path, model_data, model_data_length, sess);
 }
 
@@ -583,6 +596,10 @@ static Status ValidateCompiledModelCompatibility(InferenceSession& sess) {
 OrtStatus* InitializeSession(_In_ const OrtSessionOptions* options,
                              _In_ onnxruntime::InferenceSession& sess,
                              _Inout_opt_ OrtPrepackedWeightsContainer* prepacked_weights_container) {
+  ORT_API_RETURN_IF_STATUS_NOT_OK(sess.M0FullGpuCheckIngressV1());
+  if (options) {
+    ORT_API_RETURN_IF_STATUS_NOT_OK(M0FullGpuCheckPreloadV1(options->value));
+  }
   if (sess.GetRegisteredProviderTypes().empty()) {
     ORT_API_RETURN_IF_STATUS_NOT_OK(CreateAndRegisterExecutionProviders(options, sess));
   }
@@ -935,6 +952,9 @@ OrtStatus* CreateSessionForModelPackage(_In_ const OrtSessionOptions* options,
                                         const std::filesystem::path& selected_model_path,
                                         onnxruntime::ModelPackageComponentContext& model_package_context,
                                         std::unique_ptr<onnxruntime::InferenceSession>& sess) {
+  if (options) {
+    ORT_API_RETURN_IF_STATUS_NOT_OK(M0FullGpuCheckPreloadV1(options->value));
+  }
   // The model is loaded from selected_model_path. Any path-valued options (e.g. the external
   // initializers folder via session.model_external_initializers_file_folder_path) were already
   // resolved and merged into `options` by the caller.

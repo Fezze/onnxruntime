@@ -1313,20 +1313,24 @@ void WebGpuContext::PushErrorScope(wgpu::ErrorFilter filter) { device_.PushError
 
 Status WebGpuContext::PopErrorScope() {
   // A failed WaitAny does not cancel the callback. Let Dawn retain its result until it fires.
-  auto status = std::make_shared<Status>();
+  struct ScopeResult { Status status; bool callback_exception = false; };
+  auto result = std::make_shared<ScopeResult>();
   ORT_RETURN_IF_ERROR(Wait(device_.PopErrorScope(
       wgpu::CallbackMode::WaitAnyOnly,
       // Note: Don't throw from a Dawn callback.
-      [status](wgpu::PopErrorScopeStatus pop_status, wgpu::ErrorType error_type, wgpu::StringView message) noexcept {
+      [result](wgpu::PopErrorScopeStatus pop_status, wgpu::ErrorType error_type, wgpu::StringView message) noexcept {
+        try {
         if (pop_status != wgpu::PopErrorScopeStatus::Success) {
-          *status = ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Failed to pop WebGPU error scope. status=",
+          result->status = ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Failed to pop WebGPU error scope. status=",
                                     static_cast<uint32_t>(pop_status));
         } else if (error_type != wgpu::ErrorType::NoError) {
-          *status = ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "WebGPU error scope failed. type=",
+          result->status = ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "WebGPU error scope failed. type=",
                                     static_cast<uint32_t>(error_type), ". ", std::string_view(message));
         }
+        } catch (...) { result->callback_exception = true; }
       })));
-  return *status;
+  ORT_RETURN_IF(result->callback_exception, "RW07 error-scope callback metadata allocation failed");
+  return result->status;
 }
 
 Status WebGpuContext::CheckDeviceStatus() const {
@@ -1461,6 +1465,7 @@ Status WebGpuContext::Flush(const webgpu::BufferManager& buffer_mgr,
     recording.pending_kernels.clear();
   }
   auto command_buffer = recording.command_encoder.Finish();
+  LOGS_DEFAULT(INFO) << "M0_RW02_SUBMIT timeline=" << &recording << " device=" << device_.Get() << " pending_dispatches=" << recording.num_pending_dispatches;
   device_queue_.Submit(1, &command_buffer);
   refresh_pending_buffers();
 #if defined(_WIN32) && defined(ENABLE_D3D12_FILE_LOADING)
@@ -1523,6 +1528,7 @@ wgpu::BindGroup WebGpuContext::CreateBindGroup(const std::vector<WGPUBuffer>& bi
 
 void WebGpuContext::DispatchCommand(const webgpu::CapturedCommandInfo& command,
                                     CommandRecordingState& recording) {
+  LOGS_DEFAULT(INFO) << "M0_RW02_DISPATCH timeline=" << &recording << " program=" << command.program_key << " groups=" << command.dispatch_group[0] << "," << command.dispatch_group[1] << "," << command.dispatch_group[2];
   ORT_ENFORCE(command.compute_pipeline.has_value());
   ORT_ENFORCE(command.bind_group != nullptr);
   const auto& compute_pass_encoder = GetComputePassEncoder(recording);

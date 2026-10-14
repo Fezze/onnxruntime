@@ -188,6 +188,9 @@ struct KernelCreateInfo {
   std::unique_ptr<KernelDef> kernel_def;  // Owned and stored in the global kernel registry.
   KernelCreateFn kernel_create_func;
   Status status;
+  // Source-private reviewed implementation identity. Empty is unknown;
+  // provider/op names and initializer presence never grant admission.
+  std::string m0_implementation_id_v1;
 
   KernelCreateInfo(std::unique_ptr<KernelDef> definition,
                    KernelCreateFn create_func)
@@ -198,7 +201,8 @@ struct KernelCreateInfo {
 
   KernelCreateInfo(KernelCreateInfo&& other) noexcept
       : kernel_def(std::move(other.kernel_def)),
-        kernel_create_func(std::move(other.kernel_create_func)) {}
+        kernel_create_func(std::move(other.kernel_create_func)),
+        m0_implementation_id_v1(std::move(other.m0_implementation_id_v1)) {}
 
   KernelCreateInfo() = default;
 };
