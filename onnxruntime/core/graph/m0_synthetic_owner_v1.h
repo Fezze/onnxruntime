@@ -108,6 +108,21 @@ struct M0SyntheticIssuedReceiptV1 {
   bool descriptor_permission = false;
 };
 M0SyntheticIssuedReceiptV1 M0RunFixedSyntheticIssuedV1();
+
+struct M0SyntheticFinalizedReceiptV1 {
+  size_t native_bindings = 0;
+  size_t finalized_scopes = 0;
+  size_t finalization_steps = 0;
+  size_t clean_repeats = 0;
+  size_t cached_callbacks = 0;
+  size_t present_defaults = 0;
+  size_t parentless_callbacks = 0;
+  size_t equal7_callbacks = 0;
+  size_t rejected_mutations = 0;
+  size_t retired_owners = 0;
+  bool descriptor_permission = false;
+};
+M0SyntheticFinalizedReceiptV1 M0RunFixedSyntheticFinalizedV1();
 #endif
 
 // CLOSED foundation: registration/generation do not authorize descriptor dispatch.
@@ -153,7 +168,13 @@ class M0SyntheticOwnerV1 final {
     bool pushed = false;
   };
 
-  explicit M0SyntheticOwnerV1(std::shared_ptr<M0SyntheticOwnerReceiptV1> audit);
+  enum class Recipe { kNested,
+                      kEqual7 };
+  const Recipe recipe_;
+  bool Listed(size_t slot) const noexcept { return recipe_ == Recipe::kNested || slot == 0 || slot == 3; }
+  bool HasChild(size_t slot) const noexcept { return recipe_ == Recipe::kNested && slot < 2; }
+  const ONNX_NAMESPACE::OpSchema* Schema(size_t slot) const noexcept { return sealed_schemas_[HasChild(slot) ? 1 : 0]; }
+  explicit M0SyntheticOwnerV1(std::shared_ptr<M0SyntheticOwnerReceiptV1> audit, Recipe recipe = Recipe::kNested);
   ~M0SyntheticOwnerV1() noexcept;
   friend struct std::default_delete<M0SyntheticOwnerV1>;
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(M0SyntheticOwnerV1);
@@ -188,13 +209,15 @@ class M0SyntheticOwnerV1 final {
                             kMalformedPropagation,
                             kEngagedInventory,
                             kRepeatedBody,
-                            kDirectPerform };
+                            kDirectPerform,
+                            kFinalizationForeignContext };
   class ContextLayer;
   class ChildJoin;
   class ScopeLayer;
   class NodeLayer;
   class PermitGeneration final {
    private:
+    friend class M0SyntheticOwnerV1;
     friend class M0SyntheticOwnerFactoryV1;
     friend class ScopeLayer;
     friend class Graph;
@@ -210,6 +233,7 @@ class M0SyntheticOwnerV1 final {
   };
   class ScopeLayer final {
    private:
+    friend class M0SyntheticOwnerV1;
     friend class M0SyntheticOwnerFactoryV1;
     friend class Graph;
     friend class NodeLayer;
@@ -240,6 +264,8 @@ class M0SyntheticOwnerV1 final {
     void Selected();
     void BeforeDefault(const ONNX_NAMESPACE::AttributeProto& attribute);
     void Defaulted();
+    void DefaultsVerified();
+    void CachedSelected();
     void Published();
     void Completed();
     ScopeLayer& scope_;
@@ -301,6 +327,22 @@ class M0SyntheticOwnerV1 final {
   M0SyntheticIssuedReceiptV1* issued_audit_ = nullptr;
   std::array<bool, 4> issued_inferred_child_{};
   IssuedEffect issued_effect_ = IssuedEffect::kNone;
+  enum class Finalization { kPending,
+                            kContextCleared,
+                            kCleaned,
+                            kResolveCleared,
+                            kSyncHandled,
+                            kCounted };
+  std::array<Finalization, 4> finalization_{};
+  std::array<size_t, 4> resolve_counts_{};
+  std::array<bool, 4> retained_descriptor_{};
+  std::array<bool, 4> cached_pass_{};
+  bool finalization_route_ = false;
+  bool no_proto_sync_ = true;
+  size_t issued_root_slot_ = 0;
+  M0SyntheticFinalizedReceiptV1* finalized_audit_ = nullptr;
+  void FinalizationStep(Graph& graph, PermitGeneration& permit, size_t step);
+  void BeginCachedRepeat(ScopeLayer& layer);
 #endif
   bool DenyCallback() noexcept;
   void Poison() noexcept { poisoned_.store(true, std::memory_order_release); }

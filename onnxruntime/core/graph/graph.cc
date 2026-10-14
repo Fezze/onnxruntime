@@ -3179,7 +3179,7 @@ void M0SyntheticOwnerV1::ContextLayer::EnterCallback(const void* context) {
   auto& owner = node_.scope_.permit_.generation_.owner;
   ORT_ENFORCE(context == inference_identity_ && scratch_ && propagation_ && !callback_active_ &&
                   !callback_finished_ && owner.issued_node_stage_[node_.scope_.slot_] == IssuedNodeStage::kDefaulted &&
-                  node_.node_.Op() == owner.sealed_schemas_[node_.scope_.slot_ < 2 ? 1 : 0] &&
+                  node_.node_.Op() == owner.Schema(node_.scope_.slot_) &&
                   scratch_->size() == 1 && (*scratch_)[0].SerializeAsString().empty(),
               "RW07_ISSUED_CALLBACK_ENTRY");
   callback_active_ = true;
@@ -3190,7 +3190,7 @@ void M0SyntheticOwnerV1::ContextLayer::ExitCallback(const void* context) {
   auto& owner = node_.scope_.permit_.generation_.owner;
   ORT_ENFORCE(context == inference_identity_ && callback_active_ && !callback_finished_ && scratch_->size() == 1 &&
                   (*scratch_)[0].SerializeAsString() == node_.node_.InputDefs()[0]->TypeAsProto()->SerializeAsString() &&
-                  (node_.scope_.slot_ == 2 || owner.issued_inferred_child_[node_.scope_.slot_]) && !owner.Poisoned(),
+                  (!owner.HasChild(node_.scope_.slot_) || owner.issued_inferred_child_[node_.scope_.slot_]) && !owner.Poisoned(),
               "RW07_ISSUED_CALLBACK_EXIT");
   callback_active_ = false;
   callback_finished_ = true;
@@ -3250,7 +3250,9 @@ void M0SyntheticOwnerV1::ContextLayer::SaverNoWork(const Node& node, const void*
                   outputs[index].SerializeAsString().empty(),
               "RW07_ISSUED_SAVER_NO_WORK_JOIN");
   // Check the whole inventory before any ordinary saver factory or payload lambda.
-  for (const auto& entry : owner.entries_) {
+  for (size_t slot = 0; slot < owner.entries_.size(); ++slot) {
+    if (!owner.Listed(slot)) continue;
+    const auto& entry = owner.entries_[slot];
     for (const auto& pair : entry.graph->node_args_) {
       ORT_ENFORCE(pair.second && !pair.second->GetInferredShapeScalarValue().has_value() &&
                       !pair.second->GetInferredShapeValues().has_value(),
@@ -4111,7 +4113,12 @@ Status Graph::VerifyNodeAndOpMatch(const ResolveOptions& options, M0SyntheticOwn
 
     ORT_RETURN_IF_ERROR(node.UpdateInputArgCount());
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
-    if (node_layer) node_layer->Selected();
+    if (node_layer) {
+      if (node_layer->scope_.permit_.generation_.owner.cached_pass_[node_layer->scope_.slot_])
+        node_layer->CachedSelected();
+      else
+        node_layer->Selected();
+    }
 #endif
 
     // currently an Op is required by ValidateVersion, so we use gsl::not_null to validate that.
@@ -4152,6 +4159,7 @@ Status Graph::VerifyNodeAndOpMatch(const ResolveOptions& options, M0SyntheticOwn
 
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
     if (node_layer) {
+      node_layer->DefaultsVerified();
       NO_CHANGE_ON_SYNC_FLAG(ORT_RETURN_IF_ERROR(InferAndVerifyTypeMatch(node, *p_op, options, node_layer.get())));
       node_layer->Completed();
     } else
@@ -4327,7 +4335,7 @@ Status Graph::PerformTypeAndShapeInferencing(const ResolveOptions& options, M0Sy
                   M0SyntheticOwnerV1::IssuedNodeStage::kDone,
               "RW07_ISSUED_PERFORM_EXIT");
   layer.completed_ = true;
-  if (layer.slot_ == 0) layer.permit_.root_completed_ = true;
+  if (layer.slot_ == owning_model_.m0_synthetic_owner_v1_->issued_root_slot_) layer.permit_.root_completed_ = true;
   return Status::OK();
 }
 #endif
@@ -4338,6 +4346,29 @@ Status Graph::Resolve(const ResolveOptions& options) {
     return owning_model_.m0_synthetic_owner_v1_->ResolveClosed(this);
   }
   ORT_RETURN_IF_ERROR(owning_model_.M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kResolve));
+  return ResolveSource(options);
+}
+
+Status Graph::ResolveSource(const ResolveOptions& options
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+                            ,
+                            M0SyntheticOwnerV1::ScopeLayer* layer
+#endif
+) {
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  if (layer) {
+    layer->Check(*this);
+    auto& owner = *owning_model_.m0_synthetic_owner_v1_;
+    if (layer->completed_ || layer->perform_entered_) {
+      owner.Poison();
+      ORT_THROW("RW07_FINAL_RESOLVE_REUSED_LAYER");
+    }
+    ORT_ENFORCE(owner.finalization_route_ && options.no_proto_sync_required &&
+                    options.initializer_names_to_preserve == nullptr && !options.override_types &&
+                    layer->slot_ == owner.issued_root_slot_ && !parent_graph_,
+                "RW07_FINAL_RESOLVE_ENTRY");
+  }
+#endif
   if (parent_graph_) {
     // Resolve must start at the top level graph in-order to handle outer scope
     // connections correctly, so recurse up to that level to start
@@ -4354,6 +4385,19 @@ Status Graph::Resolve(const ResolveOptions& options) {
                                             });
 
   if (!GraphResolveNeeded() && !subgraphs_need_resolve) {
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+    if (layer) {
+      auto& owner = *owning_model_.m0_synthetic_owner_v1_;
+      ORT_ENFORCE(owner.retained_descriptor_[layer->slot_] &&
+                      owner.finalization_[layer->slot_] == M0SyntheticOwnerV1::Finalization::kCounted &&
+                      !layer->perform_entered_,
+                  "RW07_FINAL_CLEAN_REPEAT");
+      layer->Check(*this);
+      layer->completed_ = true;
+      layer->permit_.root_completed_ = true;
+      ++owner.finalized_audit_->clean_repeats;
+    }
+#endif
     return Status::OK();
   }
 
@@ -4361,55 +4405,92 @@ Status Graph::Resolve(const ResolveOptions& options) {
   ORT_RETURN_IF_ERROR(owning_model_.ValidateLocalFunctionCallDepth(*this));
 #endif
 
-  // init all graph/subgraphs. non-recursive so call via ForThisAndAllSubgraphs.
-  auto init_func = [](Graph& graph) { return graph.InitInputsInitializersOutputs(); };
-  ORT_RETURN_IF_ERROR(ForThisAndAllSubgraphs(all_subgraphs, init_func));
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  if (layer) {
+    owning_model_.m0_synthetic_owner_v1_->PrepareSorted(this);
+  } else
+#endif
+  {
+    // init all graph/subgraphs. non-recursive so call via ForThisAndAllSubgraphs.
+    auto init_func = [](Graph& graph) { return graph.InitInputsInitializersOutputs(); };
+    ORT_RETURN_IF_ERROR(ForThisAndAllSubgraphs(all_subgraphs, init_func));
 
-  std::unordered_set<std::string> outer_scope_node_args_consumed;
+    std::unordered_set<std::string> outer_scope_node_args_consumed;
 
-  // recursively build connections between nodes in this graph and all subgraphs
-  bool removed_node_with_subgraph = false;
-  ORT_RETURN_IF_ERROR(BuildConnections(outer_scope_node_args_consumed, removed_node_with_subgraph));
-  ORT_ENFORCE(outer_scope_node_args_consumed.empty(),
-              "Shouldn't be possible to have NodeArgs that haven't been handled already.");
+    // recursively build connections between nodes in this graph and all subgraphs
+    bool removed_node_with_subgraph = false;
+    ORT_RETURN_IF_ERROR(BuildConnections(outer_scope_node_args_consumed, removed_node_with_subgraph));
+    ORT_ENFORCE(outer_scope_node_args_consumed.empty(),
+                "Shouldn't be possible to have NodeArgs that haven't been handled already.");
 
-  // if we removed any nodes with subgraphs, we need to refresh the list of subgraphs.
-  if (removed_node_with_subgraph) {
-    all_subgraphs.clear();
-    FindAllSubgraphs(all_subgraphs);
+    // if we removed any nodes with subgraphs, we need to refresh the list of subgraphs.
+    if (removed_node_with_subgraph) {
+      all_subgraphs.clear();
+      FindAllSubgraphs(all_subgraphs);
+    }
+
+    // topological sort of this and any subgraphs is non-recursive
+    auto topo_sort_func = [](Graph& graph) { return graph.PerformTopologicalSortAndCheckIsAcyclic(); };
+    ORT_RETURN_IF_ERROR(ForThisAndAllSubgraphs(all_subgraphs, topo_sort_func));
   }
-
-  // topological sort of this and any subgraphs is non-recursive
-  auto topo_sort_func = [](Graph& graph) { return graph.PerformTopologicalSortAndCheckIsAcyclic(); };
-  ORT_RETURN_IF_ERROR(ForThisAndAllSubgraphs(all_subgraphs, topo_sort_func));
 
   // type/shape validation and inferencing on this and any subgraphs
   // recurses into subgraphs via the ONNX checker, which descends into the GraphProto in node attributes
   // which define a subgraph.
-  ORT_RETURN_IF_ERROR(PerformTypeAndShapeInferencing(options));
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  if (layer) {
+    ORT_RETURN_IF_ERROR(PerformTypeAndShapeInferencing(options, *layer));
+  } else
+#endif
+  {
+    ORT_RETURN_IF_ERROR(PerformTypeAndShapeInferencing(options));
+  }
 
-  // perform the final steps for this graph and all subgraphs
-  auto finalize_func = [&options](Graph& graph) {
-            // we don't need the resolve context any more. call Clear first to workaround bug in
-            // MSVC std::unordered_set<std::string_view>.clear() when the underlying string is invalidated.
-            // this can happen to ResolveContext.inputs_and_initializers during CleanUnusedInitializersAndNodeArgs.
-            graph.resolve_context_.Clear();
-
-            graph.CleanUnusedInitializersAndNodeArgs(options.initializer_names_to_preserve);
-            graph.GraphResolveNeeded(false);
-
-            // if we are resolving immediately after loading from a GraphProto, we don't need to
-            // do a proto sync
-            if (options.no_proto_sync_required) {
-                graph.GraphProtoSyncNeeded(false);
-            }
-
-            // set num_resolves_ here so the graph and any subgraphs all have the same value
-            ++graph.num_resolves_;
-
-            return Status::OK(); };
-
+  auto finalize_func = [&](Graph& graph) {
+    return graph.FinalizeResolve(options
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+                                 ,
+                                 layer ? &layer->permit_ : nullptr
+#endif
+    );
+  };
   return ForThisAndAllSubgraphs(all_subgraphs, finalize_func);
+}
+
+Status Graph::FinalizeResolve(const ResolveOptions& options
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+                              ,
+                              M0SyntheticOwnerV1::PermitGeneration* permit
+#endif
+) {
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  auto step = [&](size_t value) {
+    if (permit) owning_model_.m0_synthetic_owner_v1_->FinalizationStep(*this, *permit, value);
+  };
+  step(0);
+#endif
+  // Clear first: context string_views may be invalidated by cleanup.
+  resolve_context_.Clear();
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  step(1);
+#endif
+  CleanUnusedInitializersAndNodeArgs(options.initializer_names_to_preserve);
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  step(2);
+#endif
+  GraphResolveNeeded(false);
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  step(3);
+#endif
+  if (options.no_proto_sync_required) GraphProtoSyncNeeded(false);
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  step(4);
+#endif
+  ++num_resolves_;
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  step(5);
+#endif
+  return Status::OK();
 }
 
 Status Graph::ConvertInitializersIntoOrtValues() {

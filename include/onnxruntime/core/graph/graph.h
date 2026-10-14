@@ -1945,6 +1945,18 @@ class Graph {  // NOLINT(clang-analyzer-optin.performance.Padding): preserve exi
   common::Status PerformTopologicalSortAndCheckIsAcyclic();
 
   common::Status PerformTypeAndShapeInferencing(const ResolveOptions& options);
+  common::Status ResolveSource(const ResolveOptions& options
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+                               ,
+                               M0SyntheticOwnerV1::ScopeLayer* layer = nullptr
+#endif
+  );
+  common::Status FinalizeResolve(const ResolveOptions& options
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+                                 ,
+                                 M0SyntheticOwnerV1::PermitGeneration* permit = nullptr
+#endif
+  );
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
   common::Status PerformTypeAndShapeInferencing(const ResolveOptions& options,
                                                 M0SyntheticOwnerV1::ScopeLayer& layer);

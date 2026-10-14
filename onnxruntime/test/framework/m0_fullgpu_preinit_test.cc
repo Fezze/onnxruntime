@@ -2773,6 +2773,20 @@ TEST(M0SyntheticPreparationTest, OriginalBackingLineageAndActualSourceTopologySt
   EXPECT_FALSE(receipt.descriptor_permission);
 }
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+TEST(M0SyntheticFinalizedTest, FixedFinalizationCleanCachedEqual7AndParentlessPreserveExactState) {
+  const auto receipt = M0RunFixedSyntheticFinalizedV1();
+  EXPECT_EQ(receipt.native_bindings, 2u);
+  EXPECT_EQ(receipt.finalized_scopes, 8u);
+  EXPECT_EQ(receipt.finalization_steps, 40u);
+  EXPECT_EQ(receipt.clean_repeats, 3u);
+  EXPECT_EQ(receipt.cached_callbacks, 3u);
+  EXPECT_EQ(receipt.present_defaults, 4u);
+  EXPECT_EQ(receipt.parentless_callbacks, 1u);
+  EXPECT_EQ(receipt.equal7_callbacks, 1u);
+  EXPECT_EQ(receipt.rejected_mutations, 10u);
+  EXPECT_EQ(receipt.retired_owners, 13u);
+  EXPECT_FALSE(receipt.descriptor_permission);
+}
 TEST(M0SyntheticIssuedTest, PrivateActualNestedCallbacksJoinDefaultsScratchAndNoWorkBeforePublication) {
   const auto receipt = M0RunFixedSyntheticIssuedV1();
   EXPECT_EQ(receipt.source_checks, 3u);
