@@ -15,6 +15,7 @@
 #include "core/graph/graph_viewer.h"
 #include "core/graph/m0_callback_policy_v1.h"
 #include "core/graph/m0_synthetic_owner_v1.h"
+#include "core/graph/m0_original_preload_owner_v1.h"
 #include "core/graph/ort_format_load_options.h"
 #include "core/session/onnxruntime_c_api.h"
 #if !defined(ORT_MINIMAL_BUILD)
@@ -74,6 +75,12 @@ class Model {
     if (m0_synthetic_owner_v1_ && channel != M0CallbackPolicyV1::Channel::kConstruction &&
         m0_synthetic_owner_v1_->DenyCallback()) {
       return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07_SYNTHETIC_DESCRIPTOR_GATE_CLOSED");
+    }
+    if (m0_original_preload_owner_v1_ &&
+        (channel == M0CallbackPolicyV1::Channel::kConstruction
+             ? !m0_original_preload_owner_v1_->Construction(this)
+             : m0_original_preload_owner_v1_->DenyCallback())) {
+      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07_ORIGINAL_PRELOAD_CALLBACK_DENIED");
     }
     return common::Status::OK();
   }
@@ -385,14 +392,20 @@ class Model {
   friend class M0GraphRegistrationV1;
   friend class M0SyntheticOwnerV1;
   friend class M0SyntheticOwnerFactoryV1;
+  friend class M0OriginalPreloadOwnerV1;
+  friend M0OriginalPreloadReceiptV1 M0RunFixedOriginalPreloadV1();
+  friend class InferenceContextImpl;
+  friend class DataPropagationContextImpl;
 #if !defined(ORT_MINIMAL_BUILD)
   Model(ONNX_NAMESPACE::ModelProto&& model_proto, const PathString& model_path,
         const IOnnxRuntimeOpSchemaRegistryList* local_registries,
         const logging::Logger& logger, const ModelOptions& options,
-        std::unique_ptr<M0SyntheticOwnerV1> synthetic_owner);
+        std::unique_ptr<M0SyntheticOwnerV1> synthetic_owner,
+        std::unique_ptr<M0OriginalPreloadOwnerV1> original_owner = nullptr);
 #endif
   // Const handle established before protobuf/schema/Graph construction, destroyed last.
   const std::unique_ptr<M0SyntheticOwnerV1> m0_synthetic_owner_v1_;
+  const std::unique_ptr<M0OriginalPreloadOwnerV1> m0_original_preload_owner_v1_;
   // Must precede all per-model schema, function and graph work.
   const M0CallbackPolicyV1 m0_callback_policy_v1_;
 

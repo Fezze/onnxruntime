@@ -461,6 +461,8 @@ KernelCreateInfo CreateM0FullGpuDurationNeonAuditV1KernelInfo();
 KernelCreateInfo CreateM0FullGpuDurationNeonAuditV2KernelInfo();
 KernelCreateInfo CreateM0FullGpuAlignmentExtentKernelInfo();
 KernelCreateInfo CreateM0FullGpuAlignmentExtentV2KernelInfo();
+KernelCreateInfo CreateM0FullGpuAlignmentExtentV3KernelInfo();
+KernelCreateInfo CreateM0FullGpuAlignmentTerminalPacketV1KernelInfo();
 KernelCreateInfo CreateM0FullGpuConvExtentKernelInfo();
 KernelCreateInfo CreateM0FullGpuConvExtentV2KernelInfo();
 KernelCreateInfo CreateM0FullGpuRecurrenceExtentKernelInfo();
@@ -492,6 +494,8 @@ std::unique_ptr<KernelRegistry> RegisterKernels(bool enable_graph_capture, bool 
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuDurationNeonAuditV2KernelInfo()));
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuAlignmentExtentKernelInfo()));
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuAlignmentExtentV2KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuAlignmentExtentV3KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuAlignmentTerminalPacketV1KernelInfo()));
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuConvExtentKernelInfo()));
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuConvExtentV2KernelInfo()));
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuRecurrenceExtentKernelInfo()));

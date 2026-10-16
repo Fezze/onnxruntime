@@ -31,6 +31,17 @@ inline void RegisterM0FullGpuExtentSchemasV1() {
       .Output(0, "y", "Physical output buffer", "tensor(float)")
       .Output(1, "extent", "GPU logical output extent", "tensor(uint32)")
       .Attr("physical_capacity", "Host physical resource capacity", AttributeProto::INT);
+  auto alignment_v3 = alignment;
+  alignment_v3.SetName("AlignmentExtentV3")
+      .SetDoc("RW07 original alignment MatMul with schema2 duration/prefix allocation ownership")
+      .Input(3, "total", "Exact DurationExtentV4 paired total allocation", "tensor(int64)")
+      .Attr("source_role", "Duration source role1", AttributeProto::INT)
+      .Attr("source_instance", "Duration source instance1001", AttributeProto::INT)
+      .Attr("semantic_role", "Alignment output role4", AttributeProto::INT)
+      .Attr("producer_instance", "Original1330 instance1004 or1331 instance1005", AttributeProto::INT);
+  ONNX_NAMESPACE::RegisterSchema(std::move(alignment_v3), 0, true, true);
+  auto alignment_packet = OpSchema().SetName("AlignmentTerminalPacketV1").SetDomain(domain).SinceVersion(1).SetDoc("Terminal administrative observation of completed alignment diagnostic cut only").Input(0, "extent", "AlignmentExtentV3 final sidecar", "tensor(uint32)").Input(1, "y", "Actual paired final alignment cut output", "tensor(float)").Output(0, "packet", "Terminal status/rank/dimensions only", "tensor(uint32)").Attr("source_role", "Alignment role4", AttributeProto::INT).Attr("source_instance", "Original1330 instance1004 or1331 instance1005", AttributeProto::INT);
+  ONNX_NAMESPACE::RegisterSchema(std::move(alignment_packet), 0, true, true);
   auto convolution = OpSchema().SetName("ConvExtentV1").SetDomain(domain).SinceVersion(1)
       .SetDoc("RW07 exact Conv1357/1495 consumer of GPU-owned temporal extent")
       .Input(0,"x","Physical [1,C,Lcapacity] input","tensor(float)")

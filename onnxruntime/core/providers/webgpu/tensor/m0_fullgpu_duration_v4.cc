@@ -160,6 +160,11 @@ class DurationExtent final : public WebGpuKernel {
     M0FullGpuAllocationIdentity output_identity;
     ORT_RETURN_IF_NOT(c.M0FullGpuClaimExtentV2(*extent, *total, 1, 1001, output_identity),
                       "RW07 duration opaque allocation claim unavailable");
+    // Bind the actual prefix allocation to this same producer event and total.
+    // Numerical prefix checks cannot establish allocation provenance.
+    M0FullGpuAllocationIdentity prefix_identity;
+    ORT_RETURN_IF_NOT(t == 0 || c.M0FullGpuClaimExtentV2(*prefix, *total, 1, 1001, prefix_identity),
+                      "RW07 duration prefix allocation claim unavailable");
     const uint64_t run = output_identity.run;
     const uint64_t sidecar_generation = output_identity.generation;
     const uint64_t carrier_generation = output_identity.data_generation;

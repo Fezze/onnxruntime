@@ -3108,3 +3108,17 @@ TEST(M0CompiledRegistryMetadataTest, CaptureDefinitionsAndOriginalSchemasWithout
 #endif
 
 }  // namespace onnxruntime::test
+
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && !defined(ORT_MINIMAL_BUILD)
+namespace onnxruntime::test {
+TEST(M0OriginalPreload, ExactOriginalCutsResolveThroughActualGraphAndDenyReuse) {
+  const auto receipt = M0RunFixedOriginalPreloadV1();
+  EXPECT_EQ(receipt.resolved, 43u);
+  EXPECT_EQ(receipt.published, 43u);
+  EXPECT_EQ(receipt.refused, 43u);
+  EXPECT_EQ(receipt.defaults, 24u);
+  EXPECT_EQ(receipt.mutated_input_denials, 43u);
+  EXPECT_EQ(receipt.merge_fault_denials, 43u);
+}
+}  // namespace onnxruntime::test
+#endif

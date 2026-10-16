@@ -252,8 +252,10 @@ Model::Model(ModelProto&& model_proto, const PathString& model_path,
 Model::Model(ModelProto&& model_proto, const PathString& model_path,
              const IOnnxRuntimeOpSchemaRegistryList* local_registries,
              const logging::Logger& logger, const ModelOptions& options,
-             std::unique_ptr<M0SyntheticOwnerV1> synthetic_owner)
+             std::unique_ptr<M0SyntheticOwnerV1> synthetic_owner,
+             std::unique_ptr<M0OriginalPreloadOwnerV1> original_owner)
     : m0_synthetic_owner_v1_(std::move(synthetic_owner)),
+      m0_original_preload_owner_v1_(std::move(original_owner)),
       m0_callback_policy_v1_(options.m0_callback_deny_requested_v1),
       model_path_(model_path),
       check_load_cancellation_fn_(options.check_load_cancellation_fn) {

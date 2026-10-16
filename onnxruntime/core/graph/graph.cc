@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 #include "core/graph/graph.h"
+#include "core/graph/m0_original_preload_adapters_v1.h"
+#include "core/graph/m0_original_function_descriptors_v1.h"
 
 #include <cassert>
 #include <fstream>
@@ -2790,6 +2792,10 @@ class InferenceContextImpl : public ONNX_NAMESPACE::InferenceContext {
   }
 
   void RunInferencing() {
+    if (auto* owner = graph_.GetModel().m0_original_preload_owner_v1_.get()) {
+      owner->Infer(node_, this, node_output_types_);
+      return;
+    }
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
     if (issued_layer_)
       issued_layer_->EnterCallback(this);
@@ -3118,6 +3124,10 @@ class DataPropagationContextImpl : public ONNX_NAMESPACE::DataPropagationContext
   }
 
   void RunInferencing() {
+    if (auto* owner = node_.GetContainingGraph()->GetModel().m0_original_preload_owner_v1_.get()) {
+      owner->Propagation(node_, this, node_output_types_);
+      return;
+    }
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
     if (issued_layer_) {
       issued_layer_->PropagationNoWork(this);
@@ -3810,9 +3820,12 @@ Status Graph::InferAndVerifyTypeMatch(Node& node, const OpSchema& op, const Reso
     } else
 #endif
     {
-      ORT_RETURN_IF_ERROR(SaveShapeValuesFromDataPropagation(node,
-                                                             *output_def,
-                                                             onnx_inferred_type_after_data_propagation));
+      if (auto* owner = owning_model_.m0_original_preload_owner_v1_.get()) {
+        owner->Saver(node, onnx_inferred_types_after_data_propagation);
+      } else
+        ORT_RETURN_IF_ERROR(SaveShapeValuesFromDataPropagation(node,
+                                                               *output_def,
+                                                               onnx_inferred_type_after_data_propagation));
     }
 
     DataType existing_type = output_def->Type();
@@ -3938,6 +3951,7 @@ Status Graph::InferAndVerifyTypeMatch(Node& node, const OpSchema& op, const Reso
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
   if (layer) layer->Published();
 #endif
+  if (auto* owner = owning_model_.m0_original_preload_owner_v1_.get()) owner->Published(node);
   return Status::OK();
 }
 
@@ -4072,6 +4086,8 @@ Status Graph::VerifyNodeAndOpMatch(const ResolveOptions& options, M0SyntheticOwn
           // the ToProto call.
           if (const NodeProto* orig_node_proto = node.GetOriginalNodeProto(); orig_node_proto) {
             checker::check_node(*orig_node_proto, ctx, lsc);
+            if (auto* owner = owning_model_.m0_original_preload_owner_v1_.get())
+              owner->Checked(node, *orig_node_proto);
             // clear original as we don't know if the node will be modified once the Graph::Resolve completes.
             node.SetOriginalNodeProto(nullptr);
           } else {
@@ -4119,6 +4135,7 @@ Status Graph::VerifyNodeAndOpMatch(const ResolveOptions& options, M0SyntheticOwn
     }
 
     ORT_RETURN_IF_ERROR(node.UpdateInputArgCount());
+    if (auto* owner = owning_model_.m0_original_preload_owner_v1_.get()) owner->Selected(node);
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
     if (node_layer) {
       if (node_layer->scope_.permit_.generation_.owner.cached_pass_[node_layer->scope_.slot_])
@@ -4148,6 +4165,8 @@ Status Graph::VerifyNodeAndOpMatch(const ResolveOptions& options, M0SyntheticOwn
             if (node_layer) node_layer->BeforeDefault(attr_def.second.default_value);
 #endif
             node.AddAttributeProto(attr_def.second.default_value);
+            if (auto* owner = owning_model_.m0_original_preload_owner_v1_.get())
+              owner->Defaulted(node, attr_def.second.default_value);
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
             if (node_layer) node_layer->Defaulted();
 #endif
@@ -4309,7 +4328,10 @@ Status Graph::InitInputsInitializersOutputs() {
 }
 
 Status Graph::PerformTypeAndShapeInferencing(const ResolveOptions& options) {
-  ORT_RETURN_IF_ERROR(owning_model_.M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kRecursiveInference));
+  if (auto* owner = owning_model_.m0_original_preload_owner_v1_.get())
+    owner->CheckGraph(*this);
+  else
+    ORT_RETURN_IF_ERROR(owning_model_.M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kRecursiveInference));
   ORT_RETURN_IF_ERROR(TypeCheckInputsAndInitializers());
 
   // type/shape inferencing on the nodes is done recursively as we need subgraph outputs
@@ -4348,6 +4370,13 @@ Status Graph::PerformTypeAndShapeInferencing(const ResolveOptions& options, M0Sy
 
 Status Graph::Resolve(const ResolveOptions& options) {
   // Deny before parent redirection, discovery or the clean-graph success shortcut.
+  if (auto* owner = owning_model_.m0_original_preload_owner_v1_.get()) {
+    if (options.override_types || options.initializer_names_to_preserve || options.no_proto_sync_required) {
+      owner->DenyCallback();
+      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07_ORIGINAL_RESOLVE_OPTIONS");
+    }
+    return owner->Resolve(*this);
+  }
   if (owning_model_.m0_synthetic_owner_v1_) {
     return owning_model_.m0_synthetic_owner_v1_->ResolveClosed(this);
   }
@@ -7988,6 +8017,257 @@ Status Graph::UpdateUsingModelEditorApiModel(const OrtModel& api_model) {
   // this will replace inputs/outputs and add nodes.
   return LoadFromModelEditorApiModel(*api_model.graph, /*updating_existing_graph*/ true);
 }
+
+// Exact original-node cut qualification shares the production source path; it
+// cannot release a Model or grant full-model preload authority.
+M0OriginalPreloadOwnerV1::M0OriginalPreloadOwnerV1(const FrozenRecipe& recipe) : recipe_(recipe) {
+  ORT_ENFORCE(original_.ParseFromArray(recipe.node_wire.data(), static_cast<int>(recipe.node_wire.size())),
+              "RW07_ORIGINAL_NODE_WIRE");
+}
+void M0OriginalPreloadOwnerV1::CheckGraph(const Graph& graph) const {
+  ORT_ENFORCE(!poisoned_ && active_ && graph_ == &graph && model_ && &graph.GetModel() == model_ &&
+                  model_->m0_original_preload_owner_v1_.get() == this && !graph.IsSubgraph() &&
+                  graph.NumberOfNodes() == 1 && graph.GetNode(0) == node_ &&
+                  model_->model_proto_.SerializeAsString() == model_wire_ && graph.DomainToVersionMap() == domains_,
+              "RW07_ORIGINAL_OWNER_GRAPH");
+  ORT_ENFORCE(stage_ == 0 || (graph.GetOutputs().size() == 1 && graph.GetOutputs()[0] == node_->OutputDefs()[0]),
+              "RW07_ORIGINAL_GRAPH_OUTPUT");
+  for (const auto& [name, arg] : graph.node_args_) {
+    bool present = name.empty() || name == original_.output(0);
+    for (const auto& input : original_.input()) present = present || name == input;
+    ORT_ENFORCE(present, "RW07_ORIGINAL_FOREIGN_NODEARG");
+    ORT_ENFORCE(!arg->GetInferredShapeValues().has_value() && !arg->GetInferredShapeScalarValue().has_value(),
+                "RW07_ORIGINAL_CARRIED_VALUES");
+  }
+  ORT_ENFORCE(graph.GetAllInitializedTensors().size() ==
+                  static_cast<size_t>(model_->model_proto_.graph().initializer_size()),
+              "RW07_ORIGINAL_INITIALIZER_INVENTORY");
+}
+void M0OriginalPreloadOwnerV1::CheckNode(const Node& node) const {
+  CheckGraph(*node.GetContainingGraph());
+  ORT_ENFORCE(node_ == &node && node.Index() == 0 && node.ImplicitInputDefs().empty() &&
+                  node.GetAttributeNameToSubgraphMap().empty(),
+              "RW07_ORIGINAL_OWNER_NODE");
+  NodeProto current, original_base = original_;
+  node.ToProto(current);
+  NodeProto current_base = current;
+  current_base.clear_attribute();
+  original_base.clear_attribute();
+  ORT_ENFORCE(current_base.SerializeAsString() == original_base.SerializeAsString(), "RW07_ORIGINAL_LIVE_NODE");
+  ORT_ENFORCE(node.OutputDefs().size() == 1 && node.OutputDefs()[0]->TypeAsProto() &&
+                  node.OutputDefs()[0]->TypeAsProto()->SerializeAsString() == recipe_.output_type,
+              "RW07_ORIGINAL_OUTPUT_ASSERTION");
+  if (schema_) {
+    ORT_ENFORCE(node.Op() == schema_ && node.SinceVersion() == schema_->SinceVersion(), "RW07_ORIGINAL_LIVE_SCHEMA");
+  }
+  if (stage_ >= 3) {
+    ORT_ENFORCE(Adapters::CurrentMatches(original_, current, *schema_, gsl::make_span(defaults_)),
+                "RW07_ORIGINAL_LIVE_DEFAULTS");
+  } else {
+    for (const auto& attribute : current.attribute()) {
+      const AttributeProto* expected = Adapters::FindAttribute(original_, attribute.name());
+      if (!expected && schema_) {
+        const auto found = schema_->attributes().find(attribute.name());
+        if (found != schema_->attributes().end() && found->second.default_value.has_name())
+          expected = &found->second.default_value;
+      }
+      ORT_ENFORCE(expected && attribute.SerializeAsString() == expected->SerializeAsString(),
+                  "RW07_ORIGINAL_LIVE_ATTRIBUTE");
+    }
+    for (const auto& attribute : original_.attribute())
+      ORT_ENFORCE(Adapters::FindAttribute(current, attribute.name()), "RW07_ORIGINAL_LOST_ATTRIBUTE");
+  }
+  for (size_t i = 0; i < 4; ++i) {
+    const auto* input = i < node.InputDefs().size() ? node.InputDefs()[i] : nullptr;
+    const auto* type = input && input->Exists() ? input->TypeAsProto() : nullptr;
+    ORT_ENFORCE(type ? type->SerializeAsString() == recipe_.types[i] : recipe_.types[i].empty(),
+                "RW07_ORIGINAL_LIVE_INPUT");
+    const auto* literal = input && input->Exists() ? graph_->GetConstantInitializer(input->Name(), false) : nullptr;
+    ORT_ENFORCE(literal ? literal->SerializeAsString() == recipe_.literals[i] : recipe_.literals[i].empty(),
+                "RW07_ORIGINAL_LIVE_LITERAL");
+  }
+}
+void M0OriginalPreloadOwnerV1::Checked(const Node& node, const NodeProto& original) {
+  CheckNode(node);
+  ORT_ENFORCE(stage_ == 0 && original.SerializeAsString() == recipe_.node_wire, "RW07_ORIGINAL_CHECKER");
+  stage_ = 1;
+}
+void M0OriginalPreloadOwnerV1::Selected(const Node& node) {
+  CheckNode(node);
+  ORT_ENFORCE(stage_ == 1 && node.Op() && node.Op() == ONNX_NAMESPACE::OpSchemaRegistry::Schema(node.OpType(), 20, "") &&
+                  node.SinceVersion() == node.Op()->SinceVersion(),
+              "RW07_ORIGINAL_SCHEMA_EVENT");
+  schema_ = node.Op();
+  stage_ = 2;
+}
+void M0OriginalPreloadOwnerV1::Defaulted(const Node& node, const AttributeProto& origin) {
+  CheckNode(node);
+  ORT_ENFORCE(stage_ == 2 && node.Op() == schema_ &&
+                  &schema_->attributes().at(origin.name()).default_value == &origin,
+              "RW07_ORIGINAL_DEFAULT_EVENT");
+  for (const auto* installed : defaults_) ORT_ENFORCE(installed != &origin, "RW07_ORIGINAL_DUPLICATE_DEFAULT");
+  defaults_.push_back(&origin);
+}
+void M0OriginalPreloadOwnerV1::Infer(Node& node, const void* context, std::vector<TypeProto>& outputs) {
+  CheckNode(node);
+  ORT_ENFORCE(stage_ == 2 && context && !context_ && node.Op() == schema_ &&
+                  node.SinceVersion() == schema_->SinceVersion() && outputs.size() == 1 &&
+                  outputs[0].SerializeAsString().empty(),
+              "RW07_ORIGINAL_SCRATCH_EVENT");
+  NodeProto current;
+  node.ToProto(current);
+  Adapters::SlotTypes types{};
+  Adapters::SlotLiterals literals{};
+  for (size_t i = 0; i < node.InputDefs().size() && i < 4; ++i) {
+    const auto* input = node.InputDefs()[i];
+    if (input && input->Exists()) {
+      types[i] = input->TypeAsProto();
+      literals[i] = graph_->GetConstantInitializer(input->Name(), false);
+    }
+  }
+  bool proposed = false;
+  if (Adapters::Find(recipe_.index)) {
+    proposed = Adapters::MatchAndPropose(recipe_.index, original_, current, *schema_, types, literals,
+                                         gsl::make_span(defaults_), proposal_) == Adapters::Result::kProposed;
+  } else if (Functions::Find(recipe_.index)) {
+    proposed = Functions::MatchAndPropose(recipe_.index, original_, current, *schema_, types, literals,
+                                          gsl::make_span(defaults_), proposal_) == Functions::Result::kProposed;
+  }
+  ORT_ENFORCE(proposed, "RW07_ORIGINAL_ADAPTER_REFUSED");
+  context_ = context;
+  outputs[0] = proposal_;
+  stage_ = 3;
+}
+void M0OriginalPreloadOwnerV1::Propagation(const Node& node, const void* context, const std::vector<TypeProto>& outputs) {
+  CheckNode(node);
+  ORT_ENFORCE(stage_ == 3 && context && context != context_ && !propagation_ && node.Op() == schema_ &&
+                  !schema_->has_data_propagation_function() && outputs.size() == 1 && outputs[0].SerializeAsString().empty(),
+              "RW07_ORIGINAL_PROPAGATION_NOT_EMPTY");
+  propagation_ = context;
+  stage_ = 4;
+}
+void M0OriginalPreloadOwnerV1::Saver(const Node& node, const std::vector<TypeProto>& outputs) {
+  CheckNode(node);
+  ORT_ENFORCE(stage_ == 4 && outputs.size() == 1 && outputs[0].SerializeAsString().empty(),
+              "RW07_ORIGINAL_SAVER_NOT_EMPTY");
+  ORT_ENFORCE(!fail_before_merge_, "RW07_ORIGINAL_INJECTED_PREMERGE_FAILURE");
+  stage_ = 5;
+}
+void M0OriginalPreloadOwnerV1::Published(const Node& node) {
+  CheckNode(node);
+  ORT_ENFORCE(stage_ == 5 && node.OutputDefs().size() == 1 && node.OutputDefs()[0]->TypeAsProto() &&
+                  node.OutputDefs()[0]->TypeAsProto()->SerializeAsString() == recipe_.output_type,
+              "RW07_ORIGINAL_PUBLICATION");
+  stage_ = 6;
+}
+common::Status M0OriginalPreloadOwnerV1::Resolve(Graph& graph) {
+  struct Retirement {
+    M0OriginalPreloadOwnerV1& owner;
+    bool success = false;
+    ~Retirement() {
+      owner.active_ = false;
+      if (!success) owner.poisoned_ = true;
+    }
+  } retirement{*this};
+  ORT_RETURN_IF_NOT(&graph == graph_ && !active_ && !poisoned_ && stage_ == 0, "RW07_ORIGINAL_RESOLVE_REUSE");
+  active_ = true;
+  CheckGraph(graph);
+  Graph::ResolveOptions options;
+  options.no_proto_sync_required = true;
+  ORT_RETURN_IF_ERROR(graph.ResolveSource(options));
+  CheckNode(*node_);
+  ORT_RETURN_IF_NOT(stage_ == 6 && !graph.GraphResolveNeeded(), "RW07_ORIGINAL_FINALIZATION");
+  ORT_RETURN_IF_NOT(!graph.GraphProtoSyncNeeded(), "RW07_ORIGINAL_SYNC_FINALIZATION");
+  stage_ = 7;
+  retirement.success = true;
+  return common::Status::OK();
+}
+std::unique_ptr<Model> M0OriginalPreloadOwnerV1::Make(const FrozenRecipe& recipe) {
+  ONNX_NAMESPACE::ModelProto proto;
+  proto.set_ir_version(9);
+  auto* opset = proto.add_opset_import();
+  opset->set_domain("");
+  opset->set_version(20);
+  auto owner = std::unique_ptr<M0OriginalPreloadOwnerV1>(new M0OriginalPreloadOwnerV1(recipe));
+  auto* graph = proto.mutable_graph();
+  graph->set_name("rw07_exact_original_cut");
+  *graph->add_node() = owner->original_;
+  for (size_t i = 0; i < static_cast<size_t>(owner->original_.input_size()); ++i) {
+    if (owner->original_.input(static_cast<int>(i)).empty()) continue;
+    ORT_ENFORCE(i < 4 && !recipe.types[i].empty(), "RW07_ORIGINAL_RECIPE_SLOT");
+    auto* input = recipe.literals[i].empty() ? graph->add_input() : graph->add_value_info();
+    input->set_name(owner->original_.input(static_cast<int>(i)));
+    ORT_ENFORCE(input->mutable_type()->ParseFromArray(recipe.types[i].data(), static_cast<int>(recipe.types[i].size())),
+                "RW07_ORIGINAL_TYPE_WIRE");
+    if (!recipe.literals[i].empty()) {
+      auto* literal = graph->add_initializer();
+      ORT_ENFORCE(literal->ParseFromArray(recipe.literals[i].data(), static_cast<int>(recipe.literals[i].size())),
+                  "RW07_ORIGINAL_LITERAL_WIRE");
+    }
+  }
+  auto* output = graph->add_output();
+  output->set_name(owner->original_.output(0));
+  ORT_ENFORCE(output->mutable_type()->ParseFromArray(recipe.output_type.data(), static_cast<int>(recipe.output_type.size())),
+              "RW07_ORIGINAL_OUTPUT_TYPE_WIRE");
+  ModelOptions options;
+  auto model = std::unique_ptr<Model>(new Model(std::move(proto), PathString(), nullptr,
+                                                logging::LoggingManager::DefaultLogger(), options, nullptr, std::move(owner)));
+  auto& bound = *model->m0_original_preload_owner_v1_;
+  ORT_ENFORCE(bound.construction_count_ == 2 && bound.construction_model_ == model.get(), "RW07_ORIGINAL_CONSTRUCTION_SEAL");
+  bound.model_ = model.get();
+  bound.graph_ = &model->MainGraph();
+  bound.node_ = bound.graph_->GetNode(0);
+  bound.model_wire_ = model->model_proto_.SerializeAsString();
+  bound.domains_ = bound.graph_->DomainToVersionMap();
+  return model;
+}
+M0OriginalPreloadReceiptV1 M0OriginalPreloadOwnerV1::RunFixed() {
+  M0OriginalPreloadReceiptV1 receipt;
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  auto qualify = [&](const FrozenRecipe& recipe) {
+    auto model = M0OriginalPreloadOwnerV1::Make(recipe);
+    auto& owner = *model->m0_original_preload_owner_v1_;
+    ORT_THROW_IF_ERROR(model->MainGraph().Resolve());
+    ORT_ENFORCE(owner.stage_ == 7 && !owner.poisoned_, "RW07_ORIGINAL_QUALIFICATION");
+    ++receipt.resolved;
+    ++receipt.published;
+    receipt.defaults += owner.defaults_.size();
+    ORT_ENFORCE(!model->MainGraph().Resolve().IsOK() && owner.poisoned_, "RW07_ORIGINAL_REPEAT_DENIED");
+    ++receipt.refused;
+    auto mutated = Make(recipe);
+    auto& mutated_owner = *mutated->m0_original_preload_owner_v1_;
+    TensorShapeProto changed;
+    changed.add_dim()->set_dim_value(17);
+    mutated_owner.node_->MutableInputDefs()[0]->SetShape(changed);
+    bool rejected = false;
+    ORT_TRY { rejected = !mutated->MainGraph().Resolve().IsOK(); }
+    ORT_CATCH(const std::exception&) {
+      ORT_HANDLE_EXCEPTION([&]() { rejected = true; });
+    }
+    ORT_ENFORCE(rejected && mutated_owner.poisoned_ && !mutated_owner.active_ && mutated_owner.stage_ == 0,
+                "RW07_ORIGINAL_MUTATION_DENIAL");
+    ORT_ENFORCE(!mutated->MainGraph().Resolve().IsOK(), "RW07_ORIGINAL_MUTATION_RETRY_DENIAL");
+    ++receipt.mutated_input_denials;
+    auto failed = Make(recipe);
+    auto& failed_owner = *failed->m0_original_preload_owner_v1_;
+    failed_owner.fail_before_merge_ = true;
+    rejected = false;
+    ORT_TRY { rejected = !failed->MainGraph().Resolve().IsOK(); }
+    ORT_CATCH(const std::exception&) {
+      ORT_HANDLE_EXCEPTION([&]() { rejected = true; });
+    }
+    ORT_ENFORCE(rejected && failed_owner.poisoned_ && !failed_owner.active_ && failed_owner.stage_ == 4,
+                "RW07_ORIGINAL_PREMERGE_RETIREMENT");
+    ORT_ENFORCE(!failed->MainGraph().Resolve().IsOK(), "RW07_ORIGINAL_PREMERGE_RETRY_DENIAL");
+    ++receipt.merge_fault_denials;
+  };
+  for (const auto& recipe : Adapters::kRecipes) qualify(View(recipe));
+  for (const auto& recipe : Functions::kRecipes) qualify(View(recipe));
+#endif
+  return receipt;
+}
+
+M0OriginalPreloadReceiptV1 M0RunFixedOriginalPreloadV1() { return M0OriginalPreloadOwnerV1::RunFixed(); }
 
 #endif  // !defined(ORT_MINIMAL_BUILD)
 }  // namespace onnxruntime

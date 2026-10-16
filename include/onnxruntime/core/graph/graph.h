@@ -589,6 +589,7 @@ class Node {
   friend class Graph;
   friend class M0SyntheticOwnerV1;
   friend class M0SyntheticOwnerFactoryV1;
+  friend class M0OriginalPreloadOwnerV1;
   Node(NodeIndex index, Graph& graph);
 
  protected:
@@ -1804,6 +1805,7 @@ class Graph {  // NOLINT(clang-analyzer-optin.performance.Padding): preserve exi
  private:
   friend class M0SyntheticOwnerV1;
   friend class M0SyntheticOwnerFactoryV1;
+  friend class M0OriginalPreloadOwnerV1;
   const Model& owning_model_;
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
   friend class GraphInferencerImpl;
