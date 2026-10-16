@@ -321,7 +321,7 @@ TEST(M0FullGpuPreInitAdmissionTest, PreloadRejectsValidAndMalformedBytesBeforePa
     InferenceSession session(strict, GetEnvironment());
     const auto status = session.Load(bytes->data(), static_cast<int>(bytes->size()));
     ASSERT_FALSE(status.IsOK());
-    EXPECT_NE(status.ErrorMessage().find("RW07_PRELOAD_DENY_UNREVIEWED_CONTRACT"), std::string::npos);
+    EXPECT_NE(status.ErrorMessage().find("RW07_ORIGINAL_BYTE_SIZE"), std::string::npos);
     try {
       InferenceSession model_constructor(strict, GetEnvironment(), bytes->data(), static_cast<int>(bytes->size()));
       FAIL() << "Strict model-taking constructor must deny before parsing";
@@ -427,7 +427,9 @@ TEST(M0FullGpuPreInitAdmissionTest, ExplicitOrtFormatIngressStillDeniesBeforeFor
   ASSERT_STATUS_OK(strict.config_options.AddConfigEntry(kOrtSessionOptionsConfigLoadModelFormat, "ORT"));
   const std::string invalid("invalid ort flatbuffer");
   InferenceSession session(strict, GetEnvironment());
-  ExpectPreloadDenial(session.Load(invalid.data(), static_cast<int>(invalid.size())));
+  const auto strict_status = session.Load(invalid.data(), static_cast<int>(invalid.size()));
+  ASSERT_FALSE(strict_status.IsOK());
+  EXPECT_NE(strict_status.ErrorMessage().find("RW07_ORIGINAL_LOAD_CONFIG"), std::string::npos);
   ExpectPreloadDenial(session.Load(PathString(ORT_TSTR("/rw07-ingress-nonexistent-directory/model.ort"))));
   SessionOptions normal;
   ASSERT_STATUS_OK(normal.config_options.AddConfigEntry(kOrtSessionOptionsConfigLoadModelFormat, "ORT"));
@@ -3119,6 +3121,97 @@ TEST(M0OriginalPreload, ExactOriginalCutsResolveThroughActualGraphAndDenyReuse) 
   EXPECT_EQ(receipt.defaults, 24u);
   EXPECT_EQ(receipt.mutated_input_denials, 43u);
   EXPECT_EQ(receipt.merge_fault_denials, 43u);
+}
+
+TEST(M0OriginalPreload, WholeOriginalStrictBufferLoadResolvesWithoutModelValues) {
+  const char* path = std::getenv("ORT_M0_ORIGINAL_MODEL");
+  if (!path) GTEST_SKIP() << "Original artifact path required for whole-original qualification";
+  std::ifstream input(path, std::ios::binary | std::ios::ate);
+  ASSERT_TRUE(input.is_open());
+  ASSERT_EQ(input.tellg(), std::streampos(325532387));
+  std::string bytes(325532387, '\0');
+  input.seekg(0);
+  input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  ASSERT_TRUE(input.good());
+  const auto rules = M0QualifyWholeDescriptorRulesV1(bytes);
+  EXPECT_EQ(rules.profiles, 49u);
+  EXPECT_EQ(rules.actual_dp_profiles, 10u);
+  EXPECT_EQ(rules.rank_assertions, 49u);
+  EXPECT_EQ(rules.mixed_dtype_denials, 2u);
+  EXPECT_GT(rules.copied_default_denials, 0u);
+  EXPECT_EQ(rules.lstm_optional_holes, 1u);
+  EXPECT_EQ(rules.multiple_outputs, 1u);
+  EXPECT_EQ(M0QualifyWholeRetirementV1(bytes), 1u);
+  {
+    InferenceSession session(StrictIngressOptions(), GetEnvironment());
+    ASSERT_STATUS_OK(session.Load(bytes.data(), static_cast<int>(bytes.size())));
+    const auto& graph = session.GetModel().MainGraph();
+    ASSERT_EQ(graph.NumberOfNodes(), 2464);
+    ASSERT_EQ(graph.GetAllInitializedTensors().size(), 554u);
+    ASSERT_EQ(graph.GetInputs().size(), 3u);
+    ASSERT_EQ(graph.GetOutputs().size(), 1u);
+    for (const auto& node : graph.Nodes()) {
+      for (const auto* output : node.OutputDefs()) {
+        if (!output->Exists()) continue;
+        EXPECT_FALSE(output->GetInferredShapeValues().has_value()) << node.Name();
+        EXPECT_FALSE(output->GetInferredShapeScalarValue().has_value()) << node.Name();
+      }
+    }
+    EXPECT_TRUE(session.GetModelMetadata().first.IsOK());
+    const auto replay = session.Load(bytes.data(), static_cast<int>(bytes.size()));
+    EXPECT_FALSE(replay.IsOK());
+    EXPECT_NE(replay.ErrorMessage().find("RW07_ORIGINAL_LOAD_REUSE"), std::string::npos);
+    ExpectPreloadDenial(session.Initialize());
+  }
+  bytes[0] ^= 1;
+  InferenceSession changed(StrictIngressOptions(), GetEnvironment());
+  const auto rejected = changed.Load(bytes.data(), static_cast<int>(bytes.size()));
+  EXPECT_FALSE(rejected.IsOK());
+  EXPECT_NE(rejected.ErrorMessage().find("RW07_ORIGINAL_BYTE_IDENTITY"), std::string::npos);
+  EXPECT_FALSE(changed.GetModelMetadata().first.IsOK());
+  EXPECT_NE(changed.Load(bytes.data(), static_cast<int>(bytes.size())).ErrorMessage().find("RW07_ORIGINAL_LOAD_REUSE"), std::string::npos);
+}
+
+TEST(M0OriginalPreload, OriginalBufferLoaderRejectsCancellationConfigAndExternalPoolsBeforeParsing) {
+  const char malformed = '\xff';
+  for (bool null_flag : {false, true}) {
+    auto options = StrictIngressOptions();
+    InferenceSession session(options, GetEnvironment());
+    if (null_flag)
+      session.GetMutableSessionOptions().load_cancellation_flag.reset();
+    else
+      options.SetLoadCancellationFlag(true);
+    const auto status = session.Load(&malformed, 1);
+    EXPECT_FALSE(status.IsOK());
+    EXPECT_NE(status.ErrorMessage().find("RW07_ORIGINAL_LOAD_CANCELLED"), std::string::npos);
+    EXPECT_FALSE(session.GetModelMetadata().first.IsOK());
+  }
+  auto options = StrictIngressOptions();
+  ASSERT_STATUS_OK(options.config_options.AddConfigEntry("session.unreviewed_option", "1"));
+  InferenceSession session(options, GetEnvironment());
+  const auto status = session.Load(&malformed, 1);
+  EXPECT_FALSE(status.IsOK());
+  EXPECT_NE(status.ErrorMessage().find("RW07_ORIGINAL_LOAD_CONFIG"), std::string::npos);
+  EXPECT_FALSE(session.GetModelMetadata().first.IsOK());
+  auto* foreign_pool = reinterpret_cast<concurrency::ThreadPool*>(static_cast<uintptr_t>(1));
+  try {
+    InferenceSession rejected(StrictIngressOptions(), GetEnvironment(), foreign_pool, nullptr);
+    FAIL() << "External thread pool must be rejected before access";
+  } catch (const OnnxRuntimeException& error) {
+    EXPECT_NE(std::string(error.what()).find("RW07_PREINIT_DENY_EXTERNAL_THREADPOOL"), std::string::npos);
+  }
+  for (int mutation = 0; mutation < 3; ++mutation) {
+    auto unreviewed = StrictIngressOptions();
+    if (mutation == 0) unreviewed.enable_profiling = true;
+    if (mutation == 1) unreviewed.use_per_session_threads = false;
+    if (mutation == 2) unreviewed.intra_op_param.thread_pool_size = 2;
+    try {
+      InferenceSession rejected(unreviewed, GetEnvironment());
+      FAIL() << "Unreviewed typed thread/profile options must deny before thread creation";
+    } catch (const OnnxRuntimeException& error) {
+      EXPECT_NE(std::string(error.what()).find("RW07_ORIGINAL_LOAD_THREAD_PROFILE_OPTIONS"), std::string::npos);
+    }
+  }
 }
 }  // namespace onnxruntime::test
 #endif

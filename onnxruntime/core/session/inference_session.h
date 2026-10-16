@@ -820,6 +820,7 @@ class InferenceSession {
 #if !defined(ORT_MINIMAL_BUILD)
 
   [[nodiscard]] common::Status LoadOnnxModel(const PathString& model_uri);
+  [[nodiscard]] common::Status M0LoadOriginalBytesV1(const void* model_data, int model_data_len);
 
   bool HasLocalSchema() const {
     return !custom_schema_registries_.empty();
@@ -1006,6 +1007,7 @@ class InferenceSession {
 
   mutable std::mutex session_mutex_;         // to ensure only one thread can invoke Load/Initialize
   bool is_model_loaded_ = false;             // GUARDED_BY(session_mutex_)
+  bool m0_original_load_attempted_v1_ = false;  // GUARDED_BY(session_mutex_)
   bool is_inited_ = false;                   // GUARDED_BY(session_mutex_)
   bool is_concurrent_run_supported_ = true;  // Graph execution in Run is GUARDED_BY(session_mutex_) if false
 

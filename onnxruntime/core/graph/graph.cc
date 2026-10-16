@@ -4,6 +4,8 @@
 #include "core/graph/graph.h"
 #include "core/graph/m0_original_preload_adapters_v1.h"
 #include "core/graph/m0_original_function_descriptors_v1.h"
+#include "core/graph/m0_full_model_descriptor_rules_v1.h"
+#include "core/graph/m0_whole_model_seal_v1.h"
 
 #include <cassert>
 #include <fstream>
@@ -3821,7 +3823,7 @@ Status Graph::InferAndVerifyTypeMatch(Node& node, const OpSchema& op, const Reso
 #endif
     {
       if (auto* owner = owning_model_.m0_original_preload_owner_v1_.get()) {
-        owner->Saver(node, onnx_inferred_types_after_data_propagation);
+        owner->Saver(node, *output_def, static_cast<size_t>(i), onnx_inferred_types_after_data_propagation);
       } else
         ORT_RETURN_IF_ERROR(SaveShapeValuesFromDataPropagation(node,
                                                                *output_def,
@@ -8018,6 +8020,390 @@ Status Graph::UpdateUsingModelEditorApiModel(const OrtModel& api_model) {
   return LoadFromModelEditorApiModel(*api_model.graph, /*updating_existing_graph*/ true);
 }
 
+// Whole-original descriptor replacement has a separate deferred-propagation
+// lifecycle. It never turns the fixed43 proof of DP absence into a no-op permit.
+class M0OriginalPreloadOwnerV1::WholeModel final {
+ public:
+  struct Value {
+    TypeProto expected;
+    const NodeArg* argument = nullptr;
+    size_t producer = std::numeric_limits<size_t>::max();
+  };
+  struct State {
+    const Node* node = nullptr;
+    const OpSchema* schema = nullptr;
+    const Rules::Profile* profile = nullptr;
+    std::vector<const AttributeProto*> defaults;
+    std::vector<TypeProto> proposals, expected_merge;
+    std::vector<bool> saved;
+    const void* inference = nullptr;
+    const void* propagation = nullptr;
+    size_t stage = 0;
+    bool merge_conflict = false;
+  };
+  struct Literal {
+    const TensorProto* original = nullptr;
+    const TensorProto* live = nullptr;
+    const char* raw_backing = nullptr;
+    size_t raw_size = 0;
+  };
+  explicit WholeModel(std::unique_ptr<M0WholeModelSealV1> seal) : seal_(std::move(seal)) {
+    ORT_ENFORCE(seal_ && seal_->raw_bytes_ && seal_->proto_.graph().node_size() == 2464,
+                "RW07_WHOLE_SEAL_REQUIRED");
+    const auto& original = seal_->proto_.graph();
+    states_.resize(static_cast<size_t>(original.node_size()));
+    std::unordered_map<std::string, TypeProto> lookup;
+    for (const auto& input : original.input()) {
+      ORT_ENFORCE(input.has_type() && Rules::DescriptorValid(input.type()), "RW07_WHOLE_INPUT_ASSERTION");
+      lookup[input.name()] = input.type();
+      ORT_ENFORCE(values_.emplace(input.name(), Value{input.type()}).second, "RW07_WHOLE_DUPLICATE_INPUT");
+    }
+    for (const auto& tensor : original.initializer()) {
+      ORT_ENFORCE(initializers_.emplace(tensor.name(), Literal{&tensor}).second && !values_.count(tensor.name()),
+                  "RW07_WHOLE_INITIALIZER_INPUT_ALIAS");
+      TypeProto descriptor;
+      auto* type = descriptor.mutable_tensor_type();
+      type->set_elem_type(tensor.data_type());
+      auto* shape = type->mutable_shape();
+      for (auto dimension : tensor.dims()) shape->add_dim()->set_dim_value(dimension);
+      ORT_ENFORCE(Rules::DescriptorValid(descriptor), "RW07_WHOLE_INITIALIZER_DESCRIPTOR");
+      lookup[tensor.name()] = descriptor;
+      values_.emplace(tensor.name(), Value{std::move(descriptor)});
+    }
+    for (const auto& output : original.output()) {
+      if (output.has_type()) {
+        ORT_ENFORCE(Rules::DescriptorValid(output.type()), "RW07_WHOLE_OUTPUT_ASSERTION");
+        lookup[output.name()] = output.type();
+        values_.emplace(output.name(), Value{output.type()});
+      }
+    }
+    for (const auto& info : original.value_info()) {
+      if (info.has_type()) {
+        ORT_ENFORCE(Rules::DescriptorValid(info.type()), "RW07_WHOLE_VALUE_ASSERTION");
+        lookup[info.name()] = info.type();
+      }
+    }
+    // Reproduce only the documented constructor's descriptor-creation order:
+    // existing graph inputs/initializers/outputs retain their first descriptor.
+    for (const auto& node : original.node()) {
+      for (const auto& name : node.input()) values_.emplace(name, Value{lookup.count(name) ? lookup.at(name) : TypeProto{}});
+      for (const auto& name : node.output()) values_.emplace(name, Value{lookup.count(name) ? lookup.at(name) : TypeProto{}});
+    }
+    for (size_t index = 0; index < states_.size(); ++index) {
+      const auto& node = original.node(static_cast<int>(index));
+      ORT_ENFORCE(node.domain().empty() && Rules::Find(node.op_type()), "RW07_WHOLE_UNKNOWN_ORIGINAL_NODE");
+      for (const auto& name : node.output())
+        if (!name.empty()) {
+          auto& value = values_.at(name);
+          ORT_ENFORCE(value.producer == std::numeric_limits<size_t>::max() && !initializers_.count(name),
+                      "RW07_WHOLE_DUPLICATE_PRODUCER");
+          value.producer = index;
+        }
+    }
+  }
+
+  void Bind(M0OriginalPreloadOwnerV1& owner, Model& model) {
+    ORT_ENFORCE(owner.construction_count_ == 2 && owner.construction_model_ == &model && !owner.model_,
+                "RW07_WHOLE_CONSTRUCTION_SEAL");
+    owner.model_ = &model;
+    owner.graph_ = &model.MainGraph();
+    owner.domains_ = owner.graph_->DomainToVersionMap();
+    ORT_ENFORCE(owner.graph_->strict_shape_type_inference_, "RW07_WHOLE_STRICT_MERGE_REQUIRED");
+    for (size_t index = 0; index < states_.size(); ++index) states_[index].node = owner.graph_->GetNode(index);
+    for (auto& [name, value] : values_) {
+      value.argument = owner.graph_->GetNodeArg(name);
+      ORT_ENFORCE(value.argument, "RW07_WHOLE_MISSING_NODEARG");
+    }
+    for (auto& [name, literal] : initializers_) {
+      const auto found = owner.graph_->GetAllInitializedTensors().find(name);
+      ORT_ENFORCE(found != owner.graph_->GetAllInitializedTensors().end() && found->second, "RW07_WHOLE_LITERAL_BIND");
+      literal.live = found->second;
+      // Identity/size only; no value decoding or arithmetic. Exact payload bytes
+      // remain independently checked by CheckBacking at entry and finalization.
+      literal.raw_backing = literal.live->raw_data().data();
+      literal.raw_size = literal.live->raw_data().size();
+    }
+    owner.active_ = true;
+    CheckBacking(owner);
+    CheckInventory(owner);
+    owner.active_ = false;
+  }
+
+  void CheckGraph(const M0OriginalPreloadOwnerV1& owner, const Graph& graph) const {
+    ORT_ENFORCE(owner.whole_.get() == this && !owner.poisoned_ && owner.active_ && owner.graph_ == &graph &&
+                    owner.model_ && &graph.GetModel() == owner.model_ &&
+                    owner.model_->m0_original_preload_owner_v1_.get() == &owner && !graph.IsSubgraph() &&
+                    static_cast<size_t>(graph.NumberOfNodes()) == states_.size() && graph.DomainToVersionMap() == owner.domains_,
+                "RW07_WHOLE_GRAPH_IDENTITY");
+  }
+
+  void CheckValue(const M0OriginalPreloadOwnerV1& owner, const std::string& name,
+                  const NodeArg* actual, const TypeProto* pending = nullptr) const {
+    const auto found = values_.find(name);
+    ORT_ENFORCE(found != values_.end() && actual && actual == found->second.argument &&
+                    owner.graph_->GetNodeArg(name) == actual && actual->Name() == name && actual->Exists() == !name.empty() &&
+                    !actual->GetInferredShapeValues().has_value() && !actual->GetInferredShapeScalarValue().has_value(),
+                "RW07_WHOLE_VALUE_FRONTIER_IDENTITY");
+    const TypeProto& expected = pending ? *pending : found->second.expected;
+    const auto* type = actual->TypeAsProto();
+    ORT_ENFORCE(type ? type->SerializeAsString() == expected.SerializeAsString() : expected.SerializeAsString().empty(),
+                "RW07_WHOLE_VALUE_FRONTIER_TYPE");
+    const auto literal = initializers_.find(name);
+    if (literal != initializers_.end()) {
+      const auto live = owner.graph_->GetAllInitializedTensors().find(name);
+      const auto& bound = literal->second;
+      const auto& original = *bound.original;
+      ORT_ENFORCE(live != owner.graph_->GetAllInitializedTensors().end() && live->second == bound.live &&
+                      bound.live->raw_data().data() == bound.raw_backing && bound.live->raw_data().size() == bound.raw_size &&
+                      bound.live->has_raw_data() == original.has_raw_data() && bound.live->name() == original.name() &&
+                      bound.live->data_type() == original.data_type() && bound.live->dims_size() == original.dims_size() &&
+                      std::equal(bound.live->dims().begin(), bound.live->dims().end(), original.dims().begin()) &&
+                      bound.live->data_location() == original.data_location() && bound.live->external_data_size() == original.external_data_size() &&
+                      bound.live->has_segment() == original.has_segment() && bound.live->metadata_props_size() == original.metadata_props_size(),
+                  "RW07_WHOLE_LITERAL_IDENTITY");
+    }
+  }
+
+  State& GetState(const M0OriginalPreloadOwnerV1& owner, const Node& node) {
+    CheckGraph(owner, *node.GetContainingGraph());
+    ORT_ENFORCE(node.Index() < states_.size(), "RW07_WHOLE_NODE_INDEX");
+    auto& state = states_[node.Index()];
+    ORT_ENFORCE(state.node == &node && owner.graph_->GetNode(node.Index()) == &node &&
+                    node.ImplicitInputDefs().empty() && node.GetAttributeNameToSubgraphMap().empty(),
+                "RW07_WHOLE_NODE_IDENTITY");
+    return state;
+  }
+
+  void CheckNode(const M0OriginalPreloadOwnerV1& owner, const Node& node) {
+    auto& state = GetState(owner, node);
+    const auto& original = seal_->proto_.graph().node(static_cast<int>(node.Index()));
+    NodeProto current, base(original);
+    node.ToProto(current);
+    NodeProto current_base(current);
+    base.clear_attribute();
+    current_base.clear_attribute();
+    ORT_ENFORCE(base.SerializeAsString() == current_base.SerializeAsString() &&
+                    node.InputDefs().size() == static_cast<size_t>(original.input_size()) &&
+                    node.OutputDefs().size() == static_cast<size_t>(original.output_size()),
+                "RW07_WHOLE_NODE_PORTS");
+    if (state.schema) ORT_ENFORCE(node.Op() == state.schema && node.SinceVersion() == state.schema->SinceVersion(),
+                                  "RW07_WHOLE_SELECTED_SCHEMA");
+    if (state.stage >= 3) {
+      ORT_ENFORCE(Rules::AttributesMatch(*state.profile, *state.schema, original, current, gsl::make_span(state.defaults)),
+                  "RW07_WHOLE_DEFAULT_PROVENANCE");
+    } else {
+      for (const auto& attribute : current.attribute()) {
+        const AttributeProto* expected = Rules::GetAttribute(original, attribute.name());
+        if (!expected && state.schema) {
+          const auto candidate = state.schema->attributes().find(attribute.name());
+          if (candidate != state.schema->attributes().end() && candidate->second.default_value.has_name()) expected = &candidate->second.default_value;
+        }
+        ORT_ENFORCE(expected && attribute.SerializeAsString() == expected->SerializeAsString(), "RW07_WHOLE_LIVE_ATTRIBUTE");
+      }
+      for (const auto& attribute : original.attribute()) ORT_ENFORCE(Rules::GetAttribute(current, attribute.name()), "RW07_WHOLE_LOST_ATTRIBUTE");
+    }
+    for (size_t slot = 0; slot < node.InputDefs().size(); ++slot) CheckValue(owner, original.input(static_cast<int>(slot)), node.InputDefs()[slot]);
+    for (size_t slot = 0; slot < node.OutputDefs().size(); ++slot) {
+      const TypeProto* pending = state.stage >= 4 && slot < state.saved.size() && state.saved[slot] ? &state.expected_merge[slot] : nullptr;
+      CheckValue(owner, original.output(static_cast<int>(slot)), node.OutputDefs()[slot], pending);
+    }
+  }
+
+  void Checked(M0OriginalPreloadOwnerV1& owner, const Node& node, const NodeProto& original) {
+    CheckNode(owner, node);
+    auto& state = states_[node.Index()];
+    ORT_ENFORCE(state.stage == 0 && original.SerializeAsString() == seal_->proto_.graph().node(static_cast<int>(node.Index())).SerializeAsString(),
+                "RW07_WHOLE_NATIVE_CHECKER_EVENT");
+    state.stage = 1;
+    ++checked_;
+  }
+  void Selected(M0OriginalPreloadOwnerV1& owner, const Node& node) {
+    CheckNode(owner, node);
+    auto& state = states_[node.Index()];
+    state.profile = Rules::Find(node.OpType());
+    ORT_ENFORCE(state.stage == 1 && node.Op() && state.profile && Rules::SchemaMatches(*node.Op(), *state.profile) &&
+                    node.SinceVersion() == node.Op()->SinceVersion(),
+                "RW07_WHOLE_NATIVE_SCHEMA_EVENT");
+    state.schema = node.Op();
+    state.stage = 2;
+    ++selected_;
+  }
+  void Defaulted(M0OriginalPreloadOwnerV1& owner, const Node& node, const AttributeProto& origin) {
+    CheckNode(owner, node);
+    auto& state = states_[node.Index()];
+    ORT_ENFORCE(state.stage == 2 && state.schema, "RW07_WHOLE_DEFAULT_STAGE");
+    const auto found = state.schema->attributes().find(origin.name());
+    ORT_ENFORCE(found != state.schema->attributes().end() && &found->second.default_value == &origin &&
+                    !Rules::GetAttribute(seal_->proto_.graph().node(static_cast<int>(node.Index())), origin.name()),
+                "RW07_WHOLE_DEFAULT_EVENT");
+    for (const auto* receipt : state.defaults) ORT_ENFORCE(receipt != &origin, "RW07_WHOLE_DUPLICATE_DEFAULT");
+    state.defaults.push_back(&origin);
+    ++defaults_;
+  }
+
+  static TypeProto ExpectedMerge(const TypeProto& assertion, const TypeProto& proposal, bool& conflict) {
+    ORT_ENFORCE(Rules::DescriptorValid(proposal), "RW07_WHOLE_PROPOSAL_TYPE");
+    if (assertion.SerializeAsString().empty()) return proposal;
+    ORT_ENFORCE(Rules::DescriptorValid(assertion), "RW07_WHOLE_ASSERTION_TYPE");
+    // A genuine checker/type/shape merge must reject a contradictory original
+    // assertion. Retain a closed refusal expectation; never preempt that merge
+    // with a fabricated successful descriptor or accept its publication.
+    if (assertion.tensor_type().elem_type() != proposal.tensor_type().elem_type()) {
+      conflict = true;
+      return assertion;
+    }
+    TypeProto result(assertion);
+    if (proposal.tensor_type().has_shape()) {
+      const auto& proposed = proposal.tensor_type().shape();
+      for (const auto& dimension : proposed.dim()) ORT_ENFORCE(dimension.SerializeAsString().empty(), "RW07_WHOLE_EXTENT_NOT_AUTHORIZED");
+      if (assertion.tensor_type().has_shape()) {
+        if (assertion.tensor_type().shape().dim_size() != proposed.dim_size()) {
+          conflict = true;
+          return assertion;
+        }
+      } else {
+        *result.mutable_tensor_type()->mutable_shape() = proposed;
+      }
+    }
+    return result;
+  }
+
+  void Infer(M0OriginalPreloadOwnerV1& owner, Node& node, const void* context, std::vector<TypeProto>& outputs) {
+    CheckNode(owner, node);
+    auto& state = states_[node.Index()];
+    ORT_ENFORCE(checked_ == published_ + 1 && selected_ == published_ + 1 && state.stage == 2 && context &&
+                    !state.inference && published_ < owner.graph_->nodes_in_topological_order_.size() &&
+                    owner.graph_->nodes_in_topological_order_[published_] == node.Index() &&
+                    outputs.size() == node.OutputDefs().size(),
+                "RW07_WHOLE_INFERENCE_EVENT");
+    std::vector<const TypeProto*> inputs;
+    for (const auto* input : node.InputDefs()) {
+      const auto& value = values_.at(input->Name());
+      if (input->Exists() && value.producer != std::numeric_limits<size_t>::max())
+        ORT_ENFORCE(states_[value.producer].stage == 6, "RW07_WHOLE_UNPUBLISHED_PRODUCER");
+      inputs.push_back(input->Exists() ? input->TypeAsProto() : nullptr);
+    }
+    for (const auto& output : outputs) ORT_ENFORCE(output.SerializeAsString().empty(), "RW07_WHOLE_NONEMPTY_SCRATCH");
+    NodeProto current;
+    node.ToProto(current);
+    ORT_ENFORCE(Rules::Propose(seal_->proto_.graph().node(static_cast<int>(node.Index())), current, *state.schema,
+                               gsl::make_span(inputs), gsl::make_span(state.defaults), outputs) == Rules::Result::kProposed,
+                "RW07_WHOLE_DESCRIPTOR_RULE_REFUSED");
+    state.proposals = outputs;
+    state.saved.resize(outputs.size(), false);
+    state.expected_merge.resize(outputs.size());
+    for (size_t slot = 0; slot < outputs.size(); ++slot)
+      if (node.OutputDefs()[slot]->Exists()) {
+        state.expected_merge[slot] = ExpectedMerge(values_.at(node.OutputDefs()[slot]->Name()).expected, outputs[slot], state.merge_conflict);
+      }
+    state.inference = context;
+    state.stage = 3;
+  }
+  void Propagation(M0OriginalPreloadOwnerV1& owner, const Node& node, const void* context, const std::vector<TypeProto>& outputs) {
+    CheckNode(owner, node);
+    auto& state = states_[node.Index()];
+    ORT_ENFORCE(state.stage == 3 && context && context != state.inference && !state.propagation &&
+                    state.profile->mode == Rules::Mode::kDescriptorCallbackReplacedPropagationDeferredToGPU &&
+                    state.schema->has_data_propagation_function() == state.profile->actual_data_propagation &&
+                    outputs.size() == node.OutputDefs().size(),
+                "RW07_WHOLE_DEFERRED_PROPAGATION_EVENT");
+    for (const auto& output : outputs) ORT_ENFORCE(output.SerializeAsString().empty(), "RW07_WHOLE_PROPAGATION_VALUE");
+    state.propagation = context;
+    state.stage = 4;
+    ++deferred_;
+  }
+  void Saver(M0OriginalPreloadOwnerV1& owner, const Node& node, const NodeArg& output, size_t slot, const std::vector<TypeProto>& outputs) {
+    CheckNode(owner, node);
+    auto& state = states_[node.Index()];
+    ORT_ENFORCE(state.stage == 4 && state.propagation && slot < node.OutputDefs().size() &&
+                    node.OutputDefs()[slot] == &output && output.Exists() && !state.saved[slot] &&
+                    outputs.size() == node.OutputDefs().size(),
+                "RW07_WHOLE_DEFERRED_SAVER_EVENT");
+    for (const auto& value : outputs) ORT_ENFORCE(value.SerializeAsString().empty(), "RW07_WHOLE_SAVER_VALUE");
+    ORT_ENFORCE(!owner.fail_before_merge_ || published_ == 0, "RW07_WHOLE_INJECTED_PREMERGE_FAILURE");
+    state.saved[slot] = true;
+  }
+  void Published(M0OriginalPreloadOwnerV1& owner, const Node& node) {
+    CheckNode(owner, node);
+    auto& state = states_[node.Index()];
+    ORT_ENFORCE(state.stage == 4 && !state.merge_conflict && published_ < owner.graph_->nodes_in_topological_order_.size() &&
+                    owner.graph_->nodes_in_topological_order_[published_] == node.Index(),
+                "RW07_WHOLE_PUBLICATION_ORDER");
+    for (size_t slot = 0; slot < node.OutputDefs().size(); ++slot) {
+      const auto* output = node.OutputDefs()[slot];
+      ORT_ENFORCE(state.saved[slot] == output->Exists(), "RW07_WHOLE_OUTPUT_SAVER_COVERAGE");
+      if (output->Exists()) {
+        CheckValue(owner, output->Name(), output, &state.expected_merge[slot]);
+        values_.at(output->Name()).expected = state.expected_merge[slot];
+      }
+    }
+    state.stage = 6;
+    ++published_;
+  }
+
+  void CheckBacking(const M0OriginalPreloadOwnerV1& owner) const {
+    // Genuine constructor normalization is restricted to adding missing builtin
+    // imports. Every other protobuf field, including original literals, matches.
+    const auto& live = owner.model_->model_proto_;
+    const auto* registry = dynamic_cast<const SchemaRegistryManager*>(owner.graph_->schema_registry_.get());
+    ORT_ENFORCE(registry, "RW07_WHOLE_BUILTIN_REGISTRY_REQUIRED");
+    auto expected_domains = registry->GetLastReleasedOpsetVersions(false);
+    expected_domains[""] = 20;
+    expected_domains[kMSInternalNHWCDomain] = 20;
+    ORT_ENFORCE(owner.domains_ == expected_domains, "RW07_WHOLE_CONSTRUCTOR_DOMAIN_MAP");
+    std::unordered_map<std::string, int64_t> imports;
+    for (const auto& imported : live.opset_import())
+      ORT_ENFORCE(imports.emplace(imported.domain(), imported.version()).second && expected_domains.count(imported.domain()) &&
+                      expected_domains.at(imported.domain()) == imported.version(),
+                  "RW07_WHOLE_NORMALIZED_IMPORT");
+    ORT_ENFORCE(imports.count("") && imports.at("") == 20, "RW07_WHOLE_ORIGINAL_IMPORT");
+    auto required_imports = expected_domains;
+    required_imports.erase(kMSInternalNHWCDomain);
+    ORT_ENFORCE(imports.size() == required_imports.size(), "RW07_WHOLE_NORMALIZED_IMPORT_INVENTORY");
+    ONNX_NAMESPACE::ModelProto expected(seal_->proto_);
+    expected.clear_opset_import();
+    for (const auto& imported : live.opset_import()) *expected.add_opset_import() = imported;
+    ORT_ENFORCE(expected.SerializeAsString() == live.SerializeAsString(), "RW07_WHOLE_IMMUTABLE_BACKING");
+  }
+  void CheckInventory(M0OriginalPreloadOwnerV1& owner) {
+    const auto& graph = *owner.graph_;
+    ORT_ENFORCE(static_cast<size_t>(graph.NumberOfNodes()) == states_.size() && graph.node_args_.size() == values_.size() &&
+                    graph.GetAllInitializedTensors().size() == initializers_.size(),
+                "RW07_WHOLE_FULL_INVENTORY");
+    for (const auto& [name, value] : values_) CheckValue(owner, name, graph.GetNodeArg(name));
+    for (size_t index = 0; index < states_.size(); ++index) {
+      ORT_ENFORCE(states_[index].node && graph.GetNode(index) == states_[index].node, "RW07_WHOLE_NODE_INVENTORY");
+      CheckNode(owner, *states_[index].node);
+    }
+    const auto& original = seal_->proto_.graph();
+    ORT_ENFORCE(graph.GetInputsIncludingInitializers().size() == static_cast<size_t>(original.input_size()) &&
+                    graph.GetOutputs().size() == static_cast<size_t>(original.output_size()),
+                "RW07_WHOLE_GRAPH_PORT_INVENTORY");
+    for (size_t i = 0; i < graph.GetInputsIncludingInitializers().size(); ++i)
+      ORT_ENFORCE(graph.GetInputsIncludingInitializers()[i] == values_.at(original.input(static_cast<int>(i)).name()).argument, "RW07_WHOLE_GRAPH_INPUT");
+    for (size_t i = 0; i < graph.GetOutputs().size(); ++i)
+      ORT_ENFORCE(graph.GetOutputs()[i] == values_.at(original.output(static_cast<int>(i)).name()).argument, "RW07_WHOLE_GRAPH_OUTPUT");
+  }
+  void Finalize(M0OriginalPreloadOwnerV1& owner) {
+    ORT_ENFORCE(checked_ == states_.size() && selected_ == states_.size() && deferred_ == states_.size() &&
+                    published_ == states_.size(),
+                "RW07_WHOLE_EXACT_EVENT_COVERAGE");
+    for (const auto& state : states_) ORT_ENFORCE(state.stage == 6, "RW07_WHOLE_UNPUBLISHED_NODE");
+    CheckInventory(owner);
+    CheckBacking(owner);
+  }
+
+  std::unique_ptr<M0WholeModelSealV1> seal_;
+  std::vector<State> states_;
+  std::unordered_map<std::string, Value> values_;
+  std::unordered_map<std::string, Literal> initializers_;
+  size_t checked_ = 0, selected_ = 0, deferred_ = 0, published_ = 0, defaults_ = 0;
+};
+
+M0OriginalPreloadOwnerV1::M0OriginalPreloadOwnerV1(std::unique_ptr<M0WholeModelSealV1> seal)
+    : whole_(new WholeModel(std::move(seal))), recipe_{} {}
+M0OriginalPreloadOwnerV1::~M0OriginalPreloadOwnerV1() = default;
+
 // Exact original-node cut qualification shares the production source path; it
 // cannot release a Model or grant full-model preload authority.
 M0OriginalPreloadOwnerV1::M0OriginalPreloadOwnerV1(const FrozenRecipe& recipe) : recipe_(recipe) {
@@ -8025,6 +8411,10 @@ M0OriginalPreloadOwnerV1::M0OriginalPreloadOwnerV1(const FrozenRecipe& recipe) :
               "RW07_ORIGINAL_NODE_WIRE");
 }
 void M0OriginalPreloadOwnerV1::CheckGraph(const Graph& graph) const {
+  if (whole_) {
+    whole_->CheckGraph(*this, graph);
+    return;
+  }
   ORT_ENFORCE(!poisoned_ && active_ && graph_ == &graph && model_ && &graph.GetModel() == model_ &&
                   model_->m0_original_preload_owner_v1_.get() == this && !graph.IsSubgraph() &&
                   graph.NumberOfNodes() == 1 && graph.GetNode(0) == node_ &&
@@ -8044,6 +8434,10 @@ void M0OriginalPreloadOwnerV1::CheckGraph(const Graph& graph) const {
               "RW07_ORIGINAL_INITIALIZER_INVENTORY");
 }
 void M0OriginalPreloadOwnerV1::CheckNode(const Node& node) const {
+  if (whole_) {
+    whole_->CheckNode(*this, node);
+    return;
+  }
   CheckGraph(*node.GetContainingGraph());
   ORT_ENFORCE(node_ == &node && node.Index() == 0 && node.ImplicitInputDefs().empty() &&
                   node.GetAttributeNameToSubgraphMap().empty(),
@@ -8088,11 +8482,19 @@ void M0OriginalPreloadOwnerV1::CheckNode(const Node& node) const {
   }
 }
 void M0OriginalPreloadOwnerV1::Checked(const Node& node, const NodeProto& original) {
+  if (whole_) {
+    whole_->Checked(*this, node, original);
+    return;
+  }
   CheckNode(node);
   ORT_ENFORCE(stage_ == 0 && original.SerializeAsString() == recipe_.node_wire, "RW07_ORIGINAL_CHECKER");
   stage_ = 1;
 }
 void M0OriginalPreloadOwnerV1::Selected(const Node& node) {
+  if (whole_) {
+    whole_->Selected(*this, node);
+    return;
+  }
   CheckNode(node);
   ORT_ENFORCE(stage_ == 1 && node.Op() && node.Op() == ONNX_NAMESPACE::OpSchemaRegistry::Schema(node.OpType(), 20, "") &&
                   node.SinceVersion() == node.Op()->SinceVersion(),
@@ -8101,6 +8503,10 @@ void M0OriginalPreloadOwnerV1::Selected(const Node& node) {
   stage_ = 2;
 }
 void M0OriginalPreloadOwnerV1::Defaulted(const Node& node, const AttributeProto& origin) {
+  if (whole_) {
+    whole_->Defaulted(*this, node, origin);
+    return;
+  }
   CheckNode(node);
   ORT_ENFORCE(stage_ == 2 && node.Op() == schema_ &&
                   &schema_->attributes().at(origin.name()).default_value == &origin,
@@ -8109,6 +8515,10 @@ void M0OriginalPreloadOwnerV1::Defaulted(const Node& node, const AttributeProto&
   defaults_.push_back(&origin);
 }
 void M0OriginalPreloadOwnerV1::Infer(Node& node, const void* context, std::vector<TypeProto>& outputs) {
+  if (whole_) {
+    whole_->Infer(*this, node, context, outputs);
+    return;
+  }
   CheckNode(node);
   ORT_ENFORCE(stage_ == 2 && context && !context_ && node.Op() == schema_ &&
                   node.SinceVersion() == schema_->SinceVersion() && outputs.size() == 1 &&
@@ -8139,6 +8549,10 @@ void M0OriginalPreloadOwnerV1::Infer(Node& node, const void* context, std::vecto
   stage_ = 3;
 }
 void M0OriginalPreloadOwnerV1::Propagation(const Node& node, const void* context, const std::vector<TypeProto>& outputs) {
+  if (whole_) {
+    whole_->Propagation(*this, node, context, outputs);
+    return;
+  }
   CheckNode(node);
   ORT_ENFORCE(stage_ == 3 && context && context != context_ && !propagation_ && node.Op() == schema_ &&
                   !schema_->has_data_propagation_function() && outputs.size() == 1 && outputs[0].SerializeAsString().empty(),
@@ -8146,14 +8560,24 @@ void M0OriginalPreloadOwnerV1::Propagation(const Node& node, const void* context
   propagation_ = context;
   stage_ = 4;
 }
-void M0OriginalPreloadOwnerV1::Saver(const Node& node, const std::vector<TypeProto>& outputs) {
+void M0OriginalPreloadOwnerV1::Saver(const Node& node, const NodeArg& output, size_t output_index,
+                                     const std::vector<TypeProto>& outputs) {
+  if (whole_) {
+    whole_->Saver(*this, node, output, output_index, outputs);
+    return;
+  }
   CheckNode(node);
-  ORT_ENFORCE(stage_ == 4 && outputs.size() == 1 && outputs[0].SerializeAsString().empty(),
+  ORT_ENFORCE(stage_ == 4 && output_index == 0 && node.OutputDefs()[0] == &output &&
+                  outputs.size() == 1 && outputs[0].SerializeAsString().empty(),
               "RW07_ORIGINAL_SAVER_NOT_EMPTY");
   ORT_ENFORCE(!fail_before_merge_, "RW07_ORIGINAL_INJECTED_PREMERGE_FAILURE");
   stage_ = 5;
 }
 void M0OriginalPreloadOwnerV1::Published(const Node& node) {
+  if (whole_) {
+    whole_->Published(*this, node);
+    return;
+  }
   CheckNode(node);
   ORT_ENFORCE(stage_ == 5 && node.OutputDefs().size() == 1 && node.OutputDefs()[0]->TypeAsProto() &&
                   node.OutputDefs()[0]->TypeAsProto()->SerializeAsString() == recipe_.output_type,
@@ -8172,16 +8596,169 @@ common::Status M0OriginalPreloadOwnerV1::Resolve(Graph& graph) {
   ORT_RETURN_IF_NOT(&graph == graph_ && !active_ && !poisoned_ && stage_ == 0, "RW07_ORIGINAL_RESOLVE_REUSE");
   active_ = true;
   CheckGraph(graph);
+  if (whole_) {
+    whole_->CheckInventory(*this);
+    whole_->CheckBacking(*this);
+  }
   Graph::ResolveOptions options;
   options.no_proto_sync_required = true;
   ORT_RETURN_IF_ERROR(graph.ResolveSource(options));
-  CheckNode(*node_);
-  ORT_RETURN_IF_NOT(stage_ == 6 && !graph.GraphResolveNeeded(), "RW07_ORIGINAL_FINALIZATION");
+  if (whole_)
+    whole_->Finalize(*this);
+  else
+    CheckNode(*node_);
+  ORT_RETURN_IF_NOT((whole_ || stage_ == 6) && !graph.GraphResolveNeeded(), "RW07_ORIGINAL_FINALIZATION");
   ORT_RETURN_IF_NOT(!graph.GraphProtoSyncNeeded(), "RW07_ORIGINAL_SYNC_FINALIZATION");
   stage_ = 7;
   retirement.success = true;
   return common::Status::OK();
 }
+std::unique_ptr<Model> M0OriginalPreloadOwnerV1::MakeWhole(std::string_view bytes, const logging::Logger& logger) {
+  auto model = MakeWholeUnresolved(bytes, logger);
+  auto& bound = *model->m0_original_preload_owner_v1_;
+  ORT_THROW_IF_ERROR(model->MainGraph().Resolve());
+  ORT_ENFORCE(bound.stage_ == 7 && !bound.poisoned_ && !bound.active_, "RW07_WHOLE_FINAL_RECEIPT");
+  return model;
+}
+std::unique_ptr<Model> M0OriginalPreloadOwnerV1::MakeWholeUnresolved(std::string_view bytes, const logging::Logger& logger) {
+  auto seal = M0WholeModelSealV1::ValidateAndParse(bytes);
+  auto owner = std::unique_ptr<M0OriginalPreloadOwnerV1>(new M0OriginalPreloadOwnerV1(std::move(seal)));
+  ONNX_NAMESPACE::ModelProto live(owner->whole_->seal_->proto_);
+  ModelOptions options(true, true);
+  auto model = std::unique_ptr<Model>(new Model(std::move(live), PathString(), nullptr, logger, options, nullptr, std::move(owner)));
+  auto& bound = *model->m0_original_preload_owner_v1_;
+  bound.whole_->Bind(bound, *model);
+  return model;
+}
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+size_t M0OriginalPreloadOwnerV1::QualifyWholeRetirement(std::string_view bytes) {
+  auto model = MakeWholeUnresolved(bytes, logging::LoggingManager::DefaultLogger());
+  auto& owner = *model->m0_original_preload_owner_v1_;
+  owner.fail_before_merge_ = true;
+  bool rejected = false;
+  ORT_TRY {
+    const auto status = model->MainGraph().Resolve();
+    rejected = !status.IsOK() && status.ErrorMessage().find("RW07_WHOLE_INJECTED_PREMERGE_FAILURE") != std::string::npos;
+  }
+  ORT_CATCH(const std::exception& error) {
+    ORT_HANDLE_EXCEPTION([&]() {
+      rejected = std::string_view(error.what()).find("RW07_WHOLE_INJECTED_PREMERGE_FAILURE") != std::string_view::npos;
+    });
+  }
+  ORT_ENFORCE(rejected && owner.poisoned_ && !owner.active_ && owner.stage_ == 0 && owner.whole_->published_ == 1,
+              "RW07_WHOLE_LATE_FAILURE_RETIREMENT");
+  const auto replay = model->MainGraph().Resolve();
+  ORT_ENFORCE(!replay.IsOK() && replay.ErrorMessage().find("RW07_ORIGINAL_RESOLVE_REUSE") != std::string::npos,
+              "RW07_WHOLE_LATE_FAILURE_RETRY");
+  return owner.whole_->published_;
+}
+size_t M0QualifyWholeRetirementV1(std::string_view bytes) {
+  return M0OriginalPreloadOwnerV1::QualifyWholeRetirement(bytes);
+}
+M0WholeDescriptorRulesReceiptV1 M0OriginalPreloadOwnerV1::QualifyWholeRules(std::string_view bytes) {
+  // Exact original-node metadata fixtures through the actual owner's private
+  // rule facade. This does not construct a Model or confer load authority.
+  auto seal = M0WholeModelSealV1::ValidateAndParse(bytes);
+  WholeModel fixture(std::move(seal));
+  M0WholeDescriptorRulesReceiptV1 receipt;
+  for (const auto& profile : Rules::kProfiles) {
+    const NodeProto* original = nullptr;
+    for (const auto& node : fixture.seal_->proto_.graph().node())
+      if (node.op_type() == profile.name) {
+        original = &node;
+        break;
+      }
+    ORT_ENFORCE(original, "RW07_WHOLE_RULE_FIXTURE_MISSING");
+    const auto* schema = ONNX_NAMESPACE::OpSchemaRegistry::Schema(original->op_type(), 20, "");
+    ORT_ENFORCE(schema && Rules::SchemaMatches(*schema, profile), "RW07_WHOLE_RULE_FIXTURE_SCHEMA");
+    NodeProto current(*original);
+    std::vector<const AttributeProto*> defaults;
+    for (const auto& [name, definition] : schema->attributes()) {
+      if (!Rules::GetAttribute(*original, name) && definition.default_value.has_name()) {
+        *current.add_attribute() = definition.default_value;
+        defaults.push_back(&definition.default_value);
+      }
+    }
+    std::vector<TypeProto> types;
+    types.reserve(static_cast<size_t>(original->input_size()));
+    for (const auto& name : original->input()) types.push_back(fixture.values_.at(name).expected);
+    std::vector<const TypeProto*> inputs;
+    for (size_t slot = 0; slot < types.size(); ++slot) inputs.push_back(original->input(static_cast<int>(slot)).empty() ? nullptr : &types[slot]);
+    std::vector<TypeProto> outputs;
+    ORT_ENFORCE(Rules::Propose(*original, current, *schema, gsl::make_span(inputs), gsl::make_span(defaults), outputs) == Rules::Result::kProposed &&
+                    outputs.size() == static_cast<size_t>(original->output_size()),
+                "RW07_WHOLE_RULE_FIXTURE_PROPOSE");
+    ++receipt.profiles;
+    if (profile.actual_data_propagation) ++receipt.actual_dp_profiles;
+    // Independent source-semantic rank oracle; it does not read profile.rank.
+    const auto& op = original->op_type();
+    const bool unary = op == "Atan" || op == "Clip" || op == "Cos" || op == "Exp" || op == "Floor" ||
+                       op == "LeakyRelu" || op == "Round" || op == "Sigmoid" || op == "Sin" || op == "Softmax" || op == "Sqrt" || op == "Tanh";
+    for (size_t slot = 0; slot < outputs.size(); ++slot) {
+      if (original->output(static_cast<int>(slot)).empty()) continue;
+      const auto& expected = fixture.values_.at(original->output(static_cast<int>(slot))).expected;
+      ORT_ENFORCE(outputs[slot].tensor_type().elem_type() == expected.tensor_type().elem_type(), "RW07_WHOLE_RULE_DTYPE_ORACLE");
+      int rank = -1;
+      if (op == "Shape" || op == "Range") rank = 1;
+      if (op == "NonZero") rank = 2;
+      if (op == "LSTM") rank = slot == 0 ? 4 : 3;
+      if (unary && types[0].tensor_type().has_shape()) rank = types[0].tensor_type().shape().dim_size();
+      ORT_ENFORCE(outputs[slot].tensor_type().has_shape() == (rank >= 0) &&
+                      (rank < 0 || outputs[slot].tensor_type().shape().dim_size() == rank),
+                  "RW07_WHOLE_RULE_RANK_ORACLE");
+      for (const auto& dimension : outputs[slot].tensor_type().shape().dim()) ORT_ENFORCE(dimension.SerializeAsString().empty(), "RW07_WHOLE_RULE_UNKNOWN_DIM_ORACLE");
+    }
+    ++receipt.rank_assertions;
+    auto saved = outputs;
+    auto unchanged = [&]() {
+      ORT_ENFORCE(outputs.size() == saved.size(), "RW07_WHOLE_REFUSAL_SCRATCH_ARITY");
+      for (size_t slot = 0; slot < outputs.size(); ++slot) ORT_ENFORCE(outputs[slot].SerializeAsString() == saved[slot].SerializeAsString(), "RW07_WHOLE_REFUSAL_SCRATCH_MUTATION");
+    };
+    if (op == "Add" || op == "Concat") {
+      ORT_ENFORCE(types.size() >= 2 && inputs[0] && inputs[1], "RW07_WHOLE_MIXED_DTYPE_FIXTURE");
+      types[0].mutable_tensor_type()->set_elem_type(1);
+      types[1].mutable_tensor_type()->set_elem_type(7);
+      ORT_ENFORCE(Rules::Propose(*original, current, *schema, gsl::make_span(inputs), gsl::make_span(defaults), outputs) == Rules::Result::kRefused,
+                  "RW07_WHOLE_MIXED_DTYPE_NOT_REFUSED");
+      unchanged();
+      ++receipt.mixed_dtype_denials;
+    }
+    if (!defaults.empty()) {
+      std::vector<AttributeProto> copies;
+      copies.reserve(defaults.size());
+      for (const auto* origin : defaults) copies.push_back(*origin);
+      std::vector<const AttributeProto*> copied;
+      for (const auto& copy : copies) copied.push_back(&copy);
+      ORT_ENFORCE(Rules::Propose(*original, current, *schema, gsl::make_span(inputs), gsl::make_span(copied), outputs) == Rules::Result::kRefused,
+                  "RW07_WHOLE_COPIED_DEFAULT_NOT_REFUSED");
+      unchanged();
+      ++receipt.copied_default_denials;
+    }
+    if (op == "LSTM") {
+      ORT_ENFORCE(inputs.size() > 4 && !inputs[4] && outputs.size() == 3 &&
+                      outputs[0].tensor_type().shape().dim_size() == 4 && outputs[1].tensor_type().shape().dim_size() == 3 &&
+                      outputs[2].tensor_type().shape().dim_size() == 3,
+                  "RW07_WHOLE_LSTM_HOLE_MULTI_OUTPUT");
+      ++receipt.lstm_optional_holes;
+      ++receipt.multiple_outputs;
+    }
+    if (unary) {
+      types[0].mutable_tensor_type()->clear_shape();
+      ORT_ENFORCE(Rules::Propose(*original, current, *schema, gsl::make_span(inputs), gsl::make_span(defaults), outputs) == Rules::Result::kProposed &&
+                      !outputs[0].tensor_type().has_shape(),
+                  "RW07_WHOLE_ABSENT_RANK_NOT_SCALAR");
+    }
+  }
+  ORT_ENFORCE(receipt.profiles == 49 && receipt.actual_dp_profiles == 10 && receipt.rank_assertions == 49 &&
+                  receipt.mixed_dtype_denials == 2 && receipt.copied_default_denials > 0 &&
+                  receipt.lstm_optional_holes == 1 && receipt.multiple_outputs == 1,
+              "RW07_WHOLE_RULE_FIXTURE_COVERAGE");
+  return receipt;
+}
+M0WholeDescriptorRulesReceiptV1 M0QualifyWholeDescriptorRulesV1(std::string_view bytes) {
+  return M0OriginalPreloadOwnerV1::QualifyWholeRules(bytes);
+}
+#endif
 std::unique_ptr<Model> M0OriginalPreloadOwnerV1::Make(const FrozenRecipe& recipe) {
   ONNX_NAMESPACE::ModelProto proto;
   proto.set_ir_version(9);

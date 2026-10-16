@@ -50,6 +50,7 @@
 #include "core/graph/constants.h"
 #include "core/graph/graph_viewer.h"
 #include "core/graph/model.h"
+#include "core/graph/m0_original_preload_owner_v1.h"
 #include "core/graph/model_editor_api_types.h"
 #include "core/graph/model_saving_options.h"
 #include "core/providers/providers.h"
@@ -490,10 +491,39 @@ void InferenceSession::SetLoggingManager(const SessionOptions& session_options,
   }
 }
 
+namespace {
+Status M0OriginalThreadProfileOptionsV1(const SessionOptions& options) {
+  const OrtThreadPoolParams defaults;
+  const auto permitted = [&defaults](const OrtThreadPoolParams& params) {
+    return (params.thread_pool_size == 0 || params.thread_pool_size == 1) &&
+           params.auto_set_affinity == defaults.auto_set_affinity &&
+           params.allow_spinning == defaults.allow_spinning && params.spin_duration_us == defaults.spin_duration_us &&
+           params.spin_backoff_max == defaults.spin_backoff_max && params.dynamic_block_base_ == 0 &&
+           params.stack_size == 0 && params.affinity_str.empty() && !params.name && !params.set_denormal_as_zero;
+  };
+  ORT_RETURN_IF_NOT(!options.enable_profiling && options.use_per_session_threads &&
+                        permitted(options.intra_op_param) && permitted(options.inter_op_param),
+                    "RW07_ORIGINAL_LOAD_THREAD_PROFILE_OPTIONS");
+  ORT_RETURN_IF_NOT(Env::Default().GetEnvironmentVar("ORT_INTRA_OP_NUM_THREADS").empty() &&
+                        Env::Default().GetEnvironmentVar("ORT_INTER_OP_NUM_THREADS").empty(),
+                    "RW07_ORIGINAL_LOAD_THREAD_ENVIRONMENT");
+  return Status::OK();
+}
+}  // namespace
+
 void InferenceSession::ConstructorCommon(const SessionOptions& session_options,
                                          const Environment& session_env) {
   if (m0_fullgpu_strict_requested_v1_) {
     ORT_THROW_IF_ERROR(M0FullGpuValidateIngressAuthoritiesV1(session_options));
+    ORT_ENFORCE(!external_intra_op_thread_pool_ && !external_inter_op_thread_pool_,
+                "RW07_PREINIT_DENY_EXTERNAL_THREADPOOL");
+    ORT_THROW_IF_ERROR(M0OriginalThreadProfileOptionsV1(session_options));
+#ifdef ORT_ENABLE_SESSION_THREADPOOL_CALLBACKS
+    const auto* callbacks = session_env.GetPerSessionWorkCallbacks();
+    ORT_ENFORCE(!callbacks || (!callbacks->on_enqueue && !callbacks->on_start_work &&
+                               !callbacks->on_stop_work && !callbacks->on_abandon),
+                "RW07_PREINIT_DENY_ENVIRONMENT_CALLBACKS");
+#endif
     const auto model_config = Env::Default().GetEnvironmentVar(inference_session_utils::kOrtLoadConfigFromModelEnvVar);
     ORT_ENFORCE(model_config.empty() || model_config == "0", "RW07_PREINIT_DENY_ENVIRONMENT");
   }
@@ -1329,7 +1359,84 @@ common::Status InferenceSession::Load(const std::string& model_uri) {
 }
 #endif
 
+#if !defined(ORT_MINIMAL_BUILD)
+common::Status InferenceSession::M0LoadOriginalBytesV1(const void* model_data, int model_data_len) {
+  std::lock_guard<std::mutex> lock(session_mutex_);
+  ORT_RETURN_IF_NOT(!m0_original_load_attempted_v1_ && !is_model_loaded_ && !is_inited_ && !model_ &&
+                        !is_model_proto_parsed_ && !session_state_,
+                    "RW07_ORIGINAL_LOAD_REUSE");
+  m0_original_load_attempted_v1_ = true;
+  const auto cancellation = session_options_.load_cancellation_flag;
+  auto validate = [this, &cancellation]() -> Status {
+    ORT_RETURN_IF_NOT(m0_fullgpu_strict_requested_v1_ && M0FullGpuPreinitRequestedV1(session_options_),
+                      "RW07_PREINIT_DENY_INTENT_MUTATION");
+    ORT_RETURN_IF_ERROR(M0FullGpuValidatePreinitOptionsV1(session_options_));
+    ORT_RETURN_IF_ERROR(M0FullGpuValidateIngressAuthoritiesV1(session_options_));
+    // This closed loader observes cancellation at entry and before publication.
+    ORT_RETURN_IF_NOT(cancellation && session_options_.load_cancellation_flag == cancellation &&
+                          !cancellation->load(),
+                      "RW07_ORIGINAL_LOAD_CANCELLED");
+    ORT_RETURN_IF_ERROR(M0OriginalThreadProfileOptionsV1(session_options_));
+    ORT_RETURN_IF_NOT(!external_intra_op_thread_pool_ && !external_inter_op_thread_pool_ &&
+                          custom_registries_.empty() && custom_schema_registries_.empty() &&
+                          execution_providers_.GetIds().empty() &&
+                          session_options_.free_dimension_overrides.empty() &&
+                          session_options_.optimized_model_filepath.empty() && model_location_.empty(),
+                      "RW07_ORIGINAL_LOAD_AUTHORITY");
+    const auto model_config = Env::Default().GetEnvironmentVar(inference_session_utils::kOrtLoadConfigFromModelEnvVar);
+    ORT_RETURN_IF_NOT(model_config.empty() || model_config == "0", "RW07_PREINIT_DENY_ENVIRONMENT");
+    for (const auto& [key, value] : session_options_.config_options.GetConfigOptionsMap()) {
+      const bool approved = value == "1" &&
+                            (key == "m0.fullgpu.preinit_admission_v1" || key == "m0.fullgpu.preinit_abi_v1" ||
+                             key == "session.disable_prepacking" || key == "session.disable_aot_function_inlining" ||
+                             key == "session.disable_cpu_ep_fallback");
+      ORT_RETURN_IF_NOT(approved, "RW07_ORIGINAL_LOAD_CONFIG");
+    }
+    return Status::OK();
+  };
+  ORT_RETURN_IF_ERROR(validate());
+  ORT_RETURN_IF_NOT(model_data && model_data_len == 325532387, "RW07_ORIGINAL_BYTE_SIZE");
+  Status status = Status::OK();
+  ORT_TRY {
+    // The private factory returns only after the whole original Resolve commits.
+    auto pending = M0OriginalPreloadOwnerV1::MakeWhole(
+        std::string_view(static_cast<const char*>(model_data), static_cast<size_t>(model_data_len)), *session_logger_);
+    ORT_RETURN_IF_ERROR(validate());
+    status = SaveModelMetadata(*pending);
+    if (status.IsOK()) status = validate();
+    if (status.IsOK()) {
+      model_ = std::move(pending);
+      is_model_loaded_ = true;
+    }
+  }
+  ORT_CATCH(const std::exception& error) {
+    ORT_HANDLE_EXCEPTION([&]() {
+      status = ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07_ORIGINAL_LOAD_FAILED: ", error.what());
+    });
+  }
+  ORT_CATCH(...) {
+    status = ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07_ORIGINAL_LOAD_FAILED");
+  }
+  if (!status.IsOK()) {
+    input_def_map_.clear();
+    output_def_map_.clear();
+    model_metadata_.producer_name.clear();
+    model_metadata_.producer_version.clear();
+    model_metadata_.graph_name.clear();
+    model_metadata_.domain.clear();
+    model_metadata_.description.clear();
+    model_metadata_.graph_description.clear();
+    model_metadata_.version = 0;
+    model_metadata_.custom_metadata_map.clear();
+  }
+  return status;
+}
+#endif
+
 common::Status InferenceSession::Load(const void* model_data, int model_data_len) {
+#if !defined(ORT_MINIMAL_BUILD)
+  if (m0_fullgpu_strict_requested_v1_) return M0LoadOriginalBytesV1(model_data, model_data_len);
+#endif
   ORT_RETURN_IF_ERROR(M0FullGpuCheckIngressV1());
   std::string model_type = session_options_.config_options.GetConfigOrDefault(kOrtSessionOptionsConfigLoadModelFormat, "");
   bool has_explicit_type = !model_type.empty();
