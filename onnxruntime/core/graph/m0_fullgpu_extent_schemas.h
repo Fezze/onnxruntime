@@ -71,7 +71,24 @@ inline void RegisterM0FullGpuExtentSchemasV1() {
       .Output(5,"variance","Temporal centered-square mean1347 [1,512,1]","tensor(float)")
       .Output(6,"output_extent","GPU-derived rank3 merged extent","tensor(uint32)")
       .Attr("physical_capacity","Host allocation capacity only",AttributeProto::INT);
+  auto recurrence_v2 = recurrence;
+  recurrence_v2.SetName("RecurrenceExtentV2")
+      .SetDoc("RW07 original1340 internal GPU zero state, ABI2 Alignment640 input and owned merged output")
+      .Attr("source_role", "Alignment source role4", AttributeProto::INT)
+      .Attr("source_instance", "Original1330 instance1004", AttributeProto::INT)
+      .Attr("semantic_role", "Recurrence role5", AttributeProto::INT)
+      .Attr("producer_instance", "Original1340 instance1006", AttributeProto::INT);
+  auto recurrence_fault_v2 = recurrence_v2;
+  recurrence_fault_v2.SetName("RecurrenceFaultExtentV2")
+      .SetDoc("Certified diagnostic-only actual retained/current recurrence pair selector and GPU mutations")
+      .Input(5, "retained_extent", "Actual retained GPU sidecar, never host decoded", "tensor(uint32)")
+      .Input(6, "retained_x", "Actual retained GPU carrier", "tensor(float)")
+      .Attr("fault_case", "Closed diagnostic GPU mutation case", AttributeProto::INT, int64_t{0});
+  ONNX_NAMESPACE::RegisterSchema(std::move(recurrence_fault_v2), 0, true, true);
+  ONNX_NAMESPACE::RegisterSchema(std::move(recurrence_v2), 0, true, true);
   ONNX_NAMESPACE::RegisterSchema(std::move(recurrence),0,true,true);
+  auto recurrence_packet = OpSchema().SetName("RecurrenceTerminalPacketV1").SetDomain(domain).SinceVersion(1).SetDoc("Terminal administrative observation of completed original1340 recurrent diagnostic cut").Input(0, "extent", "RecurrenceExtentV2 final schema2 sidecar", "tensor(uint32)").Input(1, "merged", "Actual paired merged1343 output", "tensor(float)").Output(0, "packet", "Terminal status/rank/dimensions only", "tensor(uint32)").Attr("source_role", "Recurrence role5", AttributeProto::INT).Attr("source_instance", "Original1340 instance1006", AttributeProto::INT);
+  ONNX_NAMESPACE::RegisterSchema(std::move(recurrence_packet), 0, true, true);
   auto resize_nearest = OpSchema().SetName("ResizeNearestExtentV1").SetDomain(domain).SinceVersion(1)
       .SetDoc("RW07 exact Resize1386 nearest asymmetric floor scale[1,1,2]")
       .Input(0,"x","Physical [1,512,Lcapacity] input","tensor(float)")

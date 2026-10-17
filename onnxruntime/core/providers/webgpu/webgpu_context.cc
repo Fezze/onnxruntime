@@ -566,10 +566,26 @@ Status WebGpuContext::WaitForDeferredPipelineBuilds(CommandRecordingState& recor
     // A failed wait does not cancel a WaitAnyOnly callback. Its captured shared ownership keeps
     // the result state alive even if the failed dispatch is discarded.
     auto& build = *dispatch.pending_build;
+    if (ValidationMode() >= ValidationMode::Full) {
+      LOGS_DEFAULT(INFO) << "M0_RW07_PIPELINE_WAIT_BEGIN timeline=" << &recording
+                         << " program=" << build.name << " future=" << build.future.id
+                         << " key=" << dispatch.program_key;
+    }
     Status wait_status = Wait(build.future);
+    if (ValidationMode() >= ValidationMode::Full) {
+      LOGS_DEFAULT(INFO) << "M0_RW07_PIPELINE_WAIT_END timeline=" << &recording
+                         << " program=" << build.name << " future=" << build.future.id
+                         << " wait_ok=" << wait_status.IsOK();
+    }
     if (!wait_status.IsOK()) {
       result = wait_status;
       continue;
+    }
+    if (ValidationMode() >= ValidationMode::Full) {
+      LOGS_DEFAULT(INFO) << "M0_RW07_PIPELINE_CALLBACK timeline=" << &recording
+                         << " program=" << build.name << " future=" << build.future.id
+                         << " callback_present=" << bool(build.callback_context)
+                         << " callback_ok=" << (!build.callback_context || build.callback_context->status.IsOK());
     }
     if (build.callback_context && !build.callback_context->status.IsOK()) {
       result = build.callback_context->status;
@@ -608,6 +624,10 @@ Status WebGpuContext::EncodeDeferredDispatches(CommandRecordingState& recording)
 
   // Resolve every pipeline before encoding so a failed build cannot leave a partially encoded run.
   Status result = WaitForDeferredPipelineBuilds(recording);
+  if (ValidationMode() >= ValidationMode::Full) {
+    LOGS_DEFAULT(INFO) << "M0_RW07_PIPELINES_RESOLVED timeline=" << &recording
+                       << " count=" << recording.deferred_dispatches.size() << " ok=" << result.IsOK();
+  }
   if (!result.IsOK()) {
     reset_deferred_state();
     return result;
@@ -629,6 +649,11 @@ Status WebGpuContext::EncodeDeferredDispatches(CommandRecordingState& recording)
     }
   }
 
+  if (ValidationMode() >= ValidationMode::Full) {
+    LOGS_DEFAULT(INFO) << "M0_RW07_DISPATCHES_ENCODED timeline=" << &recording
+                       << " count=" << recording.deferred_dispatches.size()
+                       << " pending_dispatches=" << recording.num_pending_dispatches;
+  }
   reset_deferred_state();
   return result;
 }
