@@ -5,6 +5,8 @@
 
 #include <filesystem>
 #include <mutex>
+#include <string>
+#include "core/session/plugin_ep/m0_kernel_creator_binding_v1.h"
 
 #include "core/session/plugin_ep/ep_library.h"
 #include "core/session/plugin_ep/ep_library_plugin_utils.h"
@@ -37,6 +39,11 @@ class EpLibraryPlugin : public EpLibrary {
   ORT_DISALLOW_COPY_AND_ASSIGNMENT(EpLibraryPlugin);
 
  private:
+  friend class M0OriginalLstmModuleV1;
+  Status M0LoadOriginalLstmV1();
+  Status M0QueryOriginalLstmV1(M0PluginKernelCreatorBindingV1& binding);
+  void* m0_query_v1_ = nullptr;
+  std::string m0_module_lease_key_;
   size_t GetFactoryCount() const override {
     return factories_.size();
   }

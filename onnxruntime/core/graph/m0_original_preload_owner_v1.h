@@ -49,6 +49,7 @@ class M0OriginalPreloadOwnerV1 final {
   friend class InferenceContextImpl;
   friend class DataPropagationContextImpl;
   friend class InferenceSession;
+  friend class M0OriginalLstmSelectionV1;
   friend struct std::default_delete<M0OriginalPreloadOwnerV1>;
   friend M0OriginalPreloadReceiptV1 M0RunFixedOriginalPreloadV1();
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && !defined(ORT_MINIMAL_BUILD)
@@ -56,6 +57,11 @@ class M0OriginalPreloadOwnerV1 final {
   friend size_t M0QualifyWholeRetirementV1(std::string_view bytes);
   static M0WholeDescriptorRulesReceiptV1 QualifyWholeRules(std::string_view bytes);
   static size_t QualifyWholeRetirement(std::string_view bytes);
+  void BeginSelectedLstmConstructorsV1(uint64_t generation);
+  void FinishSelectedLstmConstructorsV1(uint64_t generation);
+  void AbortSelectedLstmConstructorsV1() noexcept;
+  uint64_t selection_generation_v1_ = 0;
+  bool selection_active_v1_ = false;
 #endif
   using Adapters = M0OriginalPreloadAdaptersV1;
   using Functions = M0OriginalFunctionDescriptorsV1;

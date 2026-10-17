@@ -5,11 +5,16 @@
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include "core/providers/webgpu/shader_helper.h"
 #include "core/providers/webgpu/webgpu_supported_types.h"
+
+#if defined(__ANDROID__) && defined(ORT_USE_EP_API_ADAPTERS) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
+#include "core/session/plugin_ep/m0_kernel_creator_binding_v1.h"
+#endif
 
 namespace onnxruntime {
 namespace webgpu {
@@ -46,6 +51,11 @@ Lstm::Lstm(const OpKernelInfo& info) : WebGpuKernel(info) {
   }
   info.GetAttrOrDefault("input_forget", &input_forget_, static_cast<int64_t>(0));
   info.GetAttrOrDefault("layout", &layout_, static_cast<int64_t>(0));
+  ORT_ENFORCE(hidden_size_ > 0 && hidden_size_ <= std::numeric_limits<uint32_t>::max() / 8,
+              "LSTM: hidden_size exceeds the WebGPU indexing range.");
+  ORT_ENFORCE(layout_ == 0 || layout_ == 1, "LSTM: layout must be 0 or 1.");
+  ORT_ENFORCE(direction_ == "forward" || direction_ == "reverse" || direction_ == "bidirectional",
+              "LSTM: unsupported direction.");
   int num_directions = (direction_ == "bidirectional") ? 2 : 1;
   if (!info.GetAttrs("activations", activations_).IsOK() || activations_.empty()) {
     activations_.clear();
@@ -112,14 +122,34 @@ Status LstmCellProgram::GenerateShaderCode(ShaderHelper& shader) const {
 
   shader.AdditionalImplementation()
       << "fn sigmoid_f(v: f32) -> f32 {\n"
-      << "  let clamped = clamp(v, -20.0, 20.0);\n"
-      << "  return 1.0 / (1.0 + exp(-clamped));\n"
+      << "  let bits = bitcast<u32>(v);\n"
+      << "  let magnitude = bits & 0x7fffffffu;\n"
+      << "  if (magnitude > 0x7f800000u) { return v; }\n"
+      << "  if (magnitude == 0x7f800000u) { return select(0.0, 1.0, (bits & 0x80000000u) == 0u); }\n"
+      << "  if (v >= 0.0) { return 1.0 / (1.0 + exp(-v)); }\n"
+      << "  let e = exp(v);\n"
+      << "  return e / (1.0 + e);\n"
       << "}\n"
       << "fn tanh_f(v: f32) -> f32 {\n"
-      << "  let clamped = clamp(v, -10.0, 10.0);\n"
-      << "  return tanh(clamped);\n"
+      << "  let bits = bitcast<u32>(v);\n"
+      << "  let magnitude = bits & 0x7fffffffu;\n"
+      << "  if (magnitude > 0x7f800000u) { return v; }\n"
+      << "  if (magnitude == 0x7f800000u) { return select(-1.0, 1.0, (bits & 0x80000000u) == 0u); }\n"
+      << "  return tanh(v);\n"
       << "}\n"
       << "fn relu_f(v: f32) -> f32 { return max(0.0, v); }\n\n";
+
+  // Match the pinned CPU gate boundary. Without an explicit clip, every finite
+  // value passes unchanged; only the CPU's nonfinite endpoint rules apply.
+  shader.AdditionalImplementation()
+      << "fn lstm_gate_input(v: f32) -> f32 {\n"
+      << "  let magnitude = bitcast<u32>(v) & 0x7fffffffu;\n"
+      << "  let bound = " << (has_clip_ ? "uniforms.clip_value" : "bitcast<f32>(0x7f7fffffu)") << ";\n"
+      << "  if (magnitude > 0x7f800000u) { return " << (has_bias_ ? "bound" : "v") << "; }\n"
+      << "  if (v > bound) { return bound; }\n"
+      << "  if (v < -bound) { return -bound; }\n"
+      << "  return v;\n"
+      << "}\n";
 
   auto& body = shader.MainFunctionBody();
 
@@ -184,15 +214,6 @@ Status LstmCellProgram::GenerateShaderCode(ShaderHelper& shader) const {
        << "    gate_c += hv * f32(r[r_base + (3u * H + j) * H + k]);\n"
        << "  }\n\n";
 
-  // Bias
-  if (has_bias_) {
-    body << "  let bb = dir * 8u * H;\n"
-         << "  gate_i += f32(b[bb + j]) + f32(b[bb + 4u * H + j]);\n"
-         << "  gate_o += f32(b[bb + H + j]) + f32(b[bb + 5u * H + j]);\n"
-         << "  gate_f += f32(b[bb + 2u * H + j]) + f32(b[bb + 6u * H + j]);\n"
-         << "  gate_c += f32(b[bb + 3u * H + j]) + f32(b[bb + 7u * H + j]);\n\n";
-  }
-
   // c_prev (flat [batch, H])
   body << "  let c_base = batch_idx * H;\n"
        << "  let cpv = f32(c_prev[c_base + j]);\n\n";
@@ -204,13 +225,16 @@ Status LstmCellProgram::GenerateShaderCode(ShaderHelper& shader) const {
          << "  gate_f += f32(p[pb + 2u * H + j]) * cpv;\n\n";
   }
 
-  // Clip
-  if (has_clip_) {
-    body << "  gate_i = clamp(gate_i, -uniforms.clip_value, uniforms.clip_value);\n"
-         << "  gate_o = clamp(gate_o, -uniforms.clip_value, uniforms.clip_value);\n"
-         << "  gate_f = clamp(gate_f, -uniforms.clip_value, uniforms.clip_value);\n"
-         << "  gate_c = clamp(gate_c, -uniforms.clip_value, uniforms.clip_value);\n\n";
+  // The CPU adds each fused bias after its peephole, then normalizes once.
+  if (has_bias_) {
+    body << "  let bb = dir * 8u * H;\n"
+         << "  gate_i += f32(b[bb + j]) + f32(b[bb + 4u * H + j]);\n"
+         << "  gate_f += f32(b[bb + 2u * H + j]) + f32(b[bb + 6u * H + j]);\n"
+         << "  gate_c += f32(b[bb + 3u * H + j]) + f32(b[bb + 7u * H + j]);\n";
   }
+  body << "  gate_i = lstm_gate_input(gate_i);\n"
+       << "  gate_f = lstm_gate_input(gate_f);\n"
+       << "  gate_c = lstm_gate_input(gate_c);\n\n";
 
   // Gate activations
   body << "  gate_i = " << f_activation_fn_ << "(gate_i);\n"
@@ -227,11 +251,11 @@ Status LstmCellProgram::GenerateShaderCode(ShaderHelper& shader) const {
   // Peephole for output gate (uses C_t, not C_{t-1})
   if (has_peephole_) {
     body << "  gate_o += f32(p[pb + H + j]) * cu;\n";
-    if (has_clip_) {
-      body << "  gate_o = clamp(gate_o, -uniforms.clip_value, uniforms.clip_value);\n";
-    }
-    body << "\n";
   }
+  if (has_bias_) {
+    body << "  gate_o += f32(b[bb + H + j]) + f32(b[bb + 5u * H + j]);\n";
+  }
+  body << "  gate_o = lstm_gate_input(gate_o);\n\n";
 
   // Output gate and hidden state
   body << "  gate_o = " << f_activation_fn_ << "(gate_o);\n"
@@ -305,6 +329,7 @@ Status Lstm::ComputeInternal(ComputeContext& context) const {
                 "LSTM: X, W, R are required inputs.");
 
   const auto& X_shape = X->Shape();
+  ORT_RETURN_IF(X_shape.NumDimensions() != 3, "LSTM: Input X must have rank 3.");
   int num_directions = (direction_ == "bidirectional") ? 2 : 1;
   int64_t seq_length, batch_size, input_size;
   if (layout_ == 0) {
@@ -332,6 +357,24 @@ Status Lstm::ComputeInternal(ComputeContext& context) const {
                 "}. Actual: ", R_shape);
 
   uint32_t H = static_cast<uint32_t>(hidden_size_);
+  ORT_RETURN_IF(batch_size > std::numeric_limits<uint32_t>::max() / H ||
+                    seq_length > std::numeric_limits<uint32_t>::max() ||
+                    input_size > std::numeric_limits<uint32_t>::max(),
+                "LSTM: Input dimensions exceed the WebGPU indexing range.");
+  if (B) {
+    ORT_RETURN_IF(B->Shape() != TensorShape({num_directions, 8 * hidden_size_}),
+                  "LSTM: Input B has an invalid shape.");
+  }
+  const TensorShape expected_state = layout_ == 0 ? TensorShape({num_directions, batch_size, hidden_size_})
+                                                  : TensorShape({batch_size, num_directions, hidden_size_});
+  ORT_RETURN_IF((initial_h && initial_h->Shape() != expected_state) ||
+                    (initial_c && initial_c->Shape() != expected_state),
+                "LSTM: Initial state has an invalid shape.");
+  ORT_RETURN_IF(P && P->Shape() != TensorShape({num_directions, 3 * hidden_size_}),
+                "LSTM: Input P has an invalid shape.");
+  ORT_RETURN_IF(sequence_lens && (sequence_lens->Shape() != TensorShape({batch_size}) ||
+                                  !sequence_lens->IsDataType<int32_t>()),
+                "LSTM: sequence_lens must be an INT32 vector of batch_size elements.");
 
   // Output shapes
   TensorShape Y_shape, Y_h_shape, Y_c_shape;
@@ -360,7 +403,9 @@ Status Lstm::ComputeInternal(ComputeContext& context) const {
   uint32_t total_threads = static_cast<uint32_t>(batch_size) * H;
   uint32_t wg_size = std::min(total_threads, 256u);
   if (wg_size == 0) wg_size = 1;
-  uint32_t num_groups = (total_threads + wg_size - 1) / wg_size;
+  uint32_t num_groups = total_threads / wg_size + static_cast<uint32_t>(total_threads % wg_size != 0);
+  ORT_RETURN_IF(num_groups > context.DeviceLimits().maxComputeWorkgroupsPerDimension,
+                "LSTM: Dispatch exceeds the device workgroup limit.");
 
   // sequence_lens is on GPU (no InputMemoryType CPU override)
   bool has_seq_lens = (sequence_lens != nullptr);
@@ -406,10 +451,13 @@ Status Lstm::ComputeInternal(ComputeContext& context) const {
     return context.RunProgram(prog);
   };
 
-  // Check if the cell program would exceed storage buffer limits (max 10).
+  // Split Y only when the actual device cannot bind it in the cell program.
   // Base bindings: x, w, r, h_prev, c_prev (5 inputs) + h_new, c_new (2 outputs) = 7.
   int cell_bindings = 7 + (B != nullptr ? 1 : 0) + (P != nullptr ? 1 : 0) + (has_seq_lens ? 1 : 0) + (has_Y ? 1 : 0);
-  bool split_y = (cell_bindings > 10) && has_Y;
+  const uint32_t binding_limit = context.DeviceLimits().maxStorageBuffersPerShaderStage;
+  ORT_RETURN_IF(static_cast<uint32_t>(cell_bindings - (has_Y ? 1 : 0)) > binding_limit,
+                "LSTM: Cell state exceeds the device storage-buffer limit.");
+  bool split_y = static_cast<uint32_t>(cell_bindings) > binding_limit && has_Y;
   bool cell_has_Y = has_Y && !split_y;
 
   for (int dir = 0; dir < num_directions; dir++) {
@@ -553,6 +601,31 @@ ONNX_OPERATOR_KERNEL_EX(
         .TypeConstraint("T", DataTypeImpl::GetTensorType<float>())
         .TypeConstraint("T1", DataTypeImpl::GetTensorType<int32_t>()),
     Lstm);
+
+#if defined(__ANDROID__) && defined(ORT_USE_EP_API_ADAPTERS) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
+// The EP API must already be initialized by this module's factory. Construct registration metadata
+// only: the LSTM creator, kernel constructor, PrePack, and compute are never invoked here.
+extern "C" ORT_EXPORT int ORT_API_CALL OrtM0WebGpuLstm14CreatorBindingV1(
+    uint32_t abi, M0PluginKernelCreatorBindingV1* output) noexcept {
+  if (abi != 1 || output == nullptr) {
+    return 0;
+  }
+  try {
+    const auto create_info =
+        BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kOnnxDomain, 14, LSTM)>();
+    if (create_info.kernel_create_func == nullptr) {
+      return 0;
+    }
+    // Match the adapter registry's Register conversion exactly, without calling CreateKernel.
+    const M0PluginKernelCreatorBindingV1 binding{
+        ep::adapter::KernelRegistry::CreateKernel, reinterpret_cast<void*>(create_info.kernel_create_func)};
+    *output = binding;
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+}
+#endif
 
 }  // namespace webgpu
 }  // namespace onnxruntime

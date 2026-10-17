@@ -393,6 +393,7 @@ class Model {
   friend class M0SyntheticOwnerV1;
   friend class M0SyntheticOwnerFactoryV1;
   friend class M0OriginalPreloadOwnerV1;
+  friend class M0OriginalLstmSelectionV1;
   friend M0OriginalPreloadReceiptV1 M0RunFixedOriginalPreloadV1();
   friend class InferenceContextImpl;
   friend class DataPropagationContextImpl;

@@ -511,6 +511,33 @@ Status M0OriginalThreadProfileOptionsV1(const SessionOptions& options) {
 }
 }  // namespace
 
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && !defined(ORT_MINIMAL_BUILD)
+common::Status InferenceSession::M0ValidateOriginalSelectionOptionsV1() const {
+  ORT_RETURN_IF_NOT(m0_fullgpu_strict_requested_v1_ && M0FullGpuPreinitRequestedV1(session_options_),
+                    "RW07_PREINIT_DENY_INTENT_MUTATION");
+  ORT_RETURN_IF_ERROR(M0FullGpuValidatePreinitOptionsV1(session_options_));
+  ORT_RETURN_IF_ERROR(M0FullGpuValidateIngressAuthoritiesV1(session_options_));
+  ORT_RETURN_IF_ERROR(M0OriginalThreadProfileOptionsV1(session_options_));
+  ORT_RETURN_IF_NOT(session_options_.load_cancellation_flag && !session_options_.load_cancellation_flag->load(),
+                    "RW07_LSTM_SELECTION_CANCELLED");
+  ORT_RETURN_IF_NOT(!external_intra_op_thread_pool_ && !external_inter_op_thread_pool_ &&
+                        custom_registries_.empty() && custom_schema_registries_.empty() &&
+                        execution_providers_.GetIds().empty() && session_options_.free_dimension_overrides.empty() &&
+                        session_options_.optimized_model_filepath.empty() && model_location_.empty(),
+                    "RW07_LSTM_SELECTION_SESSION_AUTHORITY");
+  const auto model_config = Env::Default().GetEnvironmentVar(inference_session_utils::kOrtLoadConfigFromModelEnvVar);
+  ORT_RETURN_IF_NOT(model_config.empty() || model_config == "0", "RW07_PREINIT_DENY_ENVIRONMENT");
+  for (const auto& [key, value] : session_options_.config_options.GetConfigOptionsMap()) {
+    ORT_RETURN_IF_NOT(value == "1" &&
+                          (key == "m0.fullgpu.preinit_admission_v1" || key == "m0.fullgpu.preinit_abi_v1" ||
+                           key == "session.disable_prepacking" || key == "session.disable_aot_function_inlining" ||
+                           key == "session.disable_cpu_ep_fallback"),
+                      "RW07_LSTM_SELECTION_CONFIG");
+  }
+  return Status::OK();
+}
+#endif
+
 void InferenceSession::ConstructorCommon(const SessionOptions& session_options,
                                          const Environment& session_env) {
   if (m0_fullgpu_strict_requested_v1_) {

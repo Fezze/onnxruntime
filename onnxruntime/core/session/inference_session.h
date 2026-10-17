@@ -796,6 +796,10 @@ class InferenceSession {
 
  private:
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(InferenceSession);
+  friend class M0OriginalLstmSelectionV1;
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && !defined(ORT_MINIMAL_BUILD)
+  common::Status M0ValidateOriginalSelectionOptionsV1() const;
+#endif
 
   // Maximum number of internal run attempts allowed (within a single session.Run()) for EP graph capture.
   // If the number of run attempts exceeds this limit, the session.Run() returns an error status.

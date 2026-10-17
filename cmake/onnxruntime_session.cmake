@@ -55,6 +55,11 @@ source_group(TREE ${REPO_ROOT} FILES ${onnxruntime_session_srcs})
 onnxruntime_add_static_library(onnxruntime_session ${onnxruntime_session_srcs})
 onnxruntime_add_include_to_target(onnxruntime_session onnxruntime_common onnxruntime_framework onnxruntime_lora onnx onnx_proto ${PROTOBUF_LIB} flatbuffers::flatbuffers Boost::mp11 safeint_interface nlohmann_json::nlohmann_json Eigen3::Eigen)
 target_link_libraries(onnxruntime_session PRIVATE onnxruntime_lora)
+# The provider digest is generated after its final strip, in the session-only build layer.
+target_include_directories(onnxruntime_session PRIVATE
+  ${MODEL_PACKAGE_LIB_DIR}/src
+  ${CMAKE_CURRENT_BINARY_DIR}/m0-qualified-provider)
+
 if(TARGET model_package)
   target_link_libraries(onnxruntime_session PRIVATE model_package)
   target_include_directories(onnxruntime_session PRIVATE ${MODEL_PACKAGE_LIB_DIR}/include)

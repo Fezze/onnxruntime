@@ -259,10 +259,25 @@ class PluginEpKernelCreateFunctor {
     return Status::OK();
   }
 
+  bool InspectM0BindingV1(M0PluginKernelCreatorBindingV1& output) const noexcept {
+    if (kernel_create_func_ == nullptr || kernel_create_func_state_ == nullptr) {
+      return false;
+    }
+    const M0PluginKernelCreatorBindingV1 binding{kernel_create_func_, kernel_create_func_state_};
+    output = binding;
+    return true;
+  }
+
  private:
   OrtKernelCreateFunc kernel_create_func_ = nullptr;
   void* kernel_create_func_state_ = nullptr;
 };
+
+bool M0InspectPluginKernelCreatorV1(const KernelCreateInfo& create_info,
+                                    M0PluginKernelCreatorBindingV1& output) noexcept {
+  const auto* functor = create_info.kernel_create_func.target<PluginEpKernelCreateFunctor>();
+  return functor != nullptr && functor->InspectM0BindingV1(output);
+}
 
 // Make a KernelCreateInfo for a plugin EP's kernel
 KernelCreateInfo MakePluginEpKernelCreateInfo(const KernelDef* kernel_def,

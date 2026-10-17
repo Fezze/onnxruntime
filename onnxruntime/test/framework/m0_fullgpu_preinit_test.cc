@@ -29,6 +29,8 @@
 #include "core/providers/cpu/cpu_execution_provider.h"
 #include "core/session/onnxruntime_session_options_config_keys.h"
 #include "core/session/inference_session.h"
+#include "core/session/m0_original_lstm_selection_v1.h"
+#include "test/unittest_util/test_dynamic_plugin_ep.h"
 #include "core/session/abi_session_options_impl.h"
 #include "core/session/ort_apis.h"
 #include "core/session/utils.h"
@@ -3213,5 +3215,61 @@ TEST(M0OriginalPreload, OriginalBufferLoaderRejectsCancellationConfigAndExternal
     }
   }
 }
+#if defined(__ANDROID__)
+TEST(M0OriginalSelection, OriginalSixNativeSelectedConstructorsRetireWithoutModelAllocation) {
+  const char* path = std::getenv("ORT_M0_ORIGINAL_MODEL");
+  if (!path) GTEST_SKIP() << "Original artifact path required for native creator selection";
+  std::ifstream input(path, std::ios::binary | std::ios::ate);
+  ASSERT_TRUE(input.is_open());
+  ASSERT_EQ(input.tellg(), std::streampos(325532387));
+  std::string bytes(325532387, '\0');
+  input.seekg(0);
+  input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  ASSERT_TRUE(input.good());
+  ASSERT_TRUE(dynamic_plugin_ep_infra::IsInitialized());
+  {
+    InferenceSession session(StrictIngressOptions(), GetEnvironment());
+    ASSERT_STATUS_OK(session.Load(bytes.data(), static_cast<int>(bytes.size())));
+    auto saved = session.GetMutableSessionOptions();
+    ASSERT_STATUS_OK(session.GetMutableSessionOptions().config_options.AddConfigEntry("session.unreviewed_option", "1"));
+    try {
+      M0QualifyOriginalLstmSelectionV1(session);
+      FAIL() << "Changed options must refuse before opening the source module";
+    } catch (const OnnxRuntimeException& error) {
+      EXPECT_NE(std::string(error.what()).find("RW07_LSTM_SELECTION_CONFIG"), std::string::npos);
+    }
+    session.GetMutableSessionOptions() = saved;
+    saved.SetLoadCancellationFlag(true);
+    try {
+      M0QualifyOriginalLstmSelectionV1(session);
+      FAIL() << "Cancelled selection must refuse before opening the source module";
+    } catch (const OnnxRuntimeException& error) {
+      EXPECT_NE(std::string(error.what()).find("RW07_LSTM_SELECTION_CANCELLED"), std::string::npos);
+    }
+    saved.SetLoadCancellationFlag(false);
+    try {
+      M0QualifyOriginalLstmSelectionV1(session);
+      FAIL() << "A generic provider lease must refuse private source capture";
+    } catch (const OnnxRuntimeException& error) {
+      EXPECT_NE(std::string(error.what()).find("RW07_LSTM_MODULE_FOREIGN_LOAD"), std::string::npos);
+    }
+    EXPECT_THROW(M0QualifyOriginalLstmSelectionV1(session), OnnxRuntimeException);
+  }
+  // This group runs in its own native process with physical/nonvirtual startup.
+  dynamic_plugin_ep_infra::Shutdown();
+  ASSERT_FALSE(dynamic_plugin_ep_infra::IsInitialized());
+  InferenceSession session(StrictIngressOptions(), GetEnvironment());
+  ASSERT_STATUS_OK(session.Load(bytes.data(), static_cast<int>(bytes.size())));
+  const auto receipt = M0QualifyOriginalLstmSelectionV1(session);
+  EXPECT_EQ(receipt.selected, 6u);
+  EXPECT_EQ(receipt.rejected_binding_mutations, 3u);
+  EXPECT_EQ(receipt.rejected_foreign_functors, 2u);
+  EXPECT_EQ(receipt.constructed, 6u);
+  EXPECT_EQ(receipt.released, 6u);
+  EXPECT_EQ(receipt.retired, 1u);
+  EXPECT_TRUE(session.GetModel().MainGraph().GetNode(449)->GetExecutionProviderType().empty());
+  ExpectPreloadDenial(session.Initialize());
+}
+#endif
 }  // namespace onnxruntime::test
 #endif

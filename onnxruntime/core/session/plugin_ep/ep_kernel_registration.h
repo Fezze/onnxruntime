@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include "core/session/plugin_ep/m0_kernel_creator_binding_v1.h"
 #include "core/common/inlined_containers_fwd.h"
 #include "core/session/onnxruntime_c_api.h"
 #include "core/framework/allocator.h"
@@ -57,6 +58,11 @@ struct OrtSharedPrePackedWeightCache {
 };
 
 namespace onnxruntime {
+
+// Inspect only the native plugin functor type; never invoke its callback. Unknown functors or
+// null bindings refuse without changing output. A returned pair grants no execution authority.
+bool M0InspectPluginKernelCreatorV1(const KernelCreateInfo& create_info,
+                                    M0PluginKernelCreatorBindingV1& output) noexcept;
 
 /// <summary>
 /// Make a KernelCreateInfo for a plugin EP's kernel. A KernelCreateInfo contains the function and state

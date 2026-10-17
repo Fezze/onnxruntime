@@ -8403,6 +8403,53 @@ class M0OriginalPreloadOwnerV1::WholeModel final {
 M0OriginalPreloadOwnerV1::M0OriginalPreloadOwnerV1(std::unique_ptr<M0WholeModelSealV1> seal)
     : whole_(new WholeModel(std::move(seal))), recipe_{} {}
 M0OriginalPreloadOwnerV1::~M0OriginalPreloadOwnerV1() = default;
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+void M0OriginalPreloadOwnerV1::BeginSelectedLstmConstructorsV1(uint64_t generation) {
+  ORT_ENFORCE(whole_ && model_ && graph_ && stage_ == 7 && !active_ && !poisoned_ &&
+                  generation && !selection_generation_v1_ && !selection_active_v1_,
+              "RW07_LSTM_SELECTION_OWNER_OR_REUSE");
+  selection_generation_v1_ = generation;
+  selection_active_v1_ = true;
+  try {
+    active_ = true;
+    whole_->Finalize(*this);
+    for (const auto index : std::array<size_t, 6>{449, 1260, 1274, 1288, 1303, 1340}) {
+      const auto* node = graph_->GetNode(index);
+      ORT_ENFORCE(node && node->OpType() == "LSTM" && node->Domain().empty() &&
+                      node->GetExecutionProviderType().empty() && node->InputDefs().size() == 7 &&
+                      !node->InputDefs()[4]->Exists() && node->InputDefs()[5] == node->InputDefs()[6] &&
+                      node->OutputDefs().size() == 3,
+                  "RW07_LSTM_SELECTION_ORIGINAL_SIX");
+    }
+    active_ = false;
+  } catch (...) {
+    AbortSelectedLstmConstructorsV1();
+    throw;
+  }
+}
+void M0OriginalPreloadOwnerV1::FinishSelectedLstmConstructorsV1(uint64_t generation) {
+  ORT_ENFORCE(selection_active_v1_ && selection_generation_v1_ == generation && !active_ && !poisoned_,
+              "RW07_LSTM_SELECTION_GENERATION");
+  try {
+    active_ = true;
+    whole_->Finalize(*this);
+    for (const auto index : std::array<size_t, 6>{449, 1260, 1274, 1288, 1303, 1340}) {
+      ORT_ENFORCE(graph_->GetNode(index)->GetExecutionProviderType().empty(),
+                  "RW07_LSTM_SELECTION_EP_MUTATION");
+    }
+    active_ = false;
+    selection_active_v1_ = false;
+  } catch (...) {
+    AbortSelectedLstmConstructorsV1();
+    throw;
+  }
+}
+void M0OriginalPreloadOwnerV1::AbortSelectedLstmConstructorsV1() noexcept {
+  active_ = false;
+  selection_active_v1_ = false;
+  poisoned_ = true;
+}
+#endif
 
 // Exact original-node cut qualification shares the production source path; it
 // cannot release a Model or grant full-model preload authority.

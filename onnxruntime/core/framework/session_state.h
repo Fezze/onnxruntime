@@ -435,6 +435,7 @@ class SessionState {
 
  private:
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(SessionState);
+  friend class M0OriginalLstmSelectionV1;
 
   // Populate OrtValueNameIdxMap and create the graph viewer.
   void CreateGraphInfo(bool save_prepacked_on);
