@@ -89,6 +89,17 @@ inline void RegisterM0FullGpuExtentSchemasV1() {
   ONNX_NAMESPACE::RegisterSchema(std::move(recurrence),0,true,true);
   auto recurrence_packet = OpSchema().SetName("RecurrenceTerminalPacketV1").SetDomain(domain).SinceVersion(1).SetDoc("Terminal administrative observation of completed original1340 recurrent diagnostic cut").Input(0, "extent", "RecurrenceExtentV2 final schema2 sidecar", "tensor(uint32)").Input(1, "merged", "Actual paired merged1343 output", "tensor(float)").Output(0, "packet", "Terminal status/rank/dimensions only", "tensor(uint32)").Attr("source_role", "Recurrence role5", AttributeProto::INT).Attr("source_instance", "Original1340 instance1006", AttributeProto::INT);
   ONNX_NAMESPACE::RegisterSchema(std::move(recurrence_packet), 0, true, true);
+  auto normalization = OpSchema().SetName("NormalizationAfter1340ExtentV1").SetDomain(domain).SinceVersion(1).SetDoc("RW07 exact original1344-1350 normalization from the owned merged1343 carrier").Input(0, "merged", "Actual GPU [1,512,capacity] merged1343 carrier", "tensor(float)").Input(1, "source_extent", "Actual paired recurrence schema2 sidecar", "tensor(uint32)").Output(0, "normalized", "Original1350 physical normalized output", "tensor(float)").Output(1, "output_extent", "GPU-derived schema2 normalized sidecar", "tensor(uint32)").Attr("physical_capacity", "Host allocation capacity only", AttributeProto::INT).Attr("source_role", "Recurrence source role5", AttributeProto::INT).Attr("source_instance", "Original1340 instance1006", AttributeProto::INT).Attr("semantic_role", "Normalized role6", AttributeProto::INT).Attr("producer_instance", "Original1350 instance1007", AttributeProto::INT);
+  auto normalization_fault = normalization;
+  normalization_fault.SetName("NormalizationAfter1340FaultExtentV1")
+      .SetDoc("Certified diagnostic-only retained/current normalization pair selection and GPU mutations")
+      .Input(2, "retained_extent", "Actual retained GPU sidecar, never host decoded", "tensor(uint32)")
+      .Input(3, "retained_merged", "Actual retained GPU merged carrier", "tensor(float)")
+      .Attr("fault_case", "Closed diagnostic GPU mutation case", AttributeProto::INT, int64_t{0});
+  ONNX_NAMESPACE::RegisterSchema(std::move(normalization_fault), 0, true, true);
+  ONNX_NAMESPACE::RegisterSchema(std::move(normalization), 0, true, true);
+  auto normalization_packet = OpSchema().SetName("NormalizationAfter1340TerminalPacketV1").SetDomain(domain).SinceVersion(1).SetDoc("Fixed administrative observation of completed original1344-1350 normalization").Input(0, "extent", "Final normalized schema2 sidecar", "tensor(uint32)").Input(1, "normalized", "Actual paired original1350 carrier", "tensor(float)").Output(0, "packet", "Terminal status/rank/dimensions only", "tensor(uint32)").Attr("source_role", "Normalized role6", AttributeProto::INT).Attr("source_instance", "Original1350 instance1007", AttributeProto::INT);
+  ONNX_NAMESPACE::RegisterSchema(std::move(normalization_packet), 0, true, true);
   auto resize_nearest = OpSchema().SetName("ResizeNearestExtentV1").SetDomain(domain).SinceVersion(1)
       .SetDoc("RW07 exact Resize1386 nearest asymmetric floor scale[1,1,2]")
       .Input(0,"x","Physical [1,512,Lcapacity] input","tensor(float)")

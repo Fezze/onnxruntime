@@ -21,15 +21,18 @@ constexpr uint32_t SidecarGenerationWord = 26;
 constexpr uint32_t CarrierGenerationWord = 28;
 constexpr uint32_t ProducerRoleWord = 30;
 constexpr uint32_t ProducerInstanceWord = 31;
-constexpr uint32_t DurationRole = 1, FrameRole = 2, ReconstructionRole = 3, AlignmentRole = 4, RecurrenceRole = 5;
+constexpr uint32_t DurationRole = 1, FrameRole = 2, ReconstructionRole = 3, AlignmentRole = 4, RecurrenceRole = 5,
+                   NormalizationRole = 6;
 constexpr uint32_t DurationInstance = 1001, FrameInstance = 1002, ReconstructionInstance = 1003;
 constexpr uint32_t Alignment640Instance = 1004, Alignment512Instance = 1005, Shared1340Instance = 1006;
+constexpr uint32_t Normalized1350Instance = 1007;
 constexpr bool CertifiedProducer(uint32_t role, uint32_t instance) {
   return (role == DurationRole && instance == DurationInstance) ||
          (role == FrameRole && instance == FrameInstance) ||
          (role == ReconstructionRole && instance == ReconstructionInstance) ||
          (role == AlignmentRole && (instance == Alignment640Instance || instance == Alignment512Instance)) ||
-         (role == RecurrenceRole && instance == Shared1340Instance);
+         (role == RecurrenceRole && instance == Shared1340Instance) ||
+         (role == NormalizationRole && instance == Normalized1350Instance);
 }
 
 // These ten words are shader uniforms for comparison/stamping, NOT a device
