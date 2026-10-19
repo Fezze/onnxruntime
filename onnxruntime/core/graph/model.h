@@ -16,6 +16,7 @@
 #include "core/graph/m0_callback_policy_v1.h"
 #include "core/graph/m0_synthetic_owner_v1.h"
 #include "core/graph/m0_original_preload_owner_v1.h"
+#include "core/graph/m0_fullgpu_native_lowering_owner_v1.h"
 #include "core/graph/ort_format_load_options.h"
 #include "core/session/onnxruntime_c_api.h"
 #if !defined(ORT_MINIMAL_BUILD)
@@ -69,6 +70,9 @@ class Model {
   static constexpr Version kNoVersion = INT64_MAX;
 
   common::Status M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel channel) const {
+#if !defined(ORT_MINIMAL_BUILD)
+    if(m0_native_lowering_owner_v1_)return m0_native_lowering_owner_v1_->Callback(channel,this);
+#endif
     if (m0_callback_policy_v1_.Deny(channel)) {
       return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07_CALLBACK_DENY_UNREVIEWED_OWNER");
     }
@@ -393,6 +397,7 @@ class Model {
   friend class M0SyntheticOwnerV1;
   friend class M0SyntheticOwnerFactoryV1;
   friend class M0OriginalPreloadOwnerV1;
+  friend class M0FullGpuNativeLoweringOwnerV1;
   friend class M0OriginalLstmSelectionV1;
   friend M0OriginalPreloadReceiptV1 M0RunFixedOriginalPreloadV1();
   friend class InferenceContextImpl;
@@ -402,11 +407,13 @@ class Model {
         const IOnnxRuntimeOpSchemaRegistryList* local_registries,
         const logging::Logger& logger, const ModelOptions& options,
         std::unique_ptr<M0SyntheticOwnerV1> synthetic_owner,
-        std::unique_ptr<M0OriginalPreloadOwnerV1> original_owner = nullptr);
+        std::unique_ptr<M0OriginalPreloadOwnerV1> original_owner = nullptr,
+        M0FullGpuNativeLoweringOwnerV1* native_owner = nullptr);
 #endif
   // Const handle established before protobuf/schema/Graph construction, destroyed last.
   const std::unique_ptr<M0SyntheticOwnerV1> m0_synthetic_owner_v1_;
   const std::unique_ptr<M0OriginalPreloadOwnerV1> m0_original_preload_owner_v1_;
+  M0FullGpuNativeLoweringOwnerV1* const m0_native_lowering_owner_v1_=nullptr;
   // Must precede all per-model schema, function and graph work.
   const M0CallbackPolicyV1 m0_callback_policy_v1_;
 

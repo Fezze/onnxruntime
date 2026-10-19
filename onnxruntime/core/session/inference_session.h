@@ -58,6 +58,7 @@ class Environment;
 class GraphTransformer;
 class IExecutionProvider;
 class IOBinding;
+class M0FullGpuNativeLoweringOwnerV1;
 struct Notification;
 
 void reset_saturation_count();
@@ -797,7 +798,7 @@ class InferenceSession {
  private:
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(InferenceSession);
   friend class M0OriginalLstmSelectionV1;
-#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && !defined(ORT_MINIMAL_BUILD)
+#if !defined(ORT_MINIMAL_BUILD)
   common::Status M0ValidateOriginalSelectionOptionsV1() const;
 #endif
 
@@ -819,6 +820,11 @@ class InferenceSession {
   void ConstructorCommon(const SessionOptions& session_options,
                          const Environment& session_env);
   [[nodiscard]] common::Status HasInvalidCombinationOfExecutionProviders() const;
+  friend class M0FullGpuNativeLoweringOwnerV1;
+  common::Status M0PrepareOriginalLoweringV1(uint32_t physical_capacity);
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && !defined(ORT_MINIMAL_BUILD)
+  friend class M0NativeLoweringQualificationV1;
+#endif
   [[nodiscard]] common::Status SaveModelMetadata(const onnxruntime::Model& model);
 
 #if !defined(ORT_MINIMAL_BUILD)
@@ -1012,6 +1018,8 @@ class InferenceSession {
   mutable std::mutex session_mutex_;         // to ensure only one thread can invoke Load/Initialize
   bool is_model_loaded_ = false;             // GUARDED_BY(session_mutex_)
   bool m0_original_load_attempted_v1_ = false;  // GUARDED_BY(session_mutex_)
+  // Declared after model_: the immutable source Model outlives this receipt.
+  std::unique_ptr<M0FullGpuNativeLoweringOwnerV1> m0_native_lowering_v1_;
   bool is_inited_ = false;                   // GUARDED_BY(session_mutex_)
   bool is_concurrent_run_supported_ = true;  // Graph execution in Run is GUARDED_BY(session_mutex_) if false
 

@@ -9,6 +9,7 @@
 #include <sstream>
 
 #if !defined(ORT_MINIMAL_BUILD)
+#include "core/graph/m0_fullgpu_native_lowering_owner_v1.h"
 #include <filesystem>
 #include <fstream>
 #include "core/common/parse_string.h"
@@ -372,8 +373,23 @@ const std::vector<AllocPlanPerValue>& SessionState::GetPerValueAllocPlan() const
   return p_seq_exec_plan_->allocation_plan;
 }
 
+Status SessionState::M0BeforeImmutableInitializerV1(const std::string& name, int index,
+    const ONNX_NAMESPACE::TensorProto& proto, M0NativeInitializerVisitV1 visit) const {
+#if !defined(ORT_MINIMAL_BUILD)
+  ORT_RETURN_IF_NOT(m0_native_plan_owner_v1_, "RW07_NATIVE_UPLOAD_NO_OWNER");
+  return m0_native_plan_owner_v1_->BeforeInitializerUpload(*this, name, index, proto, visit);
+#else
+  ORT_UNUSED_PARAMETER(name); ORT_UNUSED_PARAMETER(index); ORT_UNUSED_PARAMETER(proto); ORT_UNUSED_PARAMETER(visit);
+  return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07_NATIVE_UPLOAD_UNSUPPORTED");
+#endif
+}
+
 Status SessionState::AddInitializedTensor(int ort_value_index, const OrtValue& ort_value,
                                           bool constant, bool sparse) {
+#if !defined(ORT_MINIMAL_BUILD)
+  if (m0_native_plan_owner_v1_)
+    ORT_RETURN_IF_ERROR(m0_native_plan_owner_v1_->AfterInitializerUpload(*this, ort_value_index, ort_value, constant, sparse));
+#endif
   auto p = initialized_tensors_.insert({ort_value_index, ort_value});
   if (!p.second)
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "duplicated ort_value index:", ort_value_index,
@@ -2123,6 +2139,9 @@ Status SessionState::FinalizeSessionStateImpl(const std::basic_string<PATH_CHAR_
         << " nodes=" << m0_fullgpu_preinit_snapshot_v1_->nodes.size()
         << " resources=" << m0_fullgpu_preinit_snapshot_v1_->resources.size()
         << " before_final_initializer_allocation=1 before_kernel_construction=1 before_prepack=1";
+#if !defined(ORT_MINIMAL_BUILD)
+    if (m0_native_plan_owner_v1_) return m0_native_plan_owner_v1_->CaptureExecutionPlan(*this);
+#endif
     // No complete-model source/input/resource certificate is built into this
     // revision. Observing a plan or naming an implementation cannot admit it.
     return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07_PREINIT_DENY_UNREVIEWED_CONTRACT");
@@ -2212,7 +2231,13 @@ Status SessionState::FinalizeSessionStateImpl(const std::basic_string<PATH_CHAR_
         return Status::OK();
       },
       logger_, data_transfer_mgr_, external_data_loader_mgr_, *p_seq_exec_plan_, session_options,
-      memory_profile_func, graph_.GetPrepacked()));
+      memory_profile_func, graph_.GetPrepacked(),
+#if !defined(ORT_MINIMAL_BUILD)
+      m0_native_plan_owner_v1_ ? this : nullptr
+#else
+      nullptr
+#endif
+      ));
 
 #if !defined(ORT_MINIMAL_BUILD) && defined(ORT_MEMORY_PROFILE)
   // Record Weight allocation info on device

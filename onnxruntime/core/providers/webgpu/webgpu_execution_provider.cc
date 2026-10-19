@@ -470,8 +470,52 @@ KernelCreateInfo CreateM0FullGpuRecurrenceExtentV2KernelInfo();
 KernelCreateInfo CreateM0FullGpuRecurrenceFaultExtentV2KernelInfo();
 KernelCreateInfo CreateM0FullGpuRecurrenceTerminalPacketV1KernelInfo();
 KernelCreateInfo CreateM0FullGpuNormalizationAfter1340ExtentV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuStyleAffineAfter1350ExtentV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuPredictorResidualExtentV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuPredictorTailExtentV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuPredictorTailTerminalPacketV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuPredictorResidualFaultExtentV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuPredictorResidualTerminalPacketV1KernelInfo();
+KernelCreateInfo CreateM0PredictorLstmZeroStateV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuSTFT1573DiagnosticV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuSignalAfter1487ExtentV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuSignalAfter1487TerminalPacketV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuSTFT1573ExtentV1KernelInfo();
+KernelCreateInfo CreateM0BertEmbeddingMaskV1KernelInfo();
+KernelCreateInfo CreateM0BertAttentionLayoutV1KernelInfo();
+KernelCreateInfo CreateM0TextTokenEmbeddingV1KernelInfo();
+KernelCreateInfo CreateM0TextMergeDirectionsV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuPolarAfter1573ExtentV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuPolarAfter1573TerminalPacketV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuNoiseConvAfter1597ExtentV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuNoiseConvAfter1597TerminalPacketV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuDecoderInputExtentV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuDecoderInputTerminalPacketV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuASR1334ExtentV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuASR1334TerminalPacketV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuDecoderResidualExtentV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuDecoderResidualTerminalPacketV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuDecoderConcatExtentV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuDecoderConcatTerminalPacketV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuNoiseResidualAfter1600ExtentV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuNoiseResidualAfter1600TerminalPacketV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuGeneratorUpsampleExtentV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuGeneratorJoinExtentV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuGeneratorMergeExtentV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuGeneratorProjectionExtentV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuGeneratorProjectionTerminalPacketV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuGeneratorResidualExtentV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuGeneratorResidualTerminalPacketV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuReconstructionExtentV3KernelInfo();
+KernelCreateInfo CreateM0FullGpuPCM2463TerminalPacketV3KernelInfo();
+KernelCreateInfo CreateM0FullGpuSTFT1573TerminalPacketV1KernelInfo();
+KernelCreateInfo CreateM0PredictorConcatStyleV1KernelInfo();
+KernelCreateInfo CreateM0PredictorMergeDirectionsV1KernelInfo();
+KernelCreateInfo CreateM0PredictorStyleAffineV1KernelInfo();
 KernelCreateInfo CreateM0FullGpuNormalizationAfter1340FaultExtentV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuStyleAffineAfter1350FaultExtentV1KernelInfo();
 KernelCreateInfo CreateM0FullGpuNormalizationAfter1340TerminalPacketV1KernelInfo();
+KernelCreateInfo CreateM0FullGpuStyleAffineAfter1350TerminalPacketV1KernelInfo();
 KernelCreateInfo CreateM0FullGpuResizeNearestExtentKernelInfo();
 KernelCreateInfo CreateM0FullGpuResizeLinearExtentKernelInfo();
 KernelCreateInfo CreateM0FullGpuTemporalProjectionExtentKernelInfo();
@@ -509,8 +553,52 @@ std::unique_ptr<KernelRegistry> RegisterKernels(bool enable_graph_capture, bool 
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuRecurrenceFaultExtentV2KernelInfo()));
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuRecurrenceTerminalPacketV1KernelInfo()));
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuNormalizationAfter1340ExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuStyleAffineAfter1350ExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuPredictorResidualExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuPredictorTailExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuPredictorTailTerminalPacketV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuPredictorResidualFaultExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuPredictorResidualTerminalPacketV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0PredictorLstmZeroStateV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuSTFT1573DiagnosticV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuSignalAfter1487ExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuSignalAfter1487TerminalPacketV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuSTFT1573ExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0BertEmbeddingMaskV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0BertAttentionLayoutV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0TextTokenEmbeddingV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0TextMergeDirectionsV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuPolarAfter1573ExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuPolarAfter1573TerminalPacketV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuNoiseConvAfter1597ExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuNoiseConvAfter1597TerminalPacketV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuDecoderInputExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuDecoderInputTerminalPacketV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuASR1334ExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuASR1334TerminalPacketV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuDecoderResidualExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuDecoderResidualTerminalPacketV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuDecoderConcatExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuDecoderConcatTerminalPacketV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuNoiseResidualAfter1600ExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuNoiseResidualAfter1600TerminalPacketV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuGeneratorUpsampleExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuGeneratorJoinExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuGeneratorMergeExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuGeneratorProjectionExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuGeneratorProjectionTerminalPacketV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuGeneratorResidualExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuGeneratorResidualTerminalPacketV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuReconstructionExtentV3KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuPCM2463TerminalPacketV3KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuSTFT1573TerminalPacketV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0PredictorConcatStyleV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0PredictorMergeDirectionsV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0PredictorStyleAffineV1KernelInfo()));
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuNormalizationAfter1340FaultExtentV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuStyleAffineAfter1350FaultExtentV1KernelInfo()));
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuNormalizationAfter1340TerminalPacketV1KernelInfo()));
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuStyleAffineAfter1350TerminalPacketV1KernelInfo()));
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuResizeNearestExtentKernelInfo()));
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuResizeLinearExtentKernelInfo()));
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuTemporalProjectionExtentKernelInfo()));
@@ -1117,8 +1205,28 @@ Status WebGpuExecutionProvider::OnRunEnd(bool sync_stream, const onnxruntime::Ru
     catch (...) {}
   });
   ORT_RETURN_IF_NOT(!strict_ownership || sync_stream, "RW07 strict ownership requires checked completion");
+  if (strict_ownership && m0_fault_mode_v2_ == 21) {
+    webgpu::M0FullGpuFaultModeV2 actual_mode;
+    ORT_RETURN_IF_NOT(m0_fault_session_v2_ && m0_fault_run_v2_ &&
+                         context_.M0FaultHooksV2().Mode(m0_fault_session_v2_, m0_fault_run_v2_, actual_mode) &&
+                         actual_mode == webgpu::M0FullGpuFaultModeV2::DestroyDeviceAtEnd,
+                     "RW07 device-loss diagnostic requires actual active Run ticket");
+    // Destructive diagnostic: the harness must isolate it as the final GPU Run
+    // in this process. The ordinary checked-completion path must observe actual
+    // device loss; an injected return code or ownership poison is insufficient.
+    context_.Device().Destroy();
+    LOGS_DEFAULT(INFO) << "M0_RW07_ACTUAL_DEVICE_DESTROY session=" << m0_fault_session_v2_
+                      << " run=" << m0_fault_run_v2_ << " mode=21";
+  }
+  if (strict_ownership && m0_fault_mode_v2_ == 22) {
+    webgpu::M0FullGpuFaultModeV2 actual_mode;
+    ORT_RETURN_IF_NOT(m0_fault_session_v2_ && m0_fault_run_v2_ &&
+                         context_.M0FaultHooksV2().Mode(m0_fault_session_v2_, m0_fault_run_v2_, actual_mode) &&
+                         actual_mode == webgpu::M0FullGpuFaultModeV2::ZeroDeadlineAtEnd,
+                     "RW07 queue-deadline diagnostic requires actual active Run ticket");
+  }
   Status flush_status = strict_ownership
-      ? context_.FlushAndWaitChecked(BufferManager(), *recording_)
+      ? context_.FlushAndWaitChecked(BufferManager(), *recording_, m0_fault_mode_v2_ == 22)
       : context_.Flush(BufferManager(), *recording_);
   if (strict_ownership && flush_status.IsOK()) {
     LOGS_DEFAULT(INFO) << "M0_RW07_RUN_QUEUE_COMPLETE timeline=" << recording_.get();

@@ -189,6 +189,19 @@ std::shared_ptr<KernelRegistry> M0OriginalLstmModuleV1::Registry() const {
   impl_->file.Verify();
   return impl_->registry;
 }
+std::array<M0NativeProviderKernelBindingV2,42> M0OriginalLstmModuleV1::NativeBindingsV2() const {
+  impl_->file.Verify();
+  std::array<M0NativeProviderKernelBindingV2,42> result;
+  for(const auto& record:kM0NativeKernelRecordsV2)
+    ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeKernelV2(record.id,result[record.id-1]));
+  impl_->file.Verify();return result;
+}
+M0NativeResourceBindingV3 M0OriginalLstmModuleV1::NativeResourceV3(uintptr_t handle,uint64_t required_bytes)const{
+ impl_->file.Verify();M0NativeResourceBindingV3 result;
+ ORT_ENFORCE(impl_->provider&&impl_->provider->GetOrtEp(),"RW07_NATIVE_RESOURCE_OWNED_EP");
+ ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeResourceV3(impl_->provider->GetOrtEp(),handle,required_bytes,result));
+ impl_->file.Verify();return result;
+}
 const M0PluginKernelCreatorBindingV1& M0OriginalLstmModuleV1::Binding() const {
   impl_->file.Verify();
   return impl_->binding;
@@ -204,5 +217,7 @@ PluginExecutionProvider& M0OriginalLstmModuleV1::Provider() const { ORT_THROW("R
 const ExecutionProviders& M0OriginalLstmModuleV1::Providers() const { ORT_THROW("RW07_LSTM_MODULE_UNSUPPORTED"); }
 std::shared_ptr<KernelRegistry> M0OriginalLstmModuleV1::Registry() const { ORT_THROW("RW07_LSTM_MODULE_UNSUPPORTED"); }
 const M0PluginKernelCreatorBindingV1& M0OriginalLstmModuleV1::Binding() const { ORT_THROW("RW07_LSTM_MODULE_UNSUPPORTED"); }
+std::array<M0NativeProviderKernelBindingV2,42> M0OriginalLstmModuleV1::NativeBindingsV2() const { ORT_THROW("RW07_NATIVE_MODULE_UNSUPPORTED"); }
+M0NativeResourceBindingV3 M0OriginalLstmModuleV1::NativeResourceV3(uintptr_t,uint64_t)const { ORT_THROW("RW07_NATIVE_RESOURCE_UNSUPPORTED"); }
 }  // namespace onnxruntime
 #endif

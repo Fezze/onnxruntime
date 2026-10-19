@@ -30,6 +30,7 @@
 #include "core/framework/kernel_registry_manager.h"
 #include "core/framework/mem_pattern.h"
 #include "core/framework/m0_fullgpu_run_ownership.h"
+#include "core/framework/m0_native_initializer_visit_v1.h"
 #include "core/framework/m0_fullgpu_preinit_admission.h"
 #include "core/framework/ort_value.h"
 #include "core/framework/node_index_info.h"
@@ -59,6 +60,7 @@ namespace fbs {
 struct SessionState;
 }  // namespace fbs
 
+class M0FullGpuNativeLoweringOwnerV1;
 class ExecutionProviders;
 class MaxShapeInferenceResult;
 class KernelDef;
@@ -159,6 +161,9 @@ class SessionState {
    * as sparse tensor.
    */
   Status AddInitializedTensor(int ort_value_index, const OrtValue& ort_value, bool constant, bool sparse);
+  // Source-private phase check, not a caller-supplied callback or upload permit.
+  Status M0BeforeImmutableInitializerV1(const std::string& name, int index,
+      const ONNX_NAMESPACE::TensorProto& proto, M0NativeInitializerVisitV1 visit) const;
 
   /**
    * Gets the map of ort_value_index to initialized tensors (weights) so that it can be used by the
@@ -436,6 +441,10 @@ class SessionState {
  private:
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(SessionState);
   friend class M0OriginalLstmSelectionV1;
+  friend class M0FullGpuNativeLoweringOwnerV1;
+#if !defined(ORT_MINIMAL_BUILD)
+  M0FullGpuNativeLoweringOwnerV1* m0_native_plan_owner_v1_ = nullptr;
+#endif
 
   // Populate OrtValueNameIdxMap and create the graph viewer.
   void CreateGraphInfo(bool save_prepacked_on);

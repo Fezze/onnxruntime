@@ -22,17 +22,34 @@ constexpr uint32_t CarrierGenerationWord = 28;
 constexpr uint32_t ProducerRoleWord = 30;
 constexpr uint32_t ProducerInstanceWord = 31;
 constexpr uint32_t DurationRole = 1, FrameRole = 2, ReconstructionRole = 3, AlignmentRole = 4, RecurrenceRole = 5,
-                   NormalizationRole = 6;
+                   NormalizationRole = 6, StyleF0Role = 7, StyleN0Role = 8,
+                   ResidualF0Role = 9, ResidualN0Role = 10, PredictorF0Role = 11, PredictorNRole = 12, SignalRole = 13, SpectrumRole = 14, PolarRole = 15;
 constexpr uint32_t DurationInstance = 1001, FrameInstance = 1002, ReconstructionInstance = 1003;
 constexpr uint32_t Alignment640Instance = 1004, Alignment512Instance = 1005, Shared1340Instance = 1006;
-constexpr uint32_t Normalized1350Instance = 1007;
+constexpr uint32_t Normalized1350Instance = 1007, StyleF0Activated1355Instance = 1008, StyleN0Activated1356Instance = 1009;
+constexpr uint32_t ResidualF01383Instance = 1010, ResidualN01384Instance = 1011;
+constexpr uint32_t PredictorF01487Instance = 1012, PredictorN1488Instance = 1013, Signal1571Instance = 1014, Spectrum1573Instance = 1015, Polar1597Instance = 1016;
 constexpr bool CertifiedProducer(uint32_t role, uint32_t instance) {
   return (role == DurationRole && instance == DurationInstance) ||
          (role == FrameRole && instance == FrameInstance) ||
          (role == ReconstructionRole && instance == ReconstructionInstance) ||
          (role == AlignmentRole && (instance == Alignment640Instance || instance == Alignment512Instance)) ||
          (role == RecurrenceRole && instance == Shared1340Instance) ||
-         (role == NormalizationRole && instance == Normalized1350Instance);
+         (role == NormalizationRole && instance == Normalized1350Instance) ||
+         (role == StyleF0Role && instance == StyleF0Activated1355Instance) ||
+         (role == StyleN0Role && instance == StyleN0Activated1356Instance) ||
+         (role == ResidualF0Role && instance == ResidualF01383Instance) ||
+         (role == ResidualN0Role && instance == ResidualN01384Instance) ||
+         (role == PredictorF0Role && instance == PredictorF01487Instance) ||
+         (role == PredictorNRole && instance == PredictorN1488Instance) ||
+         (role == SignalRole && instance == Signal1571Instance) ||
+         (role == SpectrumRole && instance == Spectrum1573Instance) ||
+         (role == PolarRole && instance == Polar1597Instance) ||
+         (role == 16 && instance == 1017) || (role == 17 && instance == 1018) ||
+         (role == 18 && instance == 1019) || (role == 19 && instance == 1020) ||
+         (role >= 20 && role <= 28 && instance == role + 1001) ||
+         (role >= 40 && role <= 45 && instance == role + 1001) ||
+         (role >= 50 && role <= 75 && instance == role + 1001);
 }
 
 // These ten words are shader uniforms for comparison/stamping, NOT a device

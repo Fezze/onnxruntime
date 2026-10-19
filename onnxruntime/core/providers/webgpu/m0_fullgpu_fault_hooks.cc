@@ -13,7 +13,9 @@ bool Known(M0FullGpuFaultModeV2 mode) {
     case M0FullGpuFaultModeV2::AfterPushScope:
     case M0FullGpuFaultModeV2::AfterProfilingAttempt:
     case M0FullGpuFaultModeV2::AfterCheckedEnd:
-    case M0FullGpuFaultModeV2::FirstTerminalInvalidMap: return true;
+    case M0FullGpuFaultModeV2::FirstTerminalInvalidMap:
+    case M0FullGpuFaultModeV2::DestroyDeviceAtEnd:
+    case M0FullGpuFaultModeV2::ZeroDeadlineAtEnd: return true;
   }
   return false;
 }
@@ -27,7 +29,8 @@ bool M0FullGpuParseFaultModeV2(std::string_view option, bool certified,
   for (const auto mode : {M0FullGpuFaultModeV2::RetainedPair, M0FullGpuFaultModeV2::WrongRole,
                          M0FullGpuFaultModeV2::WrongInstance, M0FullGpuFaultModeV2::CarrierAbaRunPromotion,
                          M0FullGpuFaultModeV2::AfterPushScope, M0FullGpuFaultModeV2::AfterProfilingAttempt,
-                         M0FullGpuFaultModeV2::AfterCheckedEnd, M0FullGpuFaultModeV2::FirstTerminalInvalidMap}) {
+                         M0FullGpuFaultModeV2::AfterCheckedEnd, M0FullGpuFaultModeV2::FirstTerminalInvalidMap,
+                         M0FullGpuFaultModeV2::DestroyDeviceAtEnd, M0FullGpuFaultModeV2::ZeroDeadlineAtEnd}) {
     const uint32_t value = static_cast<uint32_t>(mode);
     // Closed decimal literals; no allocation or permissive integer parsing.
     const char digits[] = {char('0' + value / 10), char('0' + value % 10)};

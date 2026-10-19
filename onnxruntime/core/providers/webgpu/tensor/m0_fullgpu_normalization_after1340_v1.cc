@@ -248,7 +248,7 @@ class NormalizationFault final : public WebGpuKernel {
   }
   Status ComputeInternal(ComputeContext& c) const override {
     const auto mode = c.M0FullGpuFaultModeV2();
-    ORT_RETURN_IF_NOT((mode <= 4 || mode == 10 || mode == 11 || mode == 12 || mode == 20) && (fault_ == 0 || mode == 2),
+    ORT_RETURN_IF_NOT((mode <= 4 || mode == 10 || mode == 11 || mode == 12 || mode == 20 || mode == 21 || mode == 22) && (fault_ == 0 || mode == 2),
                       "RW07 normalization after1340 certified fault selection");
     const bool retained = mode == 1 || mode == 4;
     const auto* x = c.Input<Tensor>(retained ? 3 : 0);

@@ -51,7 +51,8 @@ common::Status SaveInitializedTensors(
     const ExecutionPlanBase& exec_plan,
     const SessionOptions& session_options,
     const MemoryProfileFunction& memory_profile_func,
-    PrepackedWeightsForGraph& prepacked_for_graph);
+    PrepackedWeightsForGraph& prepacked_for_graph,
+    const SessionState* m0_native_state = nullptr);
 
 common::Status AllocateTensor(
     const onnxruntime::MemBuffer* memory_buffer,

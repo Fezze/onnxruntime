@@ -2,6 +2,9 @@
 // Licensed under the MIT License.
 #pragma once
 #include <memory>
+#include <array>
+#include "core/session/plugin_ep/m0_native_kernel_binding_v2.h"
+#include "core/session/plugin_ep/m0_native_resource_binding_v3.h"
 #include "core/common/common.h"
 #include "core/session/plugin_ep/m0_kernel_creator_binding_v1.h"
 namespace onnxruntime {
@@ -15,6 +18,7 @@ class M0OriginalLstmSelectionV1;
 class M0OriginalLstmModuleV1 final {
  private:
   friend class M0OriginalLstmSelectionV1;
+  friend class M0NativeGpuModuleV2;
   friend struct std::default_delete<M0OriginalLstmModuleV1>;
   struct Impl;
   explicit M0OriginalLstmModuleV1(std::unique_ptr<Impl> impl);
@@ -24,6 +28,8 @@ class M0OriginalLstmModuleV1 final {
   std::shared_ptr<KernelRegistry> Registry() const;
   const ExecutionProviders& Providers() const;
   const M0PluginKernelCreatorBindingV1& Binding() const;
+  std::array<M0NativeProviderKernelBindingV2,42> NativeBindingsV2() const;
+  M0NativeResourceBindingV3 NativeResourceV3(uintptr_t handle,uint64_t required_bytes) const;
   std::unique_ptr<Impl> impl_;
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(M0OriginalLstmModuleV1);
 };

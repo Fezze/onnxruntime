@@ -283,7 +283,8 @@ common::Status SaveInitializedTensors(
     const ExecutionPlanBase& exec_plan,
     const SessionOptions& session_options,
     const MemoryProfileFunction& memory_profile_func,
-    PrepackedWeightsForGraph& prepacked_for_graph) {
+    PrepackedWeightsForGraph& prepacked_for_graph,
+    const SessionState* m0_native_state) {
   LOGS(logger, INFO) << "Saving initialized tensors.";
   ORT_ENFORCE(ort_value_name_idx_map.MaxIdx() > -1, "OrtValue indexes should have been populated.");
 
@@ -327,6 +328,11 @@ common::Status SaveInitializedTensors(
   for (const auto& entry : initialized_tensor_set) {
     int ort_value_index;
     ORT_RETURN_IF_ERROR(ort_value_name_idx_map.GetIdx(entry.first, ort_value_index));
+    if (m0_native_state) {
+      ORT_ENFORCE(entry.second, "RW07_NATIVE_UPLOAD_MISSING_SOURCE");
+      ORT_RETURN_IF_ERROR(m0_native_state->M0BeforeImmutableInitializerV1(
+          entry.first, ort_value_index, *entry.second, M0NativeInitializerVisitV1::Plan));
+    }
     if (use_user_supplied_initializer(entry.first)) {
       user_supplied_initializer_ids.insert(ort_value_index);
     }
@@ -451,6 +457,14 @@ common::Status SaveInitializedTensors(
 
   // 3. create weight tensors based on weights buffer
   for (const auto& entry : id_to_initialized_tensor) {
+    // Before cancellation/optional-name skips, shared OrtValue reuse, planner
+    // buffers, deserialization or any transfer. The real owner checks phase,
+    // exact sealed Proto identity/bytes and accounting before data work.
+    if (m0_native_state) {
+      ORT_ENFORCE(entry.second, "RW07_NATIVE_UPLOAD_MISSING_COPY_SOURCE");
+      ORT_RETURN_IF_ERROR(m0_native_state->M0BeforeImmutableInitializerV1(
+          entry.second->name(), entry.first, *entry.second, M0NativeInitializerVisitV1::Copy));
+    }
     // We check for cancellation for every initializer since mapping from disk can be costly
     if (session_options.IsLoadCancellationFlagSet()) {
       return ORT_MAKE_STATUS(ONNXRUNTIME, MODEL_LOAD_CANCELED,

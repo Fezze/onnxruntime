@@ -19,6 +19,7 @@ class M0OriginalPreloadAdaptersV1;
 class M0OriginalFunctionDescriptorsV1;
 class M0FullModelDescriptorRulesV1;
 class M0WholeModelSealV1;
+class M0FullGpuNativeLoweringOwnerV1;
 class InferenceSession;
 namespace logging {
 class Logger;
@@ -49,6 +50,7 @@ class M0OriginalPreloadOwnerV1 final {
   friend class InferenceContextImpl;
   friend class DataPropagationContextImpl;
   friend class InferenceSession;
+  friend class M0FullGpuNativeLoweringOwnerV1;
   friend class M0OriginalLstmSelectionV1;
   friend struct std::default_delete<M0OriginalPreloadOwnerV1>;
   friend M0OriginalPreloadReceiptV1 M0RunFixedOriginalPreloadV1();
@@ -112,6 +114,9 @@ class M0OriginalPreloadOwnerV1 final {
   static std::unique_ptr<Model> Make(const FrozenRecipe& recipe);
   static std::unique_ptr<Model> MakeWhole(std::string_view bytes, const logging::Logger& logger);
   static std::unique_ptr<Model> MakeWholeUnresolved(std::string_view bytes, const logging::Logger& logger);
+  static void ValidateNativeLoweringSource(const Model& source);
+  static std::unique_ptr<M0FullGpuNativeLoweringOwnerV1> PrepareNativeLowering(
+      const Model& source,const InferenceSession& session,uint32_t physical_capacity);
 #if !defined(ORT_MINIMAL_BUILD)
   std::unique_ptr<WholeModel> whole_;
 #endif

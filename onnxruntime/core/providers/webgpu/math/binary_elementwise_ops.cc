@@ -452,6 +452,15 @@ std::string GetPowImpl(int lhs_element_type, int /* rhs_element_type */) {
         "  }\n";
   }
 
+  if (lhs_element_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    // The pinned CPU Pow kernel evaluates the ALBERT GELU cube as (x*x)*x.
+    use_pow_shortcut +=
+        "  else if (b == 3.0) {\n"
+        "    let square: f32 = a * a;\n"
+        "    return square * a;\n"
+        "  }\n";
+  }
+
   s << "fn pow_custom(a : input_a_element_t, b : f32) -> input_a_element_t {\n"
        "  if (b == 0.0) {\n"
        "    return input_a_element_t(1.0);\n"

@@ -345,7 +345,7 @@ class RecurrenceFault final : public WebGpuKernel {
   }
   Status ComputeInternal(ComputeContext& c) const override {
     const auto mode = c.M0FullGpuFaultModeV2();
-    ORT_RETURN_IF_NOT((mode <= 4 || mode == 10 || mode == 11 || mode == 12 || mode == 20) && (fault_ == 0 || mode == 2),
+    ORT_RETURN_IF_NOT((mode <= 4 || mode == 10 || mode == 11 || mode == 12 || mode == 20 || mode == 21 || mode == 22) && (fault_ == 0 || mode == 2),
                       "RW07 recurrence V2 certified fault selection");
     const bool retained = mode == 1 || mode == 4;
     const auto* x = c.Input<Tensor>(retained ? 6 : 0);

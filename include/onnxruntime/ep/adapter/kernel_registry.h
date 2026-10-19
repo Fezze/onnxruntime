@@ -9,6 +9,10 @@
 
 #include <memory>
 
+#if defined(__ANDROID__) && defined(ORT_USE_EP_API_ADAPTERS) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
+#include "core/session/plugin_ep/m0_native_kernel_binding_v2.h"
+#endif
+
 #include "kernel_def_builder.h"
 #include "op_kernel_info.h"
 #include "op_kernel.h"
@@ -96,8 +100,47 @@ struct KernelRegistry {
     registry_.AddKernel(create_info.kernel_def,
                         KernelRegistry::CreateKernel,
                         reinterpret_cast<void*>(create_info.kernel_create_func));
+#if defined(__ANDROID__) && defined(ORT_USE_EP_API_ADAPTERS) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
+    // Capture only after successful AddKernel; keep its exact original metadata
+    // and creator alive. AddKernel and provider->core registry copy clone defs.
+    const auto& api = Ort::GetEpApi();
+    const OrtKernelDef* definition = create_info.kernel_def;
+    int since = 0, end = 0;
+    Ort::ThrowOnError(api.KernelDef_GetSinceVersion(definition, &since, &end));
+    const auto* record = M0NativeKernelRecordByDefinitionV2(api.KernelDef_GetOperatorType(definition),
+                                                          api.KernelDef_GetDomain(definition), since, end);
+    if (record != nullptr && std::string_view(api.KernelDef_GetExecutionProvider(definition)) == "WebGpuExecutionProvider") {
+      m0_native_metadata_v2_.push_back({record->id, std::move(create_info.kernel_def), create_info.kernel_create_func});
+    }
+#endif
     return Status::OK();
   }
+
+#if defined(__ANDROID__) && defined(ORT_USE_EP_API_ADAPTERS) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
+  bool M0NativeBindingV2(uint32_t record_id, M0NativeProviderKernelBindingV2& output) const noexcept {
+    const auto* record = M0NativeKernelRecordByIdV2(record_id);
+    if (!record) return false;
+    const OrtKernelRegistry* actual_registry = registry_;
+    if (!actual_registry) return false;
+    const M0NativeMetadataV2* selected = nullptr;
+    for (const auto& item : m0_native_metadata_v2_) {
+      if (item.record_id == record_id) {
+        if (selected) return false;
+        selected = &item;
+      }
+    }
+    if (!selected || !selected->definition || !selected->creator) return false;
+    M0NativeProviderKernelBindingV2 binding;
+    binding.abi = 2;
+    binding.record_id = record_id;
+    binding.type = record->type;
+    binding.creator = {KernelRegistry::CreateKernel, reinterpret_cast<void*>(selected->creator)};
+    binding.registry = actual_registry;
+    binding.registration_definition = selected->definition;
+    output = binding;
+    return true;
+  }
+#endif
 
   // Implicit conversion to OrtKernelRegistry* for compatibility with C API
   operator OrtKernelRegistry*() const noexcept {
@@ -110,6 +153,14 @@ struct KernelRegistry {
   }
 
  private:
+#if defined(__ANDROID__) && defined(ORT_USE_EP_API_ADAPTERS) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
+  struct M0NativeMetadataV2 {
+    uint32_t record_id;
+    Ort::KernelDef definition;
+    KernelCreatePtrFn creator;
+  };
+  std::vector<M0NativeMetadataV2> m0_native_metadata_v2_;
+#endif
   Ort::KernelRegistry registry_;
 };
 

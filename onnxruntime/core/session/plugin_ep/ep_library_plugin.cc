@@ -232,4 +232,85 @@ Status EpLibraryPlugin::M0QueryOriginalLstmV1(M0PluginKernelCreatorBindingV1& bi
   return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07_LSTM_MODULE_UNSUPPORTED");
 #endif
 }
+Status EpLibraryPlugin::M0QueryNativeKernelV2(uint32_t record,M0NativeProviderKernelBindingV2& binding) {
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && defined(__ANDROID__) && defined(USE_WEBGPU) && !defined(ORT_MINIMAL_BUILD) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
+  auto status=Status::OK();
+  ORT_TRY {
+    std::lock_guard<std::mutex> lock{mutex_};
+    status=[&]()->Status{
+      ORT_RETURN_IF_NOT(handle_&&m0_query_v1_&&!m0_module_lease_key_.empty()&&factories_.size()==1&&M0NativeKernelRecordByIdV2(record),
+                        "RW07_NATIVE_MODULE_QUERY_STATE");
+      const auto canonical=std::filesystem::canonical(library_path_);
+      void* base=nullptr;
+      ORT_RETURN_IF_NOT(M0SymbolPathV1(m0_query_v1_,&base)==canonical&&M0MappedKeyV1(m0_query_v1_)==m0_module_lease_key_&&
+                            M0FileKeyV1(canonical)==m0_module_lease_key_,"RW07_NATIVE_MODULE_ORIGIN_CHANGED");
+      M0WebGpuNativeCreatorBindingQueryV2 query=nullptr;
+      ORT_RETURN_IF_ERROR(Env::Default().GetSymbolFromLibrary(handle_,"OrtM0WebGpuNativeCreatorBindingV2",reinterpret_cast<void**>(&query)));
+      void* query_base=nullptr;
+      ORT_RETURN_IF_NOT(query&&M0SymbolPathV1(reinterpret_cast<void*>(query),&query_base)==canonical&&query_base==base&&
+                            M0MappedKeyV1(reinterpret_cast<void*>(query))==m0_module_lease_key_,"RW07_NATIVE_MODULE_QUERY_ORIGIN");
+      M0NativeProviderKernelBindingV2 pending;
+      ORT_RETURN_IF_NOT(query(2,record,&pending)==1&&pending.abi==2&&pending.record_id==record&&pending.registry&&
+                            pending.registration_definition&&pending.creator.callback&&pending.creator.state,
+                        "RW07_NATIVE_MODULE_QUERY_BINDING");
+      for(void* symbol:{reinterpret_cast<void*>(pending.creator.callback),pending.creator.state}){
+        void* actual_base=nullptr;
+        ORT_RETURN_IF_NOT(M0SymbolPathV1(symbol,&actual_base)==canonical&&actual_base==base&&M0MappedKeyV1(symbol)==m0_module_lease_key_,
+                          "RW07_NATIVE_MODULE_CREATOR_ORIGIN");
+      }
+      ORT_RETURN_IF_NOT(M0FileKeyV1(canonical)==m0_module_lease_key_,"RW07_NATIVE_MODULE_QUERY_INODE_CHANGED");
+      binding=pending;return Status::OK();
+    }();
+  }
+  ORT_CATCH(const std::exception& error){
+    ORT_HANDLE_EXCEPTION([&](){status=ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_MODULE_QUERY: ",error.what());});
+  }
+  return status;
+#else
+  ORT_UNUSED_PARAMETER(record);ORT_UNUSED_PARAMETER(binding);
+  return ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_MODULE_UNSUPPORTED");
+#endif
+}
+Status EpLibraryPlugin::M0QueryNativeResourceV3(const OrtEp* ep,uintptr_t handle,uint64_t required_bytes,
+                                               M0NativeResourceBindingV3& binding){
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && defined(__ANDROID__) && defined(USE_WEBGPU) && !defined(ORT_MINIMAL_BUILD) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
+ auto status=Status::OK();
+ ORT_TRY {
+  std::lock_guard<std::mutex> lock{mutex_};
+  status=[&]()->Status{
+   ORT_RETURN_IF_NOT(handle_&&m0_query_v1_&&!m0_module_lease_key_.empty()&&factories_.size()==1&&ep,
+     "RW07_NATIVE_RESOURCE_QUERY_STATE");
+   const auto canonical=std::filesystem::canonical(library_path_);void* base=nullptr;
+   ORT_RETURN_IF_NOT(M0SymbolPathV1(m0_query_v1_,&base)==canonical&&M0MappedKeyV1(m0_query_v1_)==m0_module_lease_key_&&
+     M0FileKeyV1(canonical)==m0_module_lease_key_,"RW07_NATIVE_RESOURCE_MODULE_ORIGIN_CHANGED");
+   M0WebGpuNativeResourceQueryV3 query=nullptr;
+   ORT_RETURN_IF_ERROR(Env::Default().GetSymbolFromLibrary(handle_,"OrtM0WebGpuNativeResourceBindingV3",reinterpret_cast<void**>(&query)));
+   void* query_base=nullptr;
+   ORT_RETURN_IF_NOT(query&&M0SymbolPathV1(reinterpret_cast<void*>(query),&query_base)==canonical&&query_base==base&&
+     M0MappedKeyV1(reinterpret_cast<void*>(query))==m0_module_lease_key_,"RW07_NATIVE_RESOURCE_QUERY_ORIGIN");
+   // This Ep was created and retained by M0OriginalLstmModuleV1's own authenticated
+   // factory. Its concrete dispatch entry points must belong to the same mapping.
+   for(void* symbol:{reinterpret_cast<void*>(ep->GetName),reinterpret_cast<void*>(ep->GetKernelRegistry),
+                    reinterpret_cast<void*>(ep->OnRunStart),reinterpret_cast<void*>(ep->OnRunEnd)}){
+    void* symbol_base=nullptr;
+    ORT_RETURN_IF_NOT(symbol&&M0SymbolPathV1(symbol,&symbol_base)==canonical&&symbol_base==base&&
+      M0MappedKeyV1(symbol)==m0_module_lease_key_,"RW07_NATIVE_RESOURCE_EP_ORIGIN");
+   }
+   M0NativeResourceBindingV3 pending;
+   ORT_RETURN_IF_NOT(query(3,ep,handle,required_bytes,&pending)==1&&pending.abi==3&&pending.structure_bytes==sizeof(pending)&&
+     pending.ep==reinterpret_cast<uintptr_t>(ep)&&pending.context&&pending.device&&pending.queue&&pending.handle==handle,
+     "RW07_NATIVE_RESOURCE_BINDING");
+   ORT_RETURN_IF_NOT(M0FileKeyV1(canonical)==m0_module_lease_key_,"RW07_NATIVE_RESOURCE_INODE_CHANGED");
+   binding=pending;return Status::OK();
+  }();
+ }
+ ORT_CATCH(const std::exception& error){
+  ORT_HANDLE_EXCEPTION([&](){status=ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_RESOURCE_QUERY: ",error.what());});
+ }
+ return status;
+#else
+ ORT_UNUSED_PARAMETER(ep);ORT_UNUSED_PARAMETER(handle);ORT_UNUSED_PARAMETER(required_bytes);ORT_UNUSED_PARAMETER(binding);
+ return ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_RESOURCE_UNSUPPORTED");
+#endif
+}
 }  // namespace onnxruntime

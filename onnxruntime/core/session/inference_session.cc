@@ -51,6 +51,7 @@
 #include "core/graph/graph_viewer.h"
 #include "core/graph/model.h"
 #include "core/graph/m0_original_preload_owner_v1.h"
+#include "core/graph/m0_fullgpu_native_lowering_owner_v1.h"
 #include "core/graph/model_editor_api_types.h"
 #include "core/graph/model_saving_options.h"
 #include "core/providers/providers.h"
@@ -511,7 +512,7 @@ Status M0OriginalThreadProfileOptionsV1(const SessionOptions& options) {
 }
 }  // namespace
 
-#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && !defined(ORT_MINIMAL_BUILD)
+#if !defined(ORT_MINIMAL_BUILD)
 common::Status InferenceSession::M0ValidateOriginalSelectionOptionsV1() const {
   ORT_RETURN_IF_NOT(m0_fullgpu_strict_requested_v1_ && M0FullGpuPreinitRequestedV1(session_options_),
                     "RW07_PREINIT_DENY_INTENT_MUTATION");
@@ -2511,6 +2512,10 @@ Status InferenceSession::LoadOrtModelWithLoader(std::function<Status()> load_ort
 
 bool InferenceSession::IsInitialized() const {
   std::lock_guard<std::mutex> l(session_mutex_);
+  #if !defined(ORT_MINIMAL_BUILD)
+  if(m0_fullgpu_strict_requested_v1_&&m0_native_lowering_v1_)
+    return m0_native_lowering_v1_->ExecutionInitialized();
+#endif
   return is_inited_;
 }
 
@@ -2876,6 +2881,40 @@ common::Status InferenceSession::HasInvalidCombinationOfExecutionProviders() con
 }
 
 common::Status InferenceSession::Initialize() {
+  bool prepare_original=false;
+  if(m0_fullgpu_strict_requested_v1_){
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    prepare_original=is_model_loaded_&&bool(model_);
+  }
+  if (prepare_original) {
+    // Physical budget only; logical D remains GPU-owned. Preparation retains
+    // the original public Model and does not issue an initialization permit.
+    Status prepared=Status::OK();
+    ORT_TRY {
+      prepared=M0PrepareOriginalLoweringV1(1024);
+    }
+    ORT_CATCH(const std::exception& error) {
+      ORT_HANDLE_EXCEPTION([&](){prepared=ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_LOWERING_FAILED: ",error.what());});
+    }
+    ORT_CATCH(...) {
+      prepared=ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_LOWERING_FAILED");
+    }
+    ORT_RETURN_IF_ERROR(prepared);
+#if !defined(ORT_MINIMAL_BUILD)
+    // The private state admits its one actual Finalize continuation only after
+    // source, selected creators, resource plan and immutable uploads are bound.
+    ORT_TRY {
+      prepared=m0_native_lowering_v1_->InitializeExecution(*this);
+    }
+    ORT_CATCH(const std::exception& error) {
+      ORT_HANDLE_EXCEPTION([&](){prepared=ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_PLAN_FAILED: ",error.what());});
+    }
+    ORT_CATCH(...) {prepared=ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_PLAN_FAILED");}
+    // Retain the original public model and generic SessionState untouched.
+    // Strict Run dispatches to the initialized private holder below.
+    return prepared;
+#endif
+  }
   // Before capability discovery, transforms or initializer conversion. The
   // post-CreatePlan seam independently denies direct SessionState entry.
   ORT_RETURN_IF_ERROR(M0FullGpuCheckIngressV1());
@@ -3504,6 +3543,66 @@ const SessionOptions& InferenceSession::GetSessionOptions() const {
   return session_options_;
 }
 
+common::Status InferenceSession::M0PrepareOriginalLoweringV1(uint32_t capacity) {
+#if !defined(ORT_MINIMAL_BUILD)
+  std::lock_guard<std::mutex> lock(session_mutex_);
+  if(m0_native_lowering_v1_&&m0_native_lowering_v1_->capacity_!=capacity)
+    return ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_LOWERING_RECEIPT_SUBSTITUTION");
+  bool validated=false;
+  auto retire=gsl::finally([&]()noexcept{
+    if(!validated&&m0_native_lowering_v1_)m0_native_lowering_v1_->phase_=M0FullGpuNativeLoweringOwnerV1::Phase::Poisoned;
+  });
+  ORT_RETURN_IF_NOT(m0_fullgpu_strict_requested_v1_&&is_model_loaded_&&model_&&!is_inited_&&!session_state_,
+                    "RW07_NATIVE_LOWERING_SOURCE_STATE");
+  const auto cancellation=session_options_.load_cancellation_flag;
+  const auto validate=[&]()->Status{
+    ORT_RETURN_IF_NOT(m0_fullgpu_strict_requested_v1_&&M0FullGpuPreinitRequestedV1(session_options_),"RW07_PREINIT_DENY_INTENT_MUTATION");
+    ORT_RETURN_IF_ERROR(M0FullGpuValidatePreinitOptionsV1(session_options_));
+    ORT_RETURN_IF_ERROR(M0FullGpuValidateIngressAuthoritiesV1(session_options_));
+    ORT_RETURN_IF_ERROR(M0OriginalThreadProfileOptionsV1(session_options_));
+    ORT_RETURN_IF_NOT(cancellation&&session_options_.load_cancellation_flag==cancellation&&!cancellation->load(),"RW07_NATIVE_LOWERING_CANCELLED");
+    ORT_RETURN_IF_NOT(!external_intra_op_thread_pool_&&!external_inter_op_thread_pool_&&custom_registries_.empty()&&
+                          custom_schema_registries_.empty()&&execution_providers_.GetIds().empty()&&
+                          session_options_.free_dimension_overrides.empty()&&session_options_.optimized_model_filepath.empty()&&model_location_.empty(),
+                      "RW07_NATIVE_LOWERING_SESSION_AUTHORITY");
+    const auto env=Env::Default().GetEnvironmentVar(inference_session_utils::kOrtLoadConfigFromModelEnvVar);
+    ORT_RETURN_IF_NOT(env.empty()||env=="0","RW07_PREINIT_DENY_ENVIRONMENT");
+    for(const auto& [key,value]:session_options_.config_options.GetConfigOptionsMap()){
+      ORT_RETURN_IF_NOT(value=="1"&&(key=="m0.fullgpu.preinit_admission_v1"||key=="m0.fullgpu.preinit_abi_v1"||
+        key=="session.disable_prepacking"||key=="session.disable_aot_function_inlining"||key=="session.disable_cpu_ep_fallback"),
+        "RW07_NATIVE_LOWERING_CONFIG");
+    }
+    return Status::OK();
+  };
+  ORT_RETURN_IF_ERROR(validate());
+  if(m0_native_lowering_v1_){
+    ORT_RETURN_IF_NOT(m0_native_lowering_v1_->source_==model_.get()&&m0_native_lowering_v1_->session_==this&&
+                          m0_native_lowering_v1_->capacity_==capacity,"RW07_NATIVE_LOWERING_RECEIPT_SUBSTITUTION");
+    M0OriginalPreloadOwnerV1::ValidateNativeLoweringSource(*model_);
+    m0_native_lowering_v1_->ValidateExecutionModel();
+    ORT_RETURN_IF_ERROR(validate());
+    validated=true;
+    return Status::OK();
+  }
+  auto pending=M0OriginalPreloadOwnerV1::PrepareNativeLowering(*model_,*this,capacity);
+  ORT_RETURN_IF_NOT(pending&&pending->source_==model_.get()&&pending->session_==this,
+                    "RW07_NATIVE_LOWERING_ACTUAL_OWNER");
+  M0OriginalPreloadOwnerV1::ValidateNativeLoweringSource(*model_);
+  ORT_RETURN_IF_ERROR(validate());
+  // Original model_/input_def_map_/output_def_map_ remain alive and untouched.
+  m0_native_lowering_v1_=std::move(pending);
+  LOGS(*session_logger_,INFO)<<"M0_RW07_NATIVE_LOWERING_PREPARED original_nodes=2464 source_model_retained=1"
+      <<" derived_sha256="<<m0_native_lowering_v1_->derived_sha256_
+      <<" ledger_sha256="<<m0_native_lowering_v1_->ledger_sha256_
+      <<" initialization_permission=0 run_permission=0";
+  validated=true;
+  return Status::OK();
+#else
+  ORT_UNUSED_PARAMETER(capacity);
+  return ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_LOWERING_REQUIRES_FULL_BUILD");
+#endif
+}
+
 common::Status InferenceSession::M0FullGpuCheckIngressV1() const {
   // Late opt-in cannot undo an ordinary load; late opt-out cannot erase intent.
   ORT_RETURN_IF_NOT(M0FullGpuPreinitRequestedV1(session_options_) == m0_fullgpu_strict_requested_v1_,
@@ -3865,6 +3964,28 @@ Status InferenceSession::Run(const RunOptions& run_options,
                              gsl::span<const std::string> feed_names, gsl::span<const OrtValue> feeds,
                              gsl::span<const std::string> output_names, std::vector<OrtValue>* p_fetches,
                              const std::vector<OrtDevice>* p_fetches_device_info) {
+#if !defined(ORT_MINIMAL_BUILD)
+  if(m0_fullgpu_strict_requested_v1_){
+    M0FullGpuNativeLoweringOwnerV1* owner=nullptr;
+    {
+      std::unique_lock<std::mutex> lock(session_mutex_,std::try_to_lock);
+      ORT_RETURN_IF_NOT(lock.owns_lock(),"RW07_NATIVE_RUN_SESSION_BUSY");
+      owner=m0_native_lowering_v1_.get();
+      ORT_RETURN_IF_NOT(owner,"RW07_NATIVE_RUN_REQUIRES_INITIALIZATION");
+    }
+    // The source-bound holder is retained for this Session's entire lifetime.
+    // RunExecution acquires the same mutex across all GPU work and publication.
+    Status result=Status::OK();
+    ORT_TRY {
+      result=owner->RunExecution(*this,run_options,feed_names,feeds,output_names,p_fetches,p_fetches_device_info);
+    }
+    ORT_CATCH(const std::exception& error) {
+      ORT_HANDLE_EXCEPTION([&](){result=ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_RUN_FAILED: ",error.what());});
+    }
+    ORT_CATCH(...) {result=ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_RUN_FAILED");}
+    return result;
+  }
+#endif
   // Serialize graph-state checks and replay as well as normal execution. Keep the
   // lock here so RunImpl's internal capture retries do not acquire it recursively.
   std::optional<std::lock_guard<std::mutex>> sequential_run_lock;

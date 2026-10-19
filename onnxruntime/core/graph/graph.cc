@@ -6,6 +6,7 @@
 #include "core/graph/m0_original_function_descriptors_v1.h"
 #include "core/graph/m0_full_model_descriptor_rules_v1.h"
 #include "core/graph/m0_whole_model_seal_v1.h"
+#include "core/graph/m0_fullgpu_native_lowering_owner_v1.h"
 
 #include <cassert>
 #include <fstream>
@@ -2794,6 +2795,9 @@ class InferenceContextImpl : public ONNX_NAMESPACE::InferenceContext {
   }
 
   void RunInferencing() {
+    if(auto* native=graph_.GetModel().m0_native_lowering_owner_v1_){
+      native->Infer(node_,this,node_output_types_);return;
+    }
     if (auto* owner = graph_.GetModel().m0_original_preload_owner_v1_.get()) {
       owner->Infer(node_, this, node_output_types_);
       return;
@@ -3126,6 +3130,9 @@ class DataPropagationContextImpl : public ONNX_NAMESPACE::DataPropagationContext
   }
 
   void RunInferencing() {
+    if(auto* native=node_.GetContainingGraph()->GetModel().m0_native_lowering_owner_v1_){
+      native->Propagation(node_,this,node_output_types_);return;
+    }
     if (auto* owner = node_.GetContainingGraph()->GetModel().m0_original_preload_owner_v1_.get()) {
       owner->Propagation(node_, this, node_output_types_);
       return;
@@ -3822,7 +3829,9 @@ Status Graph::InferAndVerifyTypeMatch(Node& node, const OpSchema& op, const Reso
     } else
 #endif
     {
-      if (auto* owner = owning_model_.m0_original_preload_owner_v1_.get()) {
+      if(auto* native=owning_model_.m0_native_lowering_owner_v1_){
+        native->Saver(node,*output_def,static_cast<size_t>(i),onnx_inferred_types_after_data_propagation);
+      }else if (auto* owner = owning_model_.m0_original_preload_owner_v1_.get()) {
         owner->Saver(node, *output_def, static_cast<size_t>(i), onnx_inferred_types_after_data_propagation);
       } else
         ORT_RETURN_IF_ERROR(SaveShapeValuesFromDataPropagation(node,
@@ -3953,6 +3962,7 @@ Status Graph::InferAndVerifyTypeMatch(Node& node, const OpSchema& op, const Reso
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
   if (layer) layer->Published();
 #endif
+  if(auto* native=owning_model_.m0_native_lowering_owner_v1_)native->Published(node);
   if (auto* owner = owning_model_.m0_original_preload_owner_v1_.get()) owner->Published(node);
   return Status::OK();
 }
@@ -4088,6 +4098,7 @@ Status Graph::VerifyNodeAndOpMatch(const ResolveOptions& options, M0SyntheticOwn
           // the ToProto call.
           if (const NodeProto* orig_node_proto = node.GetOriginalNodeProto(); orig_node_proto) {
             checker::check_node(*orig_node_proto, ctx, lsc);
+            if(auto* native=owning_model_.m0_native_lowering_owner_v1_)native->Checked(node,*orig_node_proto);
             if (auto* owner = owning_model_.m0_original_preload_owner_v1_.get())
               owner->Checked(node, *orig_node_proto);
             // clear original as we don't know if the node will be modified once the Graph::Resolve completes.
@@ -4137,6 +4148,7 @@ Status Graph::VerifyNodeAndOpMatch(const ResolveOptions& options, M0SyntheticOwn
     }
 
     ORT_RETURN_IF_ERROR(node.UpdateInputArgCount());
+    if(auto* native=owning_model_.m0_native_lowering_owner_v1_)native->Selected(node);
     if (auto* owner = owning_model_.m0_original_preload_owner_v1_.get()) owner->Selected(node);
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
     if (node_layer) {
@@ -4167,6 +4179,7 @@ Status Graph::VerifyNodeAndOpMatch(const ResolveOptions& options, M0SyntheticOwn
             if (node_layer) node_layer->BeforeDefault(attr_def.second.default_value);
 #endif
             node.AddAttributeProto(attr_def.second.default_value);
+            if(auto* native=owning_model_.m0_native_lowering_owner_v1_)native->Defaulted(node,attr_def.second.default_value);
             if (auto* owner = owning_model_.m0_original_preload_owner_v1_.get())
               owner->Defaulted(node, attr_def.second.default_value);
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
@@ -8659,6 +8672,31 @@ common::Status M0OriginalPreloadOwnerV1::Resolve(Graph& graph) {
   stage_ = 7;
   retirement.success = true;
   return common::Status::OK();
+}
+void M0OriginalPreloadOwnerV1::ValidateNativeLoweringSource(const Model& source) {
+  auto* owner=source.m0_original_preload_owner_v1_.get();
+  ORT_ENFORCE(owner&&owner->whole_&&owner->whole_->seal_&&owner->stage_==7&&
+                  !owner->poisoned_&&!owner->active_&&owner->model_==&source,
+              "RW07_NATIVE_LOWERING_REQUIRES_OWNED_ORIGINAL");
+  try {
+    owner->active_=true;
+    owner->whole_->Finalize(*owner);
+    owner->active_=false;
+  } catch (...) {
+    owner->active_=false;owner->poisoned_=true;throw;
+  }
+}
+std::unique_ptr<M0FullGpuNativeLoweringOwnerV1> M0OriginalPreloadOwnerV1::PrepareNativeLowering(
+    const Model& source,const InferenceSession& session,uint32_t capacity) {
+  ValidateNativeLoweringSource(source);
+  auto* owner=source.m0_original_preload_owner_v1_.get();
+  try {
+    auto pending=M0FullGpuNativeLoweringOwnerV1::Prepare(source,session,owner->whole_->seal_->proto_,capacity);
+    pending->ResolveExecutionModel(source.MainGraph().GetLogger());
+    return pending;
+  } catch (...) {
+    owner->poisoned_=true;throw;
+  }
 }
 std::unique_ptr<Model> M0OriginalPreloadOwnerV1::MakeWhole(std::string_view bytes, const logging::Logger& logger) {
   auto model = MakeWholeUnresolved(bytes, logger);

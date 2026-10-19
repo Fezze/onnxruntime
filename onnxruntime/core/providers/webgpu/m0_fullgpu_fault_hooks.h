@@ -13,6 +13,8 @@ enum class M0FullGpuFaultModeV2 : uint32_t {
   CarrierAbaRunPromotion = 4, AfterPushScope = 10,
   AfterProfilingAttempt = 11, AfterCheckedEnd = 12,
   FirstTerminalInvalidMap = 20,
+  DestroyDeviceAtEnd = 21,
+  ZeroDeadlineAtEnd = 22,
 };
 enum class M0FullGpuFaultCheckpointV2 : uint32_t {
   AfterPushScope = 10, AfterProfilingAttempt = 11, AfterCheckedEnd = 12,

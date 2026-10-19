@@ -272,6 +272,9 @@ class WebGpuContext final {
 
   const wgpu::Instance& Instance() const { return instance_; }
   const wgpu::Device& Device() const { return device_; }
+  // Payload-free admission metadata; never flushes or submits GPU work.
+  Status M0NativeResourceStatusV3() const;
+  const wgpu::Queue& M0NativeResourceQueueV3() const { return device_queue_; }
 
   const wgpu::AdapterInfo& AdapterInfo() const { return adapter_info_; }
   const wgpu::Limits& DeviceLimits() const { return device_limits_; }
@@ -326,7 +329,8 @@ class WebGpuContext final {
 
   // Unlike Flush, waits for submitted queue work and checks scoped errors and device loss.
   // Serialize with other operations on this recording. Scopes cover flushing, not earlier encoding.
-  Status FlushAndWaitChecked(const webgpu::BufferManager& buffer_mgr, CommandRecordingState& recording);
+  Status FlushAndWaitChecked(const webgpu::BufferManager& buffer_mgr, CommandRecordingState& recording,
+                            bool diagnostic_zero_deadline = false);
 
   // Context-level managers are shared by sessions and synchronize their buffer caches internally.
   webgpu::BufferManager& BufferManager() const { return *buffer_mgr_; }

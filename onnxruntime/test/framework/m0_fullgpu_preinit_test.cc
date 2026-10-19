@@ -3115,6 +3115,19 @@ TEST(M0CompiledRegistryMetadataTest, CaptureDefinitionsAndOriginalSchemasWithout
 
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && !defined(ORT_MINIMAL_BUILD)
 namespace onnxruntime::test {
+namespace {
+void ExpectWholeOriginalInitializeResult(InferenceSession& session) {
+#if defined(__ANDROID__) && defined(USE_WEBGPU) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
+  // Run these two whole-original cases in an isolated process with explicit
+  // physical startup, separately from generic provider authority tests.
+  dynamic_plugin_ep_infra::Shutdown();
+  ASSERT_FALSE(dynamic_plugin_ep_infra::IsInitialized());
+  ASSERT_STATUS_OK(session.Initialize());
+#else
+  ExpectPreloadDenial(session.Initialize());
+#endif
+}
+}  // namespace
 TEST(M0OriginalPreload, ExactOriginalCutsResolveThroughActualGraphAndDenyReuse) {
   const auto receipt = M0RunFixedOriginalPreloadV1();
   EXPECT_EQ(receipt.resolved, 43u);
@@ -3163,7 +3176,7 @@ TEST(M0OriginalPreload, WholeOriginalStrictBufferLoadResolvesWithoutModelValues)
     const auto replay = session.Load(bytes.data(), static_cast<int>(bytes.size()));
     EXPECT_FALSE(replay.IsOK());
     EXPECT_NE(replay.ErrorMessage().find("RW07_ORIGINAL_LOAD_REUSE"), std::string::npos);
-    ExpectPreloadDenial(session.Initialize());
+    ExpectWholeOriginalInitializeResult(session);
   }
   bytes[0] ^= 1;
   InferenceSession changed(StrictIngressOptions(), GetEnvironment());
@@ -3268,7 +3281,7 @@ TEST(M0OriginalSelection, OriginalSixNativeSelectedConstructorsRetireWithoutMode
   EXPECT_EQ(receipt.released, 6u);
   EXPECT_EQ(receipt.retired, 1u);
   EXPECT_TRUE(session.GetModel().MainGraph().GetNode(449)->GetExecutionProviderType().empty());
-  ExpectPreloadDenial(session.Initialize());
+  ExpectWholeOriginalInitializeResult(session);
 }
 #endif
 }  // namespace onnxruntime::test

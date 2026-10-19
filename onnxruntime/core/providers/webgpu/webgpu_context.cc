@@ -1358,6 +1358,12 @@ Status WebGpuContext::PopErrorScope() {
   return result->status;
 }
 
+Status WebGpuContext::M0NativeResourceStatusV3() const {
+  ORT_RETURN_IF_NOT(HasDevice(), "RW07 native resource metadata requires a live device.");
+  ORT_RETURN_IF(m0_ownership_v2_.Poisoned(), "RW07 native resource ownership is poisoned.");
+  return CheckDeviceStatus();
+}
+
 Status WebGpuContext::CheckDeviceStatus() const {
   // Queue work-done and error-scope callbacks can both succeed on an already-lost device.
   // Poll the existing lost future without replacing externally supplied device callbacks.
@@ -1370,7 +1376,8 @@ Status WebGpuContext::CheckDeviceStatus() const {
 }
 
 Status WebGpuContext::FlushAndWaitChecked(const webgpu::BufferManager& buffer_mgr,
-                                          CommandRecordingState& recording) {
+                                          CommandRecordingState& recording,
+                                          bool diagnostic_zero_deadline) {
   ORT_RETURN_IF_NOT(HasDevice(), "WebGPU checked completion requires a device.");
 
   PushErrorScope(wgpu::ErrorFilter::Internal);
@@ -1408,7 +1415,28 @@ Status WebGpuContext::FlushAndWaitChecked(const webgpu::BufferManager& buffer_mg
                                                  static_cast<uint32_t>(status), ". ", std::string_view{message});
           }
         });
+    if (diagnostic_zero_deadline) {
+      // Probe the actual submitted queue future, never the device-lost future
+      // or a fabricated wait result. Completion may already have happened.
+      const auto probe = instance_.WaitAny(future, 0);
+      LOGS_DEFAULT(INFO) << "M0_RW07_ACTUAL_QUEUE_DEADLINE_RESULT status=" << static_cast<uint32_t>(probe)
+                        << " timed_out=" << (probe == wgpu::WaitStatus::TimedOut)
+                        << " not_reproduced=" << (probe == wgpu::WaitStatus::Success);
+      if (probe == wgpu::WaitStatus::TimedOut) {
+        record_failure(ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07 actual GPU queue zero-deadline timeout observed"));
+      } else if (probe == wgpu::WaitStatus::Success) {
+        record_failure(ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07 GPU queue deadline timeout NOT_REPRODUCED"));
+      } else {
+        record_failure(ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07 GPU queue deadline unknown wait outcome: ",
+                                       static_cast<uint32_t>(probe)));
+      }
+    }
+    // A deadline refusal does not authorize retirement while work is pending.
+    // Drain this same actual future before releasing the recording/resources.
     const auto wait_status = Wait(future);
+    if (diagnostic_zero_deadline)
+      LOGS_DEFAULT(INFO) << "M0_RW07_ACTUAL_QUEUE_DEADLINE_DRAIN checked=" << wait_status.IsOK()
+                        << " queue_callback_ok=" << completion_status->IsOK();
     record_failure(wait_status);
     if (wait_status.IsOK()) {
       record_failure(*completion_status);
