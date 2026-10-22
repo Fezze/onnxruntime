@@ -38,6 +38,7 @@
 #include "core/graph/model.h"
 #if !defined(ORT_MINIMAL_BUILD)
 #include "core/graph/model_helpers.h"
+#include "core/graph/m0_bounded_backing_v1.h"
 #endif
 #include "core/graph/graph_utils.h"
 #include "core/graph/model_editor_api_types.h"
@@ -4343,7 +4344,29 @@ Status Graph::InitInputsInitializersOutputs() {
 }
 
 Status Graph::PerformTypeAndShapeInferencing(const ResolveOptions& options) {
-  if (auto* owner = owning_model_.m0_original_preload_owner_v1_.get())
+  if (auto* native = owning_model_.m0_native_lowering_owner_v1_) {
+    // The flat native graph uses its exact descriptor callbacks below, never
+    // the generic recursive inference channel. Consume this entry only once.
+    try {
+      ORT_ENFORCE(native->phase_ == M0FullGpuNativeLoweringOwnerV1::Phase::Resolving &&
+                      !native->descriptor_inference_started_ && native->execution_model_ &&
+                      native->execution_model_.get() == native->constructing_model_ &&
+                      native->execution_model_.get() == &owning_model_ &&
+                      native->execution_model_.get() != native->source_ &&
+                      &native->execution_model_->MainGraph() == this && !parent_graph_ && !parent_node_ &&
+                      options.no_proto_sync_required && !options.initializer_names_to_preserve &&
+                      !options.override_types,
+                  "RW07_NATIVE_DESCRIPTOR_PERFORM_ENTRY");
+      for (const auto& node : Nodes()) {
+        ORT_ENFORCE(!node.ContainsSubgraph() && node.ImplicitInputDefs().empty(),
+                    "RW07_NATIVE_DESCRIPTOR_PERFORM_FLAT_GRAPH");
+      }
+      native->descriptor_inference_started_ = true;
+    } catch (...) {
+      native->phase_ = M0FullGpuNativeLoweringOwnerV1::Phase::Poisoned;
+      throw;
+    }
+  } else if (auto* owner = owning_model_.m0_original_preload_owner_v1_.get())
     owner->CheckGraph(*this);
   else
     ORT_RETURN_IF_ERROR(owning_model_.M0CheckCallbackPolicyV1(M0CallbackPolicyV1::Channel::kRecursiveInference));
@@ -8061,7 +8084,7 @@ class M0OriginalPreloadOwnerV1::WholeModel final {
     size_t raw_size = 0;
   };
   explicit WholeModel(std::unique_ptr<M0WholeModelSealV1> seal) : seal_(std::move(seal)) {
-    ORT_ENFORCE(seal_ && seal_->raw_bytes_ && seal_->proto_.graph().node_size() == 2464,
+    ORT_ENFORCE(seal_ && seal_->proto_.graph().node_size() == 2464,
                 "RW07_WHOLE_SEAL_REQUIRED");
     const auto& original = seal_->proto_.graph();
     states_.resize(static_cast<size_t>(original.node_size()));
@@ -8236,7 +8259,7 @@ class M0OriginalPreloadOwnerV1::WholeModel final {
     state.profile = Rules::Find(node.OpType());
     ORT_ENFORCE(state.stage == 1 && node.Op() && state.profile && Rules::SchemaMatches(*node.Op(), *state.profile) &&
                     node.SinceVersion() == node.Op()->SinceVersion(),
-                "RW07_WHOLE_NATIVE_SCHEMA_EVENT");
+                "RW07_WHOLE_NATIVE_SCHEMA_EVENT node=", node.Name(), " op=", node.OpType());
     state.schema = node.Op();
     state.stage = 2;
     ++selected_;
@@ -8373,10 +8396,7 @@ class M0OriginalPreloadOwnerV1::WholeModel final {
     auto required_imports = expected_domains;
     required_imports.erase(kMSInternalNHWCDomain);
     ORT_ENFORCE(imports.size() == required_imports.size(), "RW07_WHOLE_NORMALIZED_IMPORT_INVENTORY");
-    ONNX_NAMESPACE::ModelProto expected(seal_->proto_);
-    expected.clear_opset_import();
-    for (const auto& imported : live.opset_import()) *expected.add_opset_import() = imported;
-    ORT_ENFORCE(expected.SerializeAsString() == live.SerializeAsString(), "RW07_WHOLE_IMMUTABLE_BACKING");
+    ORT_ENFORCE(m0_internal::M0SameWholeBackingV1(seal_->proto_, live), "RW07_WHOLE_IMMUTABLE_BACKING");
   }
   void CheckInventory(M0OriginalPreloadOwnerV1& owner) {
     const auto& graph = *owner.graph_;
@@ -8687,11 +8707,11 @@ void M0OriginalPreloadOwnerV1::ValidateNativeLoweringSource(const Model& source)
   }
 }
 std::unique_ptr<M0FullGpuNativeLoweringOwnerV1> M0OriginalPreloadOwnerV1::PrepareNativeLowering(
-    const Model& source,const InferenceSession& session,uint32_t capacity) {
+    const Model& source,const InferenceSession& session,uint32_t capacity,bool device_capacity) {
   ValidateNativeLoweringSource(source);
   auto* owner=source.m0_original_preload_owner_v1_.get();
   try {
-    auto pending=M0FullGpuNativeLoweringOwnerV1::Prepare(source,session,owner->whole_->seal_->proto_,capacity);
+    auto pending=M0FullGpuNativeLoweringOwnerV1::Prepare(source,session,owner->whole_->seal_->proto_,capacity,device_capacity);
     pending->ResolveExecutionModel(source.MainGraph().GetLogger());
     return pending;
   } catch (...) {
@@ -8755,7 +8775,11 @@ M0WholeDescriptorRulesReceiptV1 M0OriginalPreloadOwnerV1::QualifyWholeRules(std:
       }
     ORT_ENFORCE(original, "RW07_WHOLE_RULE_FIXTURE_MISSING");
     const auto* schema = ONNX_NAMESPACE::OpSchemaRegistry::Schema(original->op_type(), 20, "");
-    ORT_ENFORCE(schema && Rules::SchemaMatches(*schema, profile), "RW07_WHOLE_RULE_FIXTURE_SCHEMA");
+    ORT_ENFORCE(schema && Rules::SchemaMatches(*schema, profile),
+                "RW07_WHOLE_RULE_FIXTURE_SCHEMA op=", profile.name,
+                " expected_file=", profile.file, " expected_line=", profile.line,
+                " actual_file=", schema ? schema->file() : "<missing>",
+                " actual_line=", schema ? schema->line() : -1);
     NodeProto current(*original);
     std::vector<const AttributeProto*> defaults;
     for (const auto& [name, definition] : schema->attributes()) {

@@ -8,8 +8,16 @@
 #include "core/session/m0_native_gpu_module_v2.h"
 namespace onnxruntime {
 // Retaining this token prevents thread-id reuse from reviving an initialization lease.
+inline std::shared_ptr<const int>& M0NativeInitializationThreadSlotV1() noexcept {
+ thread_local std::shared_ptr<const int> token;
+ return token;
+}
+inline const std::shared_ptr<const int>& M0NativeCurrentInitializationThreadV1() noexcept {
+ return M0NativeInitializationThreadSlotV1();
+}
 inline const std::shared_ptr<const int>& M0NativeInitializationThreadV1() {
- thread_local const auto token=std::make_shared<const int>(0);
+ auto& token=M0NativeInitializationThreadSlotV1();
+ if(!token)token=std::make_shared<const int>(0);
  return token;
 }
 struct M0FullGpuNativeLoweringOwnerV1::ExecutionPlan {

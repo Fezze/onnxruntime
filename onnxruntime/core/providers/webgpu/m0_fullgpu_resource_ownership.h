@@ -17,6 +17,25 @@ struct M0FullGpuAllocationIdentity {
   uint64_t data_generation = 0;
 };
 
+// Provider-private observation of a live allocation, not permission to dispatch.
+struct M0FullGpuStorageAllocationV1 {
+  M0FullGpuAllocationIdentity identity;
+  uint64_t backing_bytes = 0;
+  uint32_t storage = 0;
+  uint32_t copy_source = 0;
+  uint32_t copy_destination = 0;
+};
+
+// Registry observations count client-visible acquisitions only. They exclude
+// deferred cache retention, driver allocations and physical memory residency.
+struct M0FullGpuResourceStatisticsV1 {
+  uint64_t live_allocations = 0;
+  uint64_t live_requested_bytes = 0;
+  uint64_t peak_live_requested_bytes = 0;
+  uint64_t acquisitions = 0;
+  uint64_t retirements = 0;
+};
+
 // Integration must call Acquire on EVERY successful physical allocation/cache
 // acquisition and Retire at the client's Release boundary, before deferred
 // cache recycling. Cached WGPUBuffer pointers are not allocation identities.
@@ -26,6 +45,7 @@ class M0FullGpuResourceOwnership final {
   uint64_t Acquire(uintptr_t handle, uint64_t requested_bytes);
   bool Retire(uintptr_t handle, uint64_t generation);
   bool Describe(uintptr_t handle, M0FullGpuAllocationIdentity& out) const;
+  M0FullGpuResourceStatisticsV1 Statistics() const;
   // Atomically snapshots actual live bound allocations, without comparing
   // producer provenance. GPU guards compare these descriptors with payloads.
   bool DescribeBindings(uintptr_t sidecar, uintptr_t data_handle,
@@ -55,6 +75,7 @@ class M0FullGpuResourceOwnership final {
                  uint64_t data_generation, uint32_t producer_instance);
   mutable std::mutex mutex_;
   std::unordered_map<uintptr_t, M0FullGpuAllocationIdentity> live_;
+  M0FullGpuResourceStatisticsV1 statistics_;
   std::atomic<bool> poisoned_{false};
 };
 }  // namespace onnxruntime::webgpu

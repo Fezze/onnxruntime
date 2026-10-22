@@ -9,7 +9,10 @@ namespace onnxruntime {
 namespace {
 constexpr const char* Domain="org.localtts.m0.rw07";
 bool PublicInput(const ONNX_NAMESPACE::ModelProto& model,const std::string& name){
- for(const auto& v:model.graph().input())if(v.name()==name)return true;return false;
+ for(const auto& v:model.graph().input()) {
+  if(v.name()==name) return true;
+ }
+ return false;
 }
 void AddUnique(std::vector<std::string>& entries,const std::string& value){
  if(std::find(entries.begin(),entries.end(),value)==entries.end())entries.push_back(value);
@@ -45,7 +48,12 @@ std::string M0FullGpuNativeBuilderV1::Initializer(const std::string& name){
 std::string M0FullGpuNativeBuilderV1::Parameter(size_t i,size_t slot){return Initializer(Input(i,slot));}
 ONNX_NAMESPACE::NodeProto M0FullGpuNativeBuilderV1::Custom(const std::string& op,const std::vector<std::string>& inputs,const std::vector<std::string>& outputs,const std::vector<std::pair<std::string,int64_t>>& attrs){
  ORT_ENFORCE(!op.empty()&&!outputs.empty()&&!outputs[0].empty(),"RW07 native custom identity");ONNX_NAMESPACE::NodeProto n;n.set_domain(Domain);n.set_op_type(op);n.set_name("rw07_native_"+op+"_"+outputs[0]);
- for(const auto& i:inputs)n.add_input(i);for(const auto& o:outputs)n.add_output(o);
+ for(const auto& i:inputs) {
+  n.add_input(i);
+ }
+ for(const auto& o:outputs) {
+  n.add_output(o);
+ }
  std::set<std::string> names;for(const auto& a:attrs){ORT_ENFORCE(names.insert(a.first).second,"RW07 native duplicate attribute");auto* p=n.add_attribute();p->set_name(a.first);p->set_type(ONNX_NAMESPACE::AttributeProto::INT);p->set_i(a.second);}return n;
 }
 void M0FullGpuNativeBuilderV1::Emit(ONNX_NAMESPACE::NodeProto node){
@@ -76,9 +84,15 @@ void M0FullGpuNativeBuilderV1::Replace(const std::string& recipe,const std::vect
   if(name.empty()||frontier.count(name)||initializers_.count(name)||PublicInput(original_,name))return;
   const auto at=producers_.find(name);ORT_ENFORCE(at!=producers_.end(),"RW07 native missing original cut dependency: ",name);
   const size_t i=at->second;if(included.count(i))return;ORT_ENFORCE(active.insert(i).second,"RW07 native original dependency cycle");
-  for(const auto& input:Node(i).input())visit(input);active.erase(i);included.insert(i);
+  for(const auto& input:Node(i).input()) {
+   visit(input);
+  }
+  active.erase(i);included.insert(i);
  };
- for(const auto& o:outputs)visit(o);ORT_ENFORCE(!included.empty(),"RW07 native empty numerical source cut");
+ for(const auto& o:outputs) {
+  visit(o);
+ }
+ ORT_ENFORCE(!included.empty(),"RW07 native empty numerical source cut");
  for(const auto i:included){AddUnique(coverage_[i].recipes,recipe);AddUnique(coverage_[i].consumers,node.name());}
  Emit(std::move(node));
 }
@@ -114,8 +128,14 @@ void M0FullGpuNativeBuilderV1::Finalize(const M0FullGpuNativeOutputV1& output){
  std::function<void(const std::string&)> visit=[&](const std::string& name){
   if(name.empty()||PublicInput(original_,name)||copied_initializers_.count(name))return;
   const auto it=values.find(name);ORT_ENFORCE(it!=values.end(),"RW07 native derived missing dependency: ",name);const size_t i=it->second;
-  if(reachable.count(i))return;ORT_ENFORCE(active.insert(i).second,"RW07 native derived cycle");
-  for(const auto& input:graph->node(int(i)).input())visit(input);active.erase(i);reachable.insert(i);order.push_back(i);
+  if(reachable.count(i)) {
+   return;
+  }
+  ORT_ENFORCE(active.insert(i).second,"RW07 native derived cycle");
+  for(const auto& input:graph->node(int(i)).input()) {
+   visit(input);
+  }
+  active.erase(i);reachable.insert(i);order.push_back(i);
  };
  for(const auto& name:public_outputs)visit(name);
  ORT_ENFORCE(reachable.size()==size_t(graph->node_size()),"RW07 native unreachable derived numerical/plumbing nodes");

@@ -291,6 +291,28 @@ ProgramInput ProgramInput::BufferView(const Tensor* backing_tensor,
   return view;
 }
 
+ProgramInput ProgramInput::FloatBufferWindow(const Tensor* backing_tensor,
+                                             ProgramTensorMetadataDependency dependency,
+                                             const TensorShape& shape,
+                                             uint32_t offset_in_elements,
+                                             uint32_t storage_offset_alignment) {
+  ORT_ENFORCE(backing_tensor && backing_tensor->IsDataType<float>() && backing_tensor->Shape().Size() > 0 && shape.Size() > 0 &&
+                  storage_offset_alignment > 0 && storage_offset_alignment % sizeof(float) == 0,
+              "Invalid float storage window descriptor.");
+  const uint64_t count = static_cast<uint64_t>(shape.Size());
+  const uint64_t backing_count = static_cast<uint64_t>(backing_tensor->Shape().Size());
+  ORT_ENFORCE(offset_in_elements <= backing_count && count <= backing_count - offset_in_elements,
+              "Float storage window exceeds the backing tensor.");
+  const uint64_t absolute_bytes = uint64_t(offset_in_elements) * sizeof(float);
+  const uint64_t binding_offset = absolute_bytes - absolute_bytes % storage_offset_alignment;
+  const uint32_t prefix = static_cast<uint32_t>((absolute_bytes - binding_offset) / sizeof(float));
+  ORT_ENFORCE(count <= UINT32_MAX - prefix, "Float storage window exceeds shader index range.");
+  auto view = BufferView(backing_tensor, dependency, shape, prefix);
+  view.buffer_binding_offset_bytes = binding_offset;
+  view.buffer_binding_size_bytes = (uint64_t(prefix) + count) * sizeof(float);
+  return view;
+}
+
 ProgramOutput::ProgramOutput(Tensor* tensor)
     : ProgramOutput{tensor, ProgramTensorMetadataDependency::None} {}
 
@@ -343,6 +365,19 @@ ProgramOutput ProgramOutput::BufferView(Tensor* backing_tensor,
   return view;
 }
 
+ProgramOutput ProgramOutput::FloatBufferWindow(Tensor* backing_tensor,
+                                               ProgramTensorMetadataDependency dependency,
+                                               const TensorShape& shape,
+                                               uint32_t offset_in_elements,
+                                               uint32_t storage_offset_alignment) {
+  const auto input = ProgramInput::FloatBufferWindow(backing_tensor, dependency, shape,
+                                                     offset_in_elements, storage_offset_alignment);
+  auto output = BufferView(backing_tensor, dependency, shape, input.buffer_offset_in_elements);
+  output.buffer_binding_offset_bytes = input.buffer_binding_offset_bytes;
+  output.buffer_binding_size_bytes = input.buffer_binding_size_bytes;
+  return output;
+}
+
 ProgramBase::ProgramBase(std::string_view name, ProgramMetadata&& metadata)
     : name_{name},
       metadata_{metadata},
@@ -360,6 +395,8 @@ ProgramBase& ProgramBase::AddInput(ProgramInput&& input) {
   inputs_.emplace_back(std::move(input));
   const size_t input_index = inputs_.size() - 1;
   const auto& added_input = inputs_.back();
+  ORT_ENFORCE(added_input.buffer_binding_size_bytes || added_input.buffer_binding_offset_bytes == 0,
+              "A storage binding offset requires a physical window.");
   if (added_input.is_buffer_view) {
     const size_t owner_index = InputBufferOwner(input_index);
     const auto& owner = inputs_[owner_index];
@@ -369,7 +406,9 @@ ProgramBase& ProgramBase::AddInput(ProgramInput&& input) {
         (added_input.tensor->Shape().Size() + NumberOfComponents(added_input.var_type) - 1) /
         NumberOfComponents(added_input.var_type);
     const uint64_t view_element_count = added_input.override_shape.Size();
-    ORT_ENFORCE(static_cast<uint64_t>(added_input.buffer_offset_in_elements) + view_element_count <= backing_element_count,
+    const uint64_t absolute_offset = added_input.buffer_binding_offset_bytes / sizeof(float) +
+                                     added_input.buffer_offset_in_elements;
+    ORT_ENFORCE(absolute_offset <= backing_element_count && view_element_count <= backing_element_count - absolute_offset,
                 "Packed input view exceeds the backing tensor.");
   }
   return *this;
@@ -386,6 +425,8 @@ ProgramBase& ProgramBase::AddOutput(ProgramOutput&& output) {
   outputs_.emplace_back(std::move(output));
   const size_t output_index = outputs_.size() - 1;
   const auto& added_output = outputs_.back();
+  ORT_ENFORCE(added_output.buffer_binding_size_bytes || added_output.buffer_binding_offset_bytes == 0,
+              "A storage binding offset requires a physical window.");
   if (added_output.is_buffer_view) {
     const size_t owner_index = OutputBufferOwner(output_index);
     const auto& owner = outputs_[owner_index];
@@ -395,7 +436,9 @@ ProgramBase& ProgramBase::AddOutput(ProgramOutput&& output) {
         (added_output.tensor->Shape().Size() + NumberOfComponents(added_output.var_type) - 1) /
         NumberOfComponents(added_output.var_type);
     const uint64_t view_element_count = added_output.override_shape.Size();
-    ORT_ENFORCE(static_cast<uint64_t>(added_output.buffer_offset_in_elements) + view_element_count <= backing_element_count,
+    const uint64_t absolute_offset = added_output.buffer_binding_offset_bytes / sizeof(float) +
+                                     added_output.buffer_offset_in_elements;
+    ORT_ENFORCE(absolute_offset <= backing_element_count && view_element_count <= backing_element_count - absolute_offset,
                 "Packed output view exceeds the backing tensor.");
   }
   return *this;
@@ -411,12 +454,12 @@ ProgramBase& ProgramBase::AddOutputs(std::initializer_list<ProgramOutput> output
 size_t ProgramBase::InputBufferOwner(size_t input_index) const {
   ORT_ENFORCE(input_index < inputs_.size(), "Input index is out of range.");
   const auto& input = inputs_[input_index];
-  if (!input.is_buffer_view) {
+  if (!input.is_buffer_view || input.buffer_binding_size_bytes) {
     return input_index;
   }
 
   for (size_t i = 0; i < input_index; ++i) {
-    if (inputs_[i].is_buffer_view && inputs_[i].tensor == input.tensor) {
+    if (inputs_[i].is_buffer_view && !inputs_[i].buffer_binding_size_bytes && inputs_[i].tensor == input.tensor) {
       return i;
     }
   }
@@ -426,12 +469,12 @@ size_t ProgramBase::InputBufferOwner(size_t input_index) const {
 size_t ProgramBase::OutputBufferOwner(size_t output_index) const {
   ORT_ENFORCE(output_index < outputs_.size(), "Output index is out of range.");
   const auto& output = outputs_[output_index];
-  if (!output.is_buffer_view) {
+  if (!output.is_buffer_view || output.buffer_binding_size_bytes) {
     return output_index;
   }
 
   for (size_t i = 0; i < output_index; ++i) {
-    if (outputs_[i].is_buffer_view && outputs_[i].tensor == output.tensor) {
+    if (outputs_[i].is_buffer_view && !outputs_[i].buffer_binding_size_bytes && outputs_[i].tensor == output.tensor) {
       return i;
     }
   }

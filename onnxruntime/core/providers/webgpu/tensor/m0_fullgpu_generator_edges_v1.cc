@@ -3,28 +3,19 @@
 // Original generator upsample/join/parallel-path average and spectral projection edges.
 #include <algorithm>
 #include <array>
+#include <optional>
 #include "core/providers/webgpu/webgpu_kernel.h"
 #include "core/providers/webgpu/shader_helper.h"
 #include "core/providers/webgpu/m0_fullgpu_extent_abi2.h"
+#include "core/providers/webgpu/tensor/m0_fullgpu_residual_stages_v1.h"
 namespace onnxruntime::webgpu {
 namespace {
 bool Gpu(const Tensor* t){return t&&t->Location().device.Type()==OrtDevice::GPU;}
-void ValidOutput(ShaderHelper& s, const ShaderVariableHelper& e) {
-  auto& f = s.AdditionalImplementation();
-  f << "fn valid_output()->bool {if(" << e.GetByOffset("0u") << "!=2u||"
-    << e.GetByOffset("1u") << "!=3u||" << e.GetByOffset("20u") << "!=0u||"
-    << e.GetByOffset("21u") << "!=63u){return false;}"
-    << "for(var i=0u;i<10u;i++){if(" << e.GetByOffset("22u+i") << "!="
-    << GetElementAt("uniforms.identity", "i", 10) << "){return false;}}"
-    << "if(" << e.GetByOffset("2u") << "!=1u||" << e.GetByOffset("3u") << "!=0u||"
-    << e.GetByOffset("4u") << "!=uniforms.channels||" << e.GetByOffset("5u") << "!=0u||"
-    << e.GetByOffset("7u") << "!=0u||" << e.GetByOffset("19u") << "!=0u){return false;}"
-    << "for(var i=8u;i<18u;i++){if(" << e.GetByOffset("i") << "!=0u){return false;}}"
-    << "let n=" << e.GetByOffset("6u") << ";return n>=uniforms.minimum&&n<=uniforms.maximum&&"
-    << "n%uniforms.modulus==uniforms.remainder&&n<=uniforms.output_capacity&&"
-    << e.GetByOffset("18u") << "==uniforms.channels*n;}\n";
-}
-
+using m0_residual_stages::ValidOutput;
+using m0_residual_stages::OriginalArithmetic;
+using m0_residual_stages::PhysicalBuffer;
+using m0_residual_stages::StorageBudget;
+using m0_residual_stages::StorageBudgetWithWindows;
 class EdgeGuard final : public Program<EdgeGuard> {
  public:
   EdgeGuard(uint32_t mode,uint32_t pairs):Program{"RW07GeneratorEdgeGuardV1"},mode_(mode),pairs_(pairs) {}
@@ -88,7 +79,7 @@ class EdgeGuard final : public Program<EdgeGuard> {
 };
 class EdgeData final : public Program<EdgeData> {
  public:
-  EdgeData(uint32_t mode,uint32_t pairs):Program{"RW07GeneratorEdgeDataV1"},mode_(mode),pairs_(pairs) {}
+  EdgeData(uint32_t mode,uint32_t pairs):Program{"RW07GeneratorEdgeSpectralWindowDataV3"},mode_(mode),pairs_(pairs) {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
     {"input_capacity",ProgramUniformVariableDataType::Uint32},
     {"output_capacity",ProgramUniformVariableDataType::Uint32},
@@ -98,45 +89,20 @@ class EdgeData final : public Program<EdgeData> {
     {"modulus",ProgramUniformVariableDataType::Uint32},
     {"remainder",ProgramUniformVariableDataType::Uint32},
     {"stage",ProgramUniformVariableDataType::Uint32},
+    {"tile_channels",ProgramUniformVariableDataType::Uint32},
+    {"component",ProgramUniformVariableDataType::Uint32},
     {"identity",ProgramUniformVariableDataType::Uint32});
   Status GenerateShaderCode(ShaderHelper& s) const override {
     std::array<const ShaderVariableHelper*,3> inputs{};
     for(uint32_t j=0;j<pairs_;j++){inputs[j]=&s.AddInput("carrier"+std::to_string(j),ShaderUsage::UseValueTypeAlias);}
     const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
     const ShaderVariableHelper* w=nullptr;const ShaderVariableHelper* b=nullptr;
-    if(mode_==0||mode_==3){w=&s.AddInput("weight",ShaderUsage::UseValueTypeAlias);b=&s.AddInput("bias",ShaderUsage::UseValueTypeAlias);}
+    if(mode_==0){w=&s.AddInput("weight",ShaderUsage::UseValueTypeAlias);b=&s.AddInput("bias",ShaderUsage::UseValueTypeAlias);}
     const auto& y=s.AddOutput("output",ShaderUsage::UseValueTypeAlias);
     ValidOutput(s,e);
-    s.AdditionalImplementation() << R"WGSL(
-fn original_mul(a:f32,b:f32)->f32 {
- let aa=bitcast<u32>(a)&0x7fffffffu;let bb=bitcast<u32>(b)&0x7fffffffu;
- if(aa>0x7f800000u||bb>0x7f800000u||(aa==0u&&bb==0x7f800000u)||(bb==0u&&aa==0x7f800000u)){
- return bitcast<f32>(0x7fc00000u);}
- if(aa==0x7f800000u||bb==0x7f800000u){return bitcast<f32>(((bitcast<u32>(a)^bitcast<u32>(b))&0x80000000u)|0x7f800000u);}
- return a*b;
-}
-fn original_add(a:f32,b:f32)->f32 {
- let aa=bitcast<u32>(a)&0x7fffffffu;let bb=bitcast<u32>(b)&0x7fffffffu;
- if(aa>0x7f800000u||bb>0x7f800000u||(aa==0x7f800000u&&bb==0x7f800000u&&((bitcast<u32>(a)^bitcast<u32>(b))&0x80000000u)!=0u)){
- return bitcast<f32>(0x7fc00000u);}
- if(aa==0x7f800000u){return a;}if(bb==0x7f800000u){return b;}return a+b;
-}
-fn original_sub(a:f32,b:f32)->f32{return original_add(a,-b);}
-fn original_sqrt(x:f32)->f32 {
- let bits=bitcast<u32>(x);let magnitude=bits&0x7fffffffu;
- if(magnitude>0x7f800000u||((bits&0x80000000u)!=0u&&magnitude!=0u)){return bitcast<f32>(0x7fc00000u);}
- if(magnitude==0x7f800000u||magnitude==0u){return x;}return sqrt(x);
-}
-fn original_div(a:f32,b:f32)->f32 {
- let ua=bitcast<u32>(a);let ub=bitcast<u32>(b);let aa=ua&0x7fffffffu;let bb=ub&0x7fffffffu;
- let sign=(ua^ub)&0x80000000u;
- if(aa>0x7f800000u||bb>0x7f800000u||(aa==0u&&bb==0u)||(aa==0x7f800000u&&bb==0x7f800000u)){return bitcast<f32>(0x7fc00000u);}
- if(bb==0u||aa==0x7f800000u){return bitcast<f32>(sign|0x7f800000u);}
- if(aa==0u||bb==0x7f800000u){return bitcast<f32>(sign);}return a/b;
-}
-)WGSL";
+    OriginalArithmetic(s);
     auto& f=s.MainFunctionBody();
-    f<<"if(global_idx>=uniforms.channels*uniforms.output_capacity){return;}"<<y.SetByOffset("global_idx","0.0")
+    f<<"if(global_idx>=uniforms.tile_channels*uniforms.output_capacity){return;}"<<y.SetByOffset("global_idx","0.0")
      <<"if(!valid_output()){return;}let t=global_idx%uniforms.output_capacity;let oc=global_idx/uniforms.output_capacity;"
      <<"let count="<<e.GetByOffset("6u")<<";if(t>=count){return;}";
     if(mode_==1||mode_==2){
@@ -144,7 +110,7 @@ fn original_div(a:f32,b:f32)->f32 {
         f<<"let v"<<j<<"="<<inputs[j]->GetByOffset("oc*"+GetElementAt("uniforms.input_capacity",std::to_string(j)+"u",3)+"+t")<<";";
       }
       if(mode_==1){f<<y.SetByOffset("global_idx","original_add(v0,v1)");}
-      else{f<<"let first=original_add(v0,v1);let total=original_add(first,v2);"<<y.SetByOffset("global_idx","original_div(total,3.0)");}
+      else{f<<"let first:f32=original_add(v0,v1);let total:f32=original_add(first,v2);"<<y.SetByOffset("global_idx","original_div(total,3.0)");}
     }
     if(mode_==0){
       f<<"let stride=select(10u,6u,uniforms.stage==1u);let kernel=select(20u,12u,uniforms.stage==1u);"
@@ -160,28 +126,117 @@ fn original_div(a:f32,b:f32)->f32 {
        <<"total=original_add(total,column);}}}"
        <<y.SetByOffset("global_idx","original_add(total,"+b->GetByOffset("oc")+")");
     }
-    if(mode_==3){
-      f<<"var total:f32=0.0;for(var ic=0u;ic<128u;ic++){for(var k=0u;k<7u;k++){"
-       <<"let pos=i32(t)+i32(k)-3;var activated:f32=0.0;if(pos>=0&&pos<i32(count)){let value="
-       <<inputs[0]->GetByOffset("ic*"+GetElementAt("uniforms.input_capacity","0u",3)+"+u32(pos)")<<";"
-       <<"let negative=original_mul(value,bitcast<f32>(0x3c23d70au));activated=select(negative,value,value>=0.0);}"
-       <<"total=original_add(total,original_mul(activated,"<<w->GetByOffset("(oc*128u+ic)*7u+k")<<"));}}"
-       <<y.SetByOffset("global_idx","original_add(total,"+b->GetByOffset("oc")+")");
-    }
     if(mode_==4){
-      f<<"let bin=oc%11u;let magnitude_log="<<inputs[0]->GetByOffset("bin*"+GetElementAt("uniforms.input_capacity","0u",3)+"+t")<<";"
-       <<"let phase_value="<<inputs[0]->GetByOffset("(bin+11u)*"+GetElementAt("uniforms.input_capacity","0u",3)+"+t")<<";"
+      f<<"let bin=oc;let magnitude_log="<<inputs[0]->GetByOffset("bin*"+GetElementAt("uniforms.input_capacity","0u",3)+"+t")<<";"
+       <<"let phase_value="<<inputs[1]->GetByOffset("bin*"+GetElementAt("uniforms.input_capacity","1u",3)+"+t")<<";"
        <<"let mb=bitcast<u32>(magnitude_log);let ma=mb&0x7fffffffu;var amplitude:f32=bitcast<f32>(0x7fc00000u);"
        <<"if(ma<0x7f800000u){if(magnitude_log>=bitcast<f32>(0x42b17218u)){amplitude=bitcast<f32>(0x7f800000u);}else{amplitude=exp(magnitude_log);}}else if(ma==0x7f800000u){amplitude=select(bitcast<f32>(0x7f800000u),0.0,(mb&0x80000000u)!=0u);}"
        <<"let pa=bitcast<u32>(phase_value)&0x7fffffffu;var phase:f32=bitcast<f32>(0x7fc00000u);"
        <<"if(pa<0x7f800000u){phase=sin(phase_value);}var wave:f32=bitcast<f32>(0x7fc00000u);"
-       <<"if((bitcast<u32>(phase)&0x7fffffffu)<0x7f800000u){if(oc<11u){wave=cos(phase);}else{wave=sin(phase);}}"
+       <<"if((bitcast<u32>(phase)&0x7fffffffu)<0x7f800000u){if(uniforms.component==0u){wave=cos(phase);}else{wave=sin(phase);}}"
        <<y.SetByOffset("global_idx","original_mul(amplitude,wave)");
     }
     return Status::OK();
   }
  private:
   const uint32_t mode_,pairs_;
+};
+void UpsampleTapGeometry(ShaderHelper& s,const ShaderVariableHelper& extent){
+  ValidOutput(s,extent);OriginalArithmetic(s);
+  s.AdditionalImplementation()<<R"WGSL(
+fn upsample_source(frame:u32,count:u32)->i32 {
+ let stride=select(10u,6u,uniforms.stage==1u);
+ let pad=select(5u,3u,uniforms.stage==1u);
+ let length=select(count/10u,(count-1u)/6u,uniforms.stage==1u);
+ var target=frame;if(uniforms.stage==1u){target=select(frame-1u,1u,frame==0u);}
+ let numerator=i32(target+pad)-i32(uniforms.tap);
+ if(numerator<0||u32(numerator)%stride!=0u){return -1;}
+ let pos=u32(numerator)/stride;
+ if(pos>=length||pos>=uniforms.input_capacity){return -1;}
+ return i32(pos);
+}
+)WGSL";
+}
+class UpsampleTapColumn final : public Program<UpsampleTapColumn> {
+ public:
+  UpsampleTapColumn():Program{"RW07GeneratorUpsampleTapColumnWindowsV1"}{}
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+    {"input_capacity",ProgramUniformVariableDataType::Uint32},
+    {"output_capacity",ProgramUniformVariableDataType::Uint32},
+    {"channels",ProgramUniformVariableDataType::Uint32},
+    {"minimum",ProgramUniformVariableDataType::Uint32},
+    {"maximum",ProgramUniformVariableDataType::Uint32},
+    {"modulus",ProgramUniformVariableDataType::Uint32},
+    {"remainder",ProgramUniformVariableDataType::Uint32},
+    {"stage",ProgramUniformVariableDataType::Uint32},
+    {"tap",ProgramUniformVariableDataType::Uint32},
+    {"input_offset",ProgramUniformVariableDataType::Uint32},
+    {"input_count",ProgramUniformVariableDataType::Uint32},
+    {"output_offset",ProgramUniformVariableDataType::Uint32},
+    {"output_count",ProgramUniformVariableDataType::Uint32},
+    {"identity",ProgramUniformVariableDataType::Uint32});
+  Status GenerateShaderCode(ShaderHelper& s)const override{
+    const auto& x=s.AddInput("source",ShaderUsage::UseValueTypeAlias);
+    const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
+    const auto& w=s.AddInput("weight",ShaderUsage::UseValueTypeAlias);
+    const auto& column=s.AddOutput("column",ShaderUsage::UseValueTypeAlias);
+    UpsampleTapGeometry(s,e);auto& f=s.MainFunctionBody();
+    f<<"if(global_idx>=uniforms.output_count*uniforms.output_capacity){return;}"
+      <<"if(!valid_output()){ "<<column.SetByOffset("global_idx","0.0")<<"return;}"
+      <<"let frame=global_idx%uniforms.output_capacity;let count="<<e.GetByOffset("6u")<<";"
+      <<"let source_channels=select(512u,256u,uniforms.stage==1u);"
+      <<"if(frame>=count||uniforms.input_offset>=source_channels||uniforms.input_count==0u||"
+      <<"uniforms.input_count>source_channels-uniforms.input_offset||uniforms.output_offset>=uniforms.channels||"
+      <<"uniforms.output_count>uniforms.channels-uniforms.output_offset){"
+      <<column.SetByOffset("global_idx","0.0")<<"return;}"
+      <<"let pos=upsample_source(frame,count);if(pos<0){"<<column.SetByOffset("global_idx","0.0")<<"return;}"
+      <<"let oc=uniforms.output_offset+global_idx/uniforms.output_capacity;"
+      <<"let kernel=select(20u,12u,uniforms.stage==1u);var total:f32=0.0;"
+      <<"if(uniforms.input_offset!=0u){total="<<column.GetByOffset("global_idx")<<";}"
+      <<"for(var local_ic=0u;local_ic<uniforms.input_count;local_ic++){let ic=uniforms.input_offset+local_ic;"
+      <<"let value="<<x.GetByOffset("local_ic*uniforms.input_capacity+u32(pos)")<<";"
+      <<"let negative=original_mul(value,bitcast<f32>(0x3dcccccdu));let activated=select(negative,value,value>=0.0);"
+      <<"total=original_add(total,original_mul(activated,"
+      <<w.GetByOffset("(ic*uniforms.channels+oc)*kernel+uniforms.tap")<<"));}"
+      <<column.SetByOffset("global_idx","total");
+    return Status::OK();
+  }
+};
+class UpsampleTapAdd final : public Program<UpsampleTapAdd> {
+ public:
+  UpsampleTapAdd():Program{"RW07GeneratorUpsampleTapOverlapWindowsV1"}{}
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+    {"input_capacity",ProgramUniformVariableDataType::Uint32},
+    {"output_capacity",ProgramUniformVariableDataType::Uint32},
+    {"channels",ProgramUniformVariableDataType::Uint32},
+    {"minimum",ProgramUniformVariableDataType::Uint32},
+    {"maximum",ProgramUniformVariableDataType::Uint32},
+    {"modulus",ProgramUniformVariableDataType::Uint32},
+    {"remainder",ProgramUniformVariableDataType::Uint32},
+    {"stage",ProgramUniformVariableDataType::Uint32},
+    {"tap",ProgramUniformVariableDataType::Uint32},
+    {"output_offset",ProgramUniformVariableDataType::Uint32},
+    {"output_count",ProgramUniformVariableDataType::Uint32},
+    {"identity",ProgramUniformVariableDataType::Uint32});
+  Status GenerateShaderCode(ShaderHelper& s)const override{
+    const auto& column=s.AddInput("column",ShaderUsage::UseValueTypeAlias);
+    const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
+    const auto& b=s.AddInput("bias",ShaderUsage::UseValueTypeAlias);
+    const auto& y=s.AddOutput("accumulator",ShaderUsage::UseValueTypeAlias);
+    UpsampleTapGeometry(s,e);auto& f=s.MainFunctionBody();
+    f<<"if(global_idx>=uniforms.output_count*uniforms.output_capacity){return;}"
+      <<"if(!valid_output()){ "<<y.SetByOffset("global_idx","0.0")<<"return;}"
+      <<"let frame=global_idx%uniforms.output_capacity;let count="<<e.GetByOffset("6u")<<";"
+      <<"if(frame>=count||uniforms.output_offset>=uniforms.channels||"
+      <<"uniforms.output_count>uniforms.channels-uniforms.output_offset){"
+      <<y.SetByOffset("global_idx","0.0")<<"return;}"
+      <<"var total:f32=0.0;if(uniforms.tap!=0u){total="<<y.GetByOffset("global_idx")<<";}"
+      <<"if(upsample_source(frame,count)>=0){total=original_add(total,"<<column.GetByOffset("global_idx")<<");}"
+      <<"if(uniforms.tap+1u==select(20u,12u,uniforms.stage==1u)){"
+      <<"let oc=uniforms.output_offset+global_idx/uniforms.output_capacity;"
+      <<"total=original_add(total,"<<b.GetByOffset("oc")<<");}"<<y.SetByOffset("global_idx","total");
+    return Status::OK();
+  }
 };
 class GeneratorEdge : public WebGpuKernel {
  public:
@@ -204,13 +259,7 @@ class GeneratorEdge : public WebGpuKernel {
     const uint64_t session=c.KernelContext().M0FullGpuExtentOwnerEpochV1(),run=c.KernelContext().M0FullGpuExtentRunIdV2();
     ORT_RETURN_IF_NOT(session&&run,"RW07 generator edge current execution identity");
     const auto& limits=c.DeviceLimits();
-    auto binding=[&](const Tensor* t)->Status{
-      ORT_RETURN_IF_NOT(t&&t->DataRaw()&&t->SizeInBytes()>0&&t->SizeInBytes()<=limits.maxBufferSize&&
-                            t->SizeInBytes()<=limits.maxStorageBufferBindingSize,"RW07 generator edge binding descriptor");
-      const uint64_t actual=wgpuBufferGetSize(static_cast<WGPUBuffer>(const_cast<void*>(t->DataRaw())));
-      ORT_RETURN_IF_NOT(actual>=t->SizeInBytes()&&actual<=limits.maxBufferSize&&actual<=limits.maxStorageBufferBindingSize,
-                        "RW07 generator edge actual backing");return Status::OK();
-    };
+    auto binding=[&](const Tensor* t)->Status{return PhysicalBuffer(c,t);};
     for(uint32_t j=0;j<pairs;j++){
       x[j]=c.Input<Tensor>(2*j);e[j]=c.Input<Tensor>(2*j+1);
       ORT_RETURN_IF_NOT(Gpu(x[j])&&x[j]->IsDataType<float>()&&x[j]->Shape().NumDimensions()==3&&
@@ -240,9 +289,41 @@ class GeneratorEdge : public WebGpuKernel {
     }
     const uint64_t groups=(uint64_t(channels)*capacity_+63)/64,limit=limits.maxComputeWorkgroupsPerDimension;
     const uint64_t bytes=uint64_t(channels)*capacity_*4;
+    const bool windowed=mode_==1||mode_==2;
+    const bool windowed_upsample=mode_==0&&(x[0]->SizeInBytes()>limits.maxStorageBufferBindingSize||bytes>limits.maxStorageBufferBindingSize);
     ORT_RETURN_IF_NOT(limits.maxStorageBuffersPerShaderStage>=5&&limits.maxComputeWorkgroupSizeX>=64&&
-        limits.maxComputeInvocationsPerWorkgroup>=64&&limit>0&&groups<=limit*limit&&bytes<=limits.maxBufferSize&&
-        bytes<=limits.maxStorageBufferBindingSize,"RW07 generator edge output resources");
+        limits.maxComputeInvocationsPerWorkgroup>=64&&limit>0&&(mode_!=0||windowed_upsample||groups<=limit*limit)&&bytes<=limits.maxBufferSize,"RW07 generator edge output resources");
+    uint32_t window_channels=channels;
+    uint32_t projection_input_channels=0,projection_output_channels=0;
+    uint32_t upsample_input_channels=0,upsample_output_channels=0;
+    if(windowed_upsample){
+      ORT_RETURN_IF_ERROR(m0_residual_stages::ResidualTileChannels(c,capacities[0],uint32_t(capacity_),
+          std::max(source_channels,channels),upsample_output_channels));
+      upsample_output_channels=std::min(upsample_output_channels,channels);
+      const uint64_t prefix=limits.minStorageBufferOffsetAlignment-sizeof(float);
+      upsample_input_channels=static_cast<uint32_t>(std::min<uint64_t>(source_channels,
+          (limits.maxStorageBufferBindingSize-prefix)/(uint64_t(capacities[0])*sizeof(float))));
+      const uint64_t window_groups=(uint64_t(upsample_output_channels)*uint64_t(capacity_)+63)/64;
+      ORT_RETURN_IF_NOT(upsample_input_channels>0&&window_groups<=limit*limit,"RW07 upsample window dispatch limit");
+    }
+    if(windowed){
+      const uint32_t source_capacity=*std::max_element(capacities.begin(),capacities.end());
+      uint32_t checked_tile=0;
+      ORT_RETURN_IF_ERROR(m0_residual_stages::ResidualTileChannels(c,source_capacity,uint32_t(capacity_),channels,checked_tile));
+      const uint64_t prefix=limits.minStorageBufferOffsetAlignment-sizeof(float);
+      const uint64_t row_bytes=uint64_t(std::max(source_capacity,uint32_t(capacity_)))*sizeof(float);
+      window_channels=static_cast<uint32_t>(std::min<uint64_t>(channels,(limits.maxStorageBufferBindingSize-prefix)/row_bytes));
+      const uint64_t window_groups=(uint64_t(window_channels)*uint64_t(capacity_)+63)/64;
+      ORT_RETURN_IF_NOT(window_channels>0&&window_groups<=limit*limit,"RW07 generator edge window dispatch limit");
+    }
+    if(mode_==3){
+      ORT_RETURN_IF_ERROR(m0_residual_stages::ResidualTileChannels(c,capacities[0],uint32_t(capacity_),128u,projection_input_channels));
+      const uint64_t prefix=limits.minStorageBufferOffsetAlignment-sizeof(float);
+      const uint64_t row_bytes=uint64_t(std::max(capacities[0],uint32_t(capacity_)))*sizeof(float);
+      projection_output_channels=static_cast<uint32_t>(std::min<uint64_t>(channels,(limits.maxStorageBufferBindingSize-prefix)/row_bytes));
+      const uint64_t window_groups=(uint64_t(projection_output_channels)*uint64_t(capacity_)+63)/64;
+      ORT_RETURN_IF_NOT(projection_output_channels>0&&window_groups<=limit*limit,"RW07 projection window dispatch limit");
+    }
     auto* y=c.Output(0,TensorShape{1,channels,capacity_});auto* out=c.Output(1,TensorShape{32});
     ORT_RETURN_IF_NOT(Gpu(y)&&y->IsDataType<float>()&&Gpu(out)&&out->IsDataType<uint32_t>()&&y->DataRaw()!=out->DataRaw(),
                       "RW07 generator edge distinct output allocations");
@@ -251,6 +332,75 @@ class GeneratorEdge : public WebGpuKernel {
         ORT_RETURN_IF_NOT(target->DataRaw()!=x[j]->DataRaw()&&target->DataRaw()!=e[j]->DataRaw(),"RW07 generator edge source/output alias");}
       if(w){ORT_RETURN_IF_NOT(target->DataRaw()!=w->DataRaw()&&target->DataRaw()!=b->DataRaw(),"RW07 generator edge parameter/output alias");}
     }
+    std::optional<Tensor> scratch;
+    if(mode_==3||windowed_upsample){
+      scratch.emplace(c.CreateGPUTensor(x[0]->DataType(),TensorShape{1,windowed_upsample?upsample_output_channels:channels,capacity_}));
+      ORT_RETURN_IF_ERROR(binding(&*scratch));
+      ORT_RETURN_IF_NOT(scratch->DataRaw()!=y->DataRaw()&&scratch->DataRaw()!=out->DataRaw(),
+          "RW07 generator edge private scratch/output alias");
+      for(uint32_t j=0;j<pairs;j++){
+        ORT_RETURN_IF_NOT(scratch->DataRaw()!=x[j]->DataRaw()&&scratch->DataRaw()!=e[j]->DataRaw(),
+            "RW07 generator edge private scratch/source alias");
+      }
+      if(w){ORT_RETURN_IF_NOT(scratch->DataRaw()!=w->DataRaw()&&scratch->DataRaw()!=b->DataRaw(),
+          "RW07 generator edge private scratch/parameter alias");}
+    }
+    // Preflight every actual dispatch, using the same tensor-byte segment counts
+    // as ProgramManager, before producing the output sidecar.
+    const auto input_window=[&](uint32_t j,uint32_t offset,uint32_t count){
+      return ProgramInput::FloatBufferWindow(x[j],ProgramTensorMetadataDependency::None,
+          TensorShape{1,count,capacities[j]},offset*capacities[j],limits.minStorageBufferOffsetAlignment);
+    };
+    const auto output_window=[&](Tensor* target,uint32_t offset,uint32_t count){
+      return ProgramOutput::FloatBufferWindow(target,ProgramTensorMetadataDependency::None,
+          TensorShape{1,count,capacity_},offset*uint32_t(capacity_),limits.minStorageBufferOffsetAlignment);
+    };
+    const auto spectral_input_window=[&](uint32_t component,uint32_t offset,uint32_t count){
+      return ProgramInput::FloatBufferWindow(&*scratch,ProgramTensorMetadataDependency::None,
+          TensorShape{1,count,capacity_},(component*11u+offset)*uint32_t(capacity_),limits.minStorageBufferOffsetAlignment);
+    };
+    const auto column_input_window=[&](uint32_t count){
+      return ProgramInput::FloatBufferWindow(&*scratch,ProgramTensorMetadataDependency::None,
+          TensorShape{1,count,capacity_},0u,limits.minStorageBufferOffsetAlignment);
+    };
+    if(pairs==3){ORT_RETURN_IF_ERROR(StorageBudget(c,{e[0],e[1],e[2],out}));}
+    else if(pairs==2){ORT_RETURN_IF_ERROR(StorageBudget(c,{e[0],e[1],out}));}
+    else{ORT_RETURN_IF_ERROR(StorageBudget(c,{e[0],out}));}
+    if(windowed_upsample){
+      for(uint32_t o=0;o<channels;o+=upsample_output_channels){
+        const uint32_t count=std::min(upsample_output_channels,channels-o);
+        for(uint32_t i=0;i<source_channels;i+=upsample_input_channels){
+          ORT_RETURN_IF_ERROR(StorageBudgetWithWindows(c,input_window(0,i,std::min(upsample_input_channels,source_channels-i)),
+              output_window(&*scratch,0u,count),{out,w}));
+        }
+        ORT_RETURN_IF_ERROR(StorageBudgetWithWindows(c,column_input_window(count),output_window(y,o,count),{out,b}));
+      }
+    }else if(windowed){
+      for(uint32_t offset=0;offset<channels;offset+=window_channels){
+        const uint32_t count=std::min(window_channels,channels-offset);
+        if(pairs==3){ORT_RETURN_IF_ERROR(StorageBudgetWithWindows(c,
+            {input_window(0,offset,count),input_window(1,offset,count),input_window(2,offset,count)},output_window(y,offset,count),{out}));}
+        else{ORT_RETURN_IF_ERROR(StorageBudgetWithWindows(c,
+            {input_window(0,offset,count),input_window(1,offset,count)},output_window(y,offset,count),{out}));}
+      }
+    }else if(mode_==3){
+      for(uint32_t i=0;i<128;i+=projection_input_channels){
+        for(uint32_t o=0;o<channels;o+=projection_output_channels){
+          ORT_RETURN_IF_ERROR(StorageBudgetWithWindows(c,input_window(0,i,std::min(projection_input_channels,128u-i)),
+              output_window(&*scratch,o,std::min(projection_output_channels,channels-o)),{out,w,b}));
+        }
+      }
+      const uint32_t spectral_tile=std::min(11u,projection_output_channels);
+      for(uint32_t component=0;component<2;component++){
+        for(uint32_t offset=0;offset<11;offset+=spectral_tile){
+          const uint32_t count=std::min(spectral_tile,11u-offset);
+          ORT_RETURN_IF_ERROR(StorageBudgetWithWindows(c,
+              {spectral_input_window(0,offset,count),spectral_input_window(1,offset,count)},
+              output_window(y,component*11u+offset,count),{out}));
+        }
+      }
+    }else if(mode_==0){ORT_RETURN_IF_ERROR(StorageBudget(c,{x[0],out,w,b,y}));}
+    else{ORT_RETURN_IF_ERROR(StorageBudget(c,{x[0],x[1],out,y}));}
     M0FullGpuAllocationIdentity output;
     ORT_RETURN_IF_NOT(c.M0FullGpuClaimExtentV2(*out,*y,role,role+1001,output),"RW07 generator edge output claim");
     const m0_extent_abi2::OpaqueOwnership owner{session,run,output.generation,output.data_generation,role,role+1001};
@@ -264,35 +414,102 @@ class GeneratorEdge : public WebGpuKernel {
           gsl::span<const uint32_t>{paired.data(),paired.size()},gsl::span<const uint32_t>{source_words.data(),source_words.size()},
           uint32_t(capacity_),channels,uint32_t(stage_),identity});
     ORT_RETURN_IF_ERROR(c.RunProgram(guard));
+    if(windowed_upsample){
+      const uint32_t kernel=stage_==0?20u:12u;
+      for(uint32_t o=0;o<channels;o+=upsample_output_channels){
+        const uint32_t co=std::min(upsample_output_channels,channels-o);
+        const uint64_t window_groups=(uint64_t(co)*uint64_t(capacity_)+63)/64;
+        const uint64_t gx=std::min(window_groups,limit),gy=(window_groups+gx-1)/gx;
+        for(uint32_t tap=0;tap<kernel;tap++){
+          for(uint32_t i=0;i<source_channels;i+=upsample_input_channels){
+            const uint32_t ic=std::min(upsample_input_channels,source_channels-i);
+            UpsampleTapColumn column;
+            column.AddInput(input_window(0,i,ic)).AddInputs({{out,ProgramTensorMetadataDependency::None},{w,ProgramTensorMetadataDependency::None}})
+                .AddOutput(output_window(&*scratch,0u,co)).SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
+                .AddUniformVariables({capacities[0],uint32_t(capacity_),channels,minimum,maximum,modulus,remainder,
+                    uint32_t(stage_),tap,i,ic,o,co,identity});
+            ORT_RETURN_IF_ERROR(c.RunProgram(column));
+          }
+          UpsampleTapAdd add;
+          add.AddInput(column_input_window(co)).AddInputs({{out,ProgramTensorMetadataDependency::None},{b,ProgramTensorMetadataDependency::None}})
+              .AddOutput(output_window(y,o,co)).SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
+              .AddUniformVariables({capacities[0],uint32_t(capacity_),channels,minimum,maximum,modulus,remainder,
+                  uint32_t(stage_),tap,o,co,identity});
+          ORT_RETURN_IF_ERROR(c.RunProgram(add));
+        }
+      }
+      LOGS(c.Logger(),INFO)<<"M0_RW07_GENERATOR_EDGE_V1 mode="<<mode_<<" stage="<<stage_<<" role="<<role
+          <<" session="<<session<<" run="<<run<<" GPU_dispatches="<<(1+((channels+upsample_output_channels-1)/upsample_output_channels)*
+              kernel*(1+(source_channels+upsample_input_channels-1)/upsample_input_channels))
+          <<" input_tile_channels="<<upsample_input_channels<<" output_tile_channels="<<upsample_output_channels
+          <<" column_scratch_bytes="<<scratch->SizeInBytes()<<" host_payload_reads=0";
+      return Status::OK();
+    }
+    if(windowed){
+      for(uint32_t offset=0;offset<channels;offset+=window_channels){
+        const uint32_t count=std::min(window_channels,channels-offset);
+        EdgeData data{mode_,pairs};data.CacheHint(std::to_string(mode_));
+        for(uint32_t j=0;j<pairs;j++) data.AddInput(input_window(j,offset,count));
+        const uint64_t window_groups=(uint64_t(count)*uint64_t(capacity_)+63)/64;
+        const uint64_t gx=std::min(window_groups,limit),gy=(window_groups+gx-1)/gx;
+        data.AddInput({out,ProgramTensorMetadataDependency::None}).AddOutput(output_window(y,offset,count))
+            .SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
+            .AddUniformVariables({capspan,uint32_t(capacity_),channels,minimum,maximum,modulus,remainder,uint32_t(stage_),count,0u,identity});
+        ORT_RETURN_IF_ERROR(c.RunProgram(data));
+      }
+      LOGS(c.Logger(),INFO)<<"M0_RW07_GENERATOR_EDGE_V1 mode="<<mode_<<" stage="<<stage_<<" role="<<role
+          <<" session="<<session<<" run="<<run<<" GPU_dispatches="<<(1+(channels+window_channels-1)/window_channels)
+          <<" window_channels="<<window_channels<<" merge_scratch_bytes=0 host_payload_reads=0";
+      return Status::OK();
+    }
+    if(mode_==3){
+      auto& convolved=*scratch;
+      for(uint32_t i=0;i<128;i+=projection_input_channels){
+        for(uint32_t o=0;o<channels;o+=projection_output_channels){
+          const uint32_t ic=std::min(projection_input_channels,128u-i),co=std::min(projection_output_channels,channels-o);
+          const uint64_t window_groups=(uint64_t(co)*uint64_t(capacity_)+63)/64;
+          const uint64_t gx=std::min(window_groups,limit),gy=(window_groups+gx-1)/gx;
+          m0_residual_stages::GeneratorChannelConv convolution;
+          convolution.AddInput(input_window(0,i,ic)).AddInputs({{out,ProgramTensorMetadataDependency::None},
+              {w,ProgramTensorMetadataDependency::None},{b,ProgramTensorMetadataDependency::None}})
+              .AddOutput(output_window(&convolved,o,co)).SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
+              .AddUniformVariables({capacities[0],uint32_t(capacity_),channels,minimum,maximum,modulus,remainder,
+                  128u,7u,1u,3u,1u,0u,1u,i,ic,o,co,identity});
+          ORT_RETURN_IF_ERROR(c.RunProgram(convolution));
+        }
+      }
+      const uint32_t spectral_tile=std::min(11u,projection_output_channels);
+      const std::array<uint32_t,3> scratch_cap{uint32_t(capacity_),uint32_t(capacity_),0u};
+      for(uint32_t component=0;component<2;component++){
+        for(uint32_t offset=0;offset<11;offset+=spectral_tile){
+          const uint32_t count=std::min(spectral_tile,11u-offset);
+          const uint64_t window_groups=(uint64_t(count)*uint64_t(capacity_)+63)/64;
+          const uint64_t gx=std::min(window_groups,limit),gy=(window_groups+gx-1)/gx;
+          EdgeData spectral{4,2};spectral.CacheHint("spectral");
+          spectral.AddInputs({spectral_input_window(0,offset,count),spectral_input_window(1,offset,count),
+              {out,ProgramTensorMetadataDependency::None}})
+              .AddOutput(output_window(y,component*11u+offset,count)).SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
+              .AddUniformVariables({gsl::span<const uint32_t>{scratch_cap.data(),scratch_cap.size()},uint32_t(capacity_),channels,
+                  minimum,maximum,modulus,remainder,uint32_t(stage_),count,component,identity});
+          ORT_RETURN_IF_ERROR(c.RunProgram(spectral));
+        }
+      }
+      LOGS(c.Logger(),INFO)<<"M0_RW07_GENERATOR_EDGE_V1 mode="<<mode_<<" stage="<<stage_<<" role="<<role
+          <<" session="<<session<<" run="<<run<<" GPU_dispatches="<<(1+((128u+projection_input_channels-1)/projection_input_channels)*
+              ((channels+projection_output_channels-1)/projection_output_channels)+2*((11u+spectral_tile-1)/spectral_tile))
+          <<" input_tile_channels="<<projection_input_channels<<" output_tile_channels="<<projection_output_channels<<" host_payload_reads=0";
+      return Status::OK();
+    }
     EdgeData data{mode_,pairs};data.CacheHint(std::to_string(mode_));
     for(uint32_t j=0;j<pairs;j++){data.AddInput({x[j],ProgramTensorMetadataDependency::None});}
     data.AddInput({out,ProgramTensorMetadataDependency::None});
     if(w){data.AddInputs({{w,ProgramTensorMetadataDependency::None},{b,ProgramTensorMetadataDependency::None}});}
     const uint64_t gx=std::min(groups,limit),gy=(groups+gx-1)/gx;
-    if(mode_==3){
-      auto convolved=c.CreateGPUTensor(x[0]->DataType(),TensorShape{1,22,capacity_});
-      ORT_RETURN_IF_ERROR(binding(&convolved));
-      ORT_RETURN_IF_NOT(convolved.DataRaw()!=y->DataRaw()&&convolved.DataRaw()!=out->DataRaw()&&
-          convolved.DataRaw()!=x[0]->DataRaw()&&convolved.DataRaw()!=e[0]->DataRaw()&&
-          convolved.DataRaw()!=w->DataRaw()&&convolved.DataRaw()!=b->DataRaw(),"RW07 generator projection private scratch alias");
-      data.AddOutput({&convolved,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64)
-        .SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
-        .AddUniformVariables({capspan,uint32_t(capacity_),channels,minimum,maximum,modulus,remainder,uint32_t(stage_),identity});
-      ORT_RETURN_IF_ERROR(c.RunProgram(data));
-      EdgeData spectral{4,1};spectral.CacheHint("spectral");
-      const std::array<uint32_t,3> scratch_cap{uint32_t(capacity_),0u,0u};
-      spectral.AddInputs({{&convolved,ProgramTensorMetadataDependency::None},{out,ProgramTensorMetadataDependency::None}})
-        .AddOutput({y,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
-        .AddUniformVariables({gsl::span<const uint32_t>{scratch_cap.data(),scratch_cap.size()},uint32_t(capacity_),channels,
-            minimum,maximum,modulus,remainder,uint32_t(stage_),identity});
-      ORT_RETURN_IF_ERROR(c.RunProgram(spectral));
-    }else{
-      data.AddOutput({y,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
-        .AddUniformVariables({capspan,uint32_t(capacity_),channels,minimum,maximum,modulus,remainder,uint32_t(stage_),identity});
-      ORT_RETURN_IF_ERROR(c.RunProgram(data));
-    }
+    data.AddOutput({y,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
+        .AddUniformVariables({capspan,uint32_t(capacity_),channels,minimum,maximum,modulus,remainder,uint32_t(stage_),channels,0u,identity});
+    ORT_RETURN_IF_ERROR(c.RunProgram(data));
     LOGS(c.Logger(),INFO)<<"M0_RW07_GENERATOR_EDGE_V1 mode="<<mode_<<" stage="<<stage_<<" role="<<role
-      <<" session="<<session<<" run="<<run<<" GPU_dispatches="<<(mode_==3?3:2)<<" host_payload_reads=0";
+      <<" session="<<session<<" run="<<run<<" GPU_dispatches=2 host_payload_reads=0";
     return Status::OK();
   }
  private:
@@ -349,19 +566,12 @@ class Packet final : public WebGpuKernel {
     ORT_RETURN_IF_NOT(limits.maxStorageBuffersPerShaderStage >= 2 && limits.maxComputeWorkgroupsPerDimension >= 1 &&
                           limits.maxComputeWorkgroupSizeX >= 1 && limits.maxComputeInvocationsPerWorkgroup >= 1,
                       "RW07 generator projection packet resources");
-    auto binding = [&](const Tensor* t) -> Status {
-      ORT_RETURN_IF_NOT(t->DataRaw() && t->SizeInBytes() <= limits.maxBufferSize && t->SizeInBytes() <= limits.maxStorageBufferBindingSize,
-                        "RW07 generator projection packet binding descriptor");
-      const uint64_t bytes = wgpuBufferGetSize(static_cast<WGPUBuffer>(const_cast<void*>(t->DataRaw())));
-      ORT_RETURN_IF_NOT(bytes >= t->SizeInBytes() && bytes <= limits.maxBufferSize && bytes <= limits.maxStorageBufferBindingSize,
-                        "RW07 generator projection packet actual backing");
-      return Status::OK();
-    };
-    ORT_RETURN_IF_ERROR(binding(e)); ORT_RETURN_IF_ERROR(binding(y));
+    // Carrier ownership is required, but this shader binds only e and p.
+    ORT_RETURN_IF_ERROR(PhysicalBuffer(c,y));
     auto* p = c.Output(0, TensorShape{18});
     ORT_RETURN_IF_NOT(Gpu(p) && p->IsDataType<uint32_t>() && p->DataRaw() != e->DataRaw() && p->DataRaw() != y->DataRaw(),
                       "RW07 generator projection distinct packet output");
-    ORT_RETURN_IF_ERROR(binding(p));
+    ORT_RETURN_IF_ERROR(StorageBudget(c,{e,p}));
     const m0_extent_abi2::OpaqueOwnership owner{session, run, pair.generation, pair.data_generation, 74u, 1075u};
     ORT_RETURN_IF_NOT(owner.Valid(), "RW07 generator projection packet opaque ownership");
     const auto words = owner.UniformWords();

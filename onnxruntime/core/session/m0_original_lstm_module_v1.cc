@@ -161,7 +161,9 @@ std::unique_ptr<M0OriginalLstmModuleV1> M0OriginalLstmModuleV1::Open(const loggi
   for (const auto* key : {"session.disable_cpu_ep_fallback", "session.disable_prepacking", "session.disable_aot_function_inlining"})
     ORT_THROW_IF_ERROR(impl->options.value.config_options.AddConfigEntry(key, "1"));
   ORT_THROW_IF_ERROR(impl->options.AddProviderOptionsToConfigOptions(
-      {{"validationMode", "full"}, {"enableGraphCapture", "0"}, {"enableInt64", "1"}, {"weightLoadAcceleration", "off"}, {"sessionBufferPoolGenerations", "0"}, {"dawnBackendType", "Vulkan"}},
+      {{"validationMode", "full"}, {"enableGraphCapture", "0"}, {"enableInt64", "1"}, {"weightLoadAcceleration", "off"},
+       {"storageBufferCacheMode", "disabled"}, {"uniformBufferCacheMode", "disabled"},
+       {"sessionBufferPoolGenerations", "0"}, {"dawnBackendType", "Vulkan"}},
       kWebGpuExecutionProvider));
   const OrtEpDevice* device = impl->devices.front().get();
   impl->factory = std::make_unique<PluginExecutionProviderFactory>(*selected,
@@ -189,6 +191,28 @@ std::shared_ptr<KernelRegistry> M0OriginalLstmModuleV1::Registry() const {
   impl_->file.Verify();
   return impl_->registry;
 }
+M0OriginalLstmModuleV1::NativeSnapshotV1 M0OriginalLstmModuleV1::ReadNativeSnapshot(
+    uintptr_t handle,uint64_t required_bytes) const {
+  // Each operation authenticates its complete live observation before and
+  // after querying. No digest or initialization permission is cached.
+  impl_->file.Verify();
+  NativeSnapshotV1 result;
+  ORT_ENFORCE(impl_->provider&&impl_->provider->GetOrtEp()&&impl_->providers&&impl_->registry&&
+                  impl_->providers->Get(kWebGpuExecutionProvider)==impl_->provider,
+              "RW07_NATIVE_SNAPSHOT_OWNED_PROVIDER");
+  result.registry=impl_->registry;
+  result.provider=impl_->provider;
+  result.providers=impl_->providers.get();
+  ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeResourceV3(impl_->provider->GetOrtEp(),0,0,result.context));
+  for(const auto& record:kM0NativeKernelRecordsV2)
+    ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeKernelV2(record.id,result.bindings[record.id-1]));
+  if(handle||required_bytes)
+    ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeResourceV3(
+        impl_->provider->GetOrtEp(),handle,required_bytes,result.resource));
+  else result.resource=result.context;
+  impl_->file.Verify();
+  return result;
+}
 std::array<M0NativeProviderKernelBindingV2,42> M0OriginalLstmModuleV1::NativeBindingsV2() const {
   impl_->file.Verify();
   std::array<M0NativeProviderKernelBindingV2,42> result;
@@ -200,6 +224,14 @@ M0NativeResourceBindingV3 M0OriginalLstmModuleV1::NativeResourceV3(uintptr_t han
  impl_->file.Verify();M0NativeResourceBindingV3 result;
  ORT_ENFORCE(impl_->provider&&impl_->provider->GetOrtEp(),"RW07_NATIVE_RESOURCE_OWNED_EP");
  ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeResourceV3(impl_->provider->GetOrtEp(),handle,required_bytes,result));
+ impl_->file.Verify();return result;
+}
+M0NativeDeviceLimitsV1 M0OriginalLstmModuleV1::NativeDeviceLimitsV1(
+ uint64_t storage_bytes,uint64_t initializer_bytes,uint64_t uniform_bytes)const{
+ impl_->file.Verify();M0NativeDeviceLimitsV1 result;
+ ORT_ENFORCE(impl_->provider&&impl_->provider->GetOrtEp(),"RW07_NATIVE_DEVICE_LIMITS_OWNED_EP");
+ ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeDeviceLimitsV1(impl_->provider->GetOrtEp(),
+   storage_bytes,initializer_bytes,uniform_bytes,result));
  impl_->file.Verify();return result;
 }
 const M0PluginKernelCreatorBindingV1& M0OriginalLstmModuleV1::Binding() const {
@@ -216,8 +248,12 @@ std::unique_ptr<M0OriginalLstmModuleV1> M0OriginalLstmModuleV1::Open(const loggi
 PluginExecutionProvider& M0OriginalLstmModuleV1::Provider() const { ORT_THROW("RW07_LSTM_MODULE_UNSUPPORTED"); }
 const ExecutionProviders& M0OriginalLstmModuleV1::Providers() const { ORT_THROW("RW07_LSTM_MODULE_UNSUPPORTED"); }
 std::shared_ptr<KernelRegistry> M0OriginalLstmModuleV1::Registry() const { ORT_THROW("RW07_LSTM_MODULE_UNSUPPORTED"); }
+M0OriginalLstmModuleV1::NativeSnapshotV1 M0OriginalLstmModuleV1::ReadNativeSnapshot(uintptr_t,uint64_t) const {
+  ORT_THROW("RW07_NATIVE_MODULE_UNSUPPORTED");
+}
 const M0PluginKernelCreatorBindingV1& M0OriginalLstmModuleV1::Binding() const { ORT_THROW("RW07_LSTM_MODULE_UNSUPPORTED"); }
 std::array<M0NativeProviderKernelBindingV2,42> M0OriginalLstmModuleV1::NativeBindingsV2() const { ORT_THROW("RW07_NATIVE_MODULE_UNSUPPORTED"); }
 M0NativeResourceBindingV3 M0OriginalLstmModuleV1::NativeResourceV3(uintptr_t,uint64_t)const { ORT_THROW("RW07_NATIVE_RESOURCE_UNSUPPORTED"); }
+M0NativeDeviceLimitsV1 M0OriginalLstmModuleV1::NativeDeviceLimitsV1(uint64_t,uint64_t,uint64_t)const { ORT_THROW("RW07_NATIVE_DEVICE_LIMITS_UNSUPPORTED"); }
 }  // namespace onnxruntime
 #endif

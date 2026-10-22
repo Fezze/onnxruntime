@@ -6,25 +6,20 @@
 #include "core/providers/webgpu/webgpu_kernel.h"
 #include "core/providers/webgpu/shader_helper.h"
 #include "core/providers/webgpu/m0_fullgpu_extent_abi2.h"
+#include "core/providers/webgpu/tensor/m0_fullgpu_residual_stages_v1.h"
 
 namespace onnxruntime::webgpu {
 namespace {
 bool Gpu(const Tensor* t) { return t && t->Location().device.Type() == OrtDevice::GPU; }
-void ValidOutput(ShaderHelper& s, const ShaderVariableHelper& e) {
-  auto& f = s.AdditionalImplementation();
-  f << "fn valid_output()->bool {if(" << e.GetByOffset("0u") << "!=2u||"
-    << e.GetByOffset("1u") << "!=3u||" << e.GetByOffset("20u") << "!=0u||"
-    << e.GetByOffset("21u") << "!=63u){return false;}"
-    << "for(var i=0u;i<10u;i++){if(" << e.GetByOffset("22u+i") << "!="
-    << GetElementAt("uniforms.identity", "i", 10) << "){return false;}}"
-    << "if(" << e.GetByOffset("2u") << "!=1u||" << e.GetByOffset("3u") << "!=0u||"
-    << e.GetByOffset("4u") << "!=uniforms.channels||" << e.GetByOffset("5u") << "!=0u||"
-    << e.GetByOffset("7u") << "!=0u||" << e.GetByOffset("19u") << "!=0u){return false;}"
-    << "for(var i=8u;i<18u;i++){if(" << e.GetByOffset("i") << "!=0u){return false;}}"
-    << "let n=" << e.GetByOffset("6u") << ";return n>=uniforms.minimum&&n<=uniforms.maximum&&"
-    << "n%uniforms.modulus==uniforms.remainder&&n<=uniforms.output_capacity&&"
-    << e.GetByOffset("18u") << "==uniforms.channels*n;}\n";
-}
+using m0_residual_stages::ValidOutput;
+using m0_residual_stages::PhysicalBuffer;
+using m0_residual_stages::StorageBudget;
+using m0_residual_stages::StorageBudgetWithWindow;
+using m0_residual_stages::StorageBudgetWithWindows;
+using m0_residual_stages::GeneratorStyleParameters;
+using m0_residual_stages::GeneratorNormSnake;
+using m0_residual_stages::GeneratorResidualConv;
+using m0_residual_stages::GeneratorResidualAdd;
 class Guard final : public Program<Guard> {
  public:
   Guard() : Program{"RW07NoiseResidualAfter1600GuardV1"} {}
@@ -73,153 +68,6 @@ class Guard final : public Program<Guard> {
     return Status::OK();
   }
 };
-class NoiseNormSnake final : public Program<NoiseNormSnake> {
- public:
-  NoiseNormSnake() : Program{"RW07NoiseResidualNormSnakeV1"} {}
-  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
-      {"input_capacity", ProgramUniformVariableDataType::Uint32},
-      {"output_capacity", ProgramUniformVariableDataType::Uint32},
-      {"channels", ProgramUniformVariableDataType::Uint32},
-      {"minimum", ProgramUniformVariableDataType::Uint32},
-      {"maximum", ProgramUniformVariableDataType::Uint32},
-      {"modulus", ProgramUniformVariableDataType::Uint32},
-      {"remainder", ProgramUniformVariableDataType::Uint32},
-      {"kernel", ProgramUniformVariableDataType::Uint32},
-      {"dilation", ProgramUniformVariableDataType::Uint32},
-      {"residual_capacity", ProgramUniformVariableDataType::Uint32},
-      {"identity", ProgramUniformVariableDataType::Uint32});
-  Status GenerateShaderCode(ShaderHelper& s) const override {
-    const auto& x=s.AddInput("carrier",ShaderUsage::UseValueTypeAlias);
-    const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
-    const auto& style=s.AddInput("style",ShaderUsage::UseValueTypeAlias);
-    const auto& w=s.AddInput("fc_weight",ShaderUsage::UseValueTypeAlias);
-    const auto& b=s.AddInput("fc_bias",ShaderUsage::UseValueTypeAlias);
-    const auto& alpha=s.AddInput("alpha",ShaderUsage::UseValueTypeAlias);
-    const auto& reciprocal=s.AddInput("reciprocal",ShaderUsage::UseValueTypeAlias);
-    const auto& y=s.AddOutput("activated",ShaderUsage::UseValueTypeAlias);
-    ValidOutput(s,e);
-    s.AdditionalImplementation() << R"WGSL(
-fn original_mul(a:f32,b:f32)->f32 {
- let aa=bitcast<u32>(a)&0x7fffffffu;let bb=bitcast<u32>(b)&0x7fffffffu;
- if(aa>0x7f800000u||bb>0x7f800000u||(aa==0u&&bb==0x7f800000u)||(bb==0u&&aa==0x7f800000u)){
- return bitcast<f32>(0x7fc00000u);}
- if(aa==0x7f800000u||bb==0x7f800000u){return bitcast<f32>(((bitcast<u32>(a)^bitcast<u32>(b))&0x80000000u)|0x7f800000u);}
- return a*b;
-}
-fn original_add(a:f32,b:f32)->f32 {
- let aa=bitcast<u32>(a)&0x7fffffffu;let bb=bitcast<u32>(b)&0x7fffffffu;
- if(aa>0x7f800000u||bb>0x7f800000u||(aa==0x7f800000u&&bb==0x7f800000u&&((bitcast<u32>(a)^bitcast<u32>(b))&0x80000000u)!=0u)){
- return bitcast<f32>(0x7fc00000u);}
- if(aa==0x7f800000u){return a;}if(bb==0x7f800000u){return b;}return a+b;
-}
-fn original_sub(a:f32,b:f32)->f32{return original_add(a,-b);}
-fn original_sqrt(x:f32)->f32 {
- let bits=bitcast<u32>(x);let magnitude=bits&0x7fffffffu;
- if(magnitude>0x7f800000u||((bits&0x80000000u)!=0u&&magnitude!=0u)){return bitcast<f32>(0x7fc00000u);}
- if(magnitude==0x7f800000u||magnitude==0u){return x;}return sqrt(x);
-}
-fn original_div(a:f32,b:f32)->f32 {
- let ua=bitcast<u32>(a);let ub=bitcast<u32>(b);let aa=ua&0x7fffffffu;let bb=ub&0x7fffffffu;
- let sign=(ua^ub)&0x80000000u;
- if(aa>0x7f800000u||bb>0x7f800000u||(aa==0u&&bb==0u)||(aa==0x7f800000u&&bb==0x7f800000u)){return bitcast<f32>(0x7fc00000u);}
- if(bb==0u||aa==0x7f800000u){return bitcast<f32>(sign|0x7f800000u);}
- if(aa==0u||bb==0x7f800000u){return bitcast<f32>(sign);}return a/b;
-}
-)WGSL";
-    auto& f=s.MainFunctionBody();
-    f << "if(global_idx>=uniforms.channels){return;}let channel=global_idx;"
-      << "for(var t=0u;t<uniforms.output_capacity;t++){"
-      << y.SetByOffset("channel*uniforms.output_capacity+t","0.0") << "}if(!valid_output()){return;}"
-      << "let count=" << e.GetByOffset("6u") << ";var sum:f32=0.0;"
-      << "for(var t=0u;t<count;t++){sum=original_add(sum," << x.GetByOffset("channel*uniforms.input_capacity+t") << ");}"
-      << "let mean=original_div(sum,f32(count));var squares:f32=0.0;"
-      << "for(var t=0u;t<count;t++){let delta=original_sub(" << x.GetByOffset("channel*uniforms.input_capacity+t") << ",mean);"
-      << "squares=original_add(squares,original_mul(delta,delta));}"
-      << "let variance=original_div(squares,f32(count));let denominator=original_sqrt(original_add(variance,bitcast<f32>(0x3727c5acu)));"
-      << "var gs:f32=0.0;var bs:f32=0.0;for(var k=0u;k<128u;k++){let value=" << style.GetByOffset("k") << ";"
-      << "gs=original_add(gs,original_mul(value," << w.GetByOffset("channel*128u+k") << "));"
-      << "bs=original_add(bs,original_mul(value," << w.GetByOffset("(channel+uniforms.channels)*128u+k") << "));}"
-      << "let gamma=original_add(original_add(gs," << b.GetByOffset("channel") << "),1.0);"
-      << "let beta=original_add(bs," << b.GetByOffset("channel+uniforms.channels") << ");"
-      << "let a=" << alpha.GetByOffset("channel") << ";let reciprocal_a=" << reciprocal.GetByOffset("channel") << ";"
-      << "for(var t=0u;t<count;t++){let centered=original_sub(" << x.GetByOffset("channel*uniforms.input_capacity+t") << ",mean);"
-      << "let normalized=original_div(centered,denominator);let affine=original_add(original_mul(gamma,normalized),beta);"
-      << "let angle=original_mul(a,affine);let bits=bitcast<u32>(angle)&0x7fffffffu;var sine:f32=bitcast<f32>(0x7fc00000u);"
-      << "if(bits<0x7f800000u){sine=sin(angle);}let square=original_mul(sine,sine);"
-      << "let result=original_add(affine,original_mul(reciprocal_a,square));"
-      << y.SetByOffset("channel*uniforms.output_capacity+t","result") << "}";
-    return Status::OK();
-  }
-};
-class NoiseResidualConv final : public Program<NoiseResidualConv> {
- public:
-  explicit NoiseResidualConv(bool residual) : Program{"RW07NoiseResidualConvV1"}, residual_(residual) {}
-  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
-      {"input_capacity", ProgramUniformVariableDataType::Uint32},
-      {"output_capacity", ProgramUniformVariableDataType::Uint32},
-      {"channels", ProgramUniformVariableDataType::Uint32},
-      {"minimum", ProgramUniformVariableDataType::Uint32},
-      {"maximum", ProgramUniformVariableDataType::Uint32},
-      {"modulus", ProgramUniformVariableDataType::Uint32},
-      {"remainder", ProgramUniformVariableDataType::Uint32},
-      {"kernel", ProgramUniformVariableDataType::Uint32},
-      {"dilation", ProgramUniformVariableDataType::Uint32},
-      {"residual_capacity", ProgramUniformVariableDataType::Uint32},
-      {"identity", ProgramUniformVariableDataType::Uint32});
-  Status GenerateShaderCode(ShaderHelper& s) const override {
-    const auto& x=s.AddInput("carrier",ShaderUsage::UseValueTypeAlias);
-    const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
-    const auto& w=s.AddInput("weight",ShaderUsage::UseValueTypeAlias);
-    const auto& b=s.AddInput("bias",ShaderUsage::UseValueTypeAlias);
-    const ShaderVariableHelper* prior=residual_? &s.AddInput("prior",ShaderUsage::UseValueTypeAlias):nullptr;
-    const auto& y=s.AddOutput("output",ShaderUsage::UseValueTypeAlias);
-    ValidOutput(s,e);
-    s.AdditionalImplementation() << R"WGSL(
-fn original_mul(a:f32,b:f32)->f32 {
- let aa=bitcast<u32>(a)&0x7fffffffu;let bb=bitcast<u32>(b)&0x7fffffffu;
- if(aa>0x7f800000u||bb>0x7f800000u||(aa==0u&&bb==0x7f800000u)||(bb==0u&&aa==0x7f800000u)){
- return bitcast<f32>(0x7fc00000u);}
- if(aa==0x7f800000u||bb==0x7f800000u){return bitcast<f32>(((bitcast<u32>(a)^bitcast<u32>(b))&0x80000000u)|0x7f800000u);}
- return a*b;
-}
-fn original_add(a:f32,b:f32)->f32 {
- let aa=bitcast<u32>(a)&0x7fffffffu;let bb=bitcast<u32>(b)&0x7fffffffu;
- if(aa>0x7f800000u||bb>0x7f800000u||(aa==0x7f800000u&&bb==0x7f800000u&&((bitcast<u32>(a)^bitcast<u32>(b))&0x80000000u)!=0u)){
- return bitcast<f32>(0x7fc00000u);}
- if(aa==0x7f800000u){return a;}if(bb==0x7f800000u){return b;}return a+b;
-}
-fn original_sub(a:f32,b:f32)->f32{return original_add(a,-b);}
-fn original_sqrt(x:f32)->f32 {
- let bits=bitcast<u32>(x);let magnitude=bits&0x7fffffffu;
- if(magnitude>0x7f800000u||((bits&0x80000000u)!=0u&&magnitude!=0u)){return bitcast<f32>(0x7fc00000u);}
- if(magnitude==0x7f800000u||magnitude==0u){return x;}return sqrt(x);
-}
-fn original_div(a:f32,b:f32)->f32 {
- let ua=bitcast<u32>(a);let ub=bitcast<u32>(b);let aa=ua&0x7fffffffu;let bb=ub&0x7fffffffu;
- let sign=(ua^ub)&0x80000000u;
- if(aa>0x7f800000u||bb>0x7f800000u||(aa==0u&&bb==0u)||(aa==0x7f800000u&&bb==0x7f800000u)){return bitcast<f32>(0x7fc00000u);}
- if(bb==0u||aa==0x7f800000u){return bitcast<f32>(sign|0x7f800000u);}
- if(aa==0u||bb==0x7f800000u){return bitcast<f32>(sign);}return a/b;
-}
-)WGSL";
-    auto& f=s.MainFunctionBody();
-    f << "if(global_idx>=uniforms.channels*uniforms.output_capacity){return;}"
-      << y.SetByOffset("global_idx","0.0") << "if(!valid_output()){return;}"
-      << "let count=" << e.GetByOffset("6u") << ";let t=global_idx%uniforms.output_capacity;"
-      << "let oc=global_idx/uniforms.output_capacity;if(t>=count){return;}var total:f32=0.0;"
-      << "let pad=i32((uniforms.kernel-1u)*uniforms.dilation/2u);"
-      << "for(var ic=0u;ic<uniforms.channels;ic++){for(var k=0u;k<uniforms.kernel;k++){"
-      << "let pos=i32(t)+i32(k*uniforms.dilation)-pad;var value:f32=0.0;"
-      << "if(pos>=0&&pos<i32(count)){value=" << x.GetByOffset("ic*uniforms.input_capacity+u32(pos)") << ";}"
-      << "total=original_add(total,original_mul(value," << w.GetByOffset("(oc*uniforms.channels+ic)*uniforms.kernel+k") << "));}}"
-      << "let convolved=original_add(total," << b.GetByOffset("oc") << ");";
-    if(residual_){f << y.SetByOffset("global_idx","original_add(convolved,"+prior->GetByOffset("oc*uniforms.residual_capacity+t")+")");}
-    else {f << y.SetByOffset("global_idx","convolved");}
-    return Status::OK();
-  }
- private:
-  const bool residual_;
-};
 class NoiseResidualExtent final : public WebGpuKernel {
  public:
   explicit NoiseResidualExtent(const OpKernelInfo& i) : WebGpuKernel{i},
@@ -246,21 +94,25 @@ class NoiseResidualExtent final : public WebGpuKernel {
                           "RW07 noise residual exact immutable parameters");
       }
     }
-    const auto& limits=c.DeviceLimits();const uint64_t groups=(uint64_t(channels)*capacity_+63)/64;
+    const auto& limits=c.DeviceLimits();
     const uint64_t limit=limits.maxComputeWorkgroupsPerDimension, bytes=uint64_t(channels)*capacity_*4;
-    ORT_RETURN_IF_NOT(limits.maxStorageBuffersPerShaderStage>=8&&limits.maxComputeWorkgroupSizeX>=64&&
-                          limits.maxComputeInvocationsPerWorkgroup>=64&&limit>=4&&groups<=limit*limit&&
-                          bytes<=limits.maxBufferSize&&bytes<=limits.maxStorageBufferBindingSize,
+    ORT_RETURN_IF_NOT(limits.maxStorageBuffersPerShaderStage>=7&&limits.maxComputeWorkgroupSizeX>=64&&
+                          limits.maxComputeInvocationsPerWorkgroup>=64&&limit>=4&&
+                          bytes<=limits.maxBufferSize,
                       "RW07 noise residual resource and dispatch capacity");
-    auto binding=[&](const Tensor* t)->Status{
-      ORT_RETURN_IF_NOT(t&&t->DataRaw()&&t->SizeInBytes()>0&&t->SizeInBytes()<=limits.maxBufferSize&&
-                            t->SizeInBytes()<=limits.maxStorageBufferBindingSize,"RW07 noise residual binding descriptor");
-      const uint64_t actual=wgpuBufferGetSize(static_cast<WGPUBuffer>(const_cast<void*>(t->DataRaw())));
-      ORT_RETURN_IF_NOT(actual>=t->SizeInBytes()&&actual<=limits.maxBufferSize&&actual<=limits.maxStorageBufferBindingSize,
-                        "RW07 noise residual backing buffer");return Status::OK();
-    };
+    auto binding=[&](const Tensor* t)->Status{return PhysicalBuffer(c,t);};
     for(const auto* t:{x,e,style}){ORT_RETURN_IF_ERROR(binding(t));}
     for(const auto* t:params){ORT_RETURN_IF_ERROR(binding(t));}
+    const uint32_t pc=uint32_t(x->Shape()[2]),oc=uint32_t(capacity_);
+    uint32_t tile_channels=0;
+    ORT_RETURN_IF_ERROR(m0_residual_stages::ResidualTileChannels(c,pc,oc,channels,tile_channels));
+    // The tile planner validated both complete rows and the worst alignment prefix.
+    const uint64_t prefix=limits.minStorageBufferOffsetAlignment-sizeof(float);
+    const uint64_t row_bytes=uint64_t(std::max(pc,oc))*sizeof(float);
+    const uint32_t output_tile_channels=static_cast<uint32_t>(std::min<uint64_t>(channels,
+        (limits.maxStorageBufferBindingSize-prefix)/row_bytes));
+    const uint64_t groups=(uint64_t(output_tile_channels)*oc+63)/64;
+    ORT_RETURN_IF_NOT(output_tile_channels>0&&groups<=limit*limit,"RW07 residual output window dispatch limit");
     const uint64_t session=c.KernelContext().M0FullGpuExtentOwnerEpochV1(),run=c.KernelContext().M0FullGpuExtentRunIdV2();
     M0FullGpuAllocationIdentity source,carrier,pair,output;
     ORT_RETURN_IF_NOT(session&&run&&c.M0FullGpuDescribeResourceV2(*e,source)&&c.M0FullGpuDescribeResourceV2(*x,carrier),
@@ -273,15 +125,46 @@ class NoiseResidualExtent final : public WebGpuKernel {
                       pair.producer_role==source_role&&pair.producer_instance==source_instance;
     auto* y=c.Output(0,TensorShape{1,channels,capacity_});auto* out=c.Output(1,TensorShape{32});
     ORT_RETURN_IF_NOT(Gpu(y)&&y->IsDataType<float>()&&Gpu(out)&&out->IsDataType<uint32_t>(),"RW07 noise residual output types");
-    auto activated=c.CreateGPUTensor(x->DataType(),TensorShape{1,channels,capacity_});
+    auto activated=c.CreateGPUTensor(x->DataType(),TensorShape{1,tile_channels,capacity_});
     auto conv=c.CreateGPUTensor(x->DataType(),TensorShape{1,channels,capacity_});
-    auto second=c.CreateGPUTensor(x->DataType(),TensorShape{1,channels,capacity_});
-    std::array<const Tensor*,5> outputs{y,out,&activated,&conv,&second};
+    auto coefficients=c.CreateGPUTensor(x->DataType(),TensorShape{channels,4});
+    std::array<const Tensor*,5> outputs{y,out,&activated,&conv,&coefficients};
     for(size_t i=0;i<outputs.size();i++){
       ORT_RETURN_IF_ERROR(binding(outputs[i]));
       for(size_t j=0;j<i;j++){ORT_RETURN_IF_NOT(outputs[i]->DataRaw()!=outputs[j]->DataRaw(),"RW07 noise residual scratch/output alias");}
       for(const auto* t:{x,e,style}){ORT_RETURN_IF_NOT(outputs[i]->DataRaw()!=t->DataRaw(),"RW07 noise residual source/output alias");}
       for(const auto* t:params){ORT_RETURN_IF_NOT(outputs[i]->DataRaw()!=t->DataRaw(),"RW07 noise residual parameter/output alias");}
+    }
+    const auto window=[&](const Tensor* input,uint32_t offset,uint32_t count){
+      const uint32_t capacity=uint32_t(input->Shape()[2]);
+      return ProgramInput::FloatBufferWindow(input,ProgramTensorMetadataDependency::None,
+          TensorShape{1,count,capacity},offset*capacity,limits.minStorageBufferOffsetAlignment);
+    };
+    const auto output_window=[&](Tensor* output,uint32_t offset,uint32_t count){
+      return ProgramOutput::FloatBufferWindow(output,ProgramTensorMetadataDependency::None,
+          TensorShape{1,count,oc},offset*oc,limits.minStorageBufferOffsetAlignment);
+    };
+    // Admit every actual window and dispatch before publishing or dispatching.
+    ORT_RETURN_IF_ERROR(StorageBudget(c,{e,out}));
+    for(uint32_t offset=0;offset<channels;offset+=output_tile_channels){
+      const uint32_t count=std::min(output_tile_channels,channels-offset);
+      ORT_RETURN_IF_ERROR(StorageBudgetWithWindows(c,window(x,offset,count),output_window(y,offset,count),{out}));
+    }
+    for(size_t h=0;h<2;h++){
+      ORT_RETURN_IF_ERROR(StorageBudget(c,{out,style,params[6*h],params[6*h+1],
+          params[6*h+2],params[6*h+3],&coefficients}));
+      const auto* input=h==0?x:&conv;
+      auto* accumulator=h==0?&conv:y;
+      for(uint32_t offset=0;offset<channels;offset+=tile_channels){
+        const uint32_t count=std::min(tile_channels,channels-offset);
+        const auto view=window(input,offset,count);
+        ORT_RETURN_IF_ERROR(StorageBudgetWithWindow(c,view,{out,&coefficients,&activated}));
+      }
+      for(uint32_t offset=0;offset<channels;offset+=output_tile_channels){
+        const uint32_t count=std::min(output_tile_channels,channels-offset);
+        ORT_RETURN_IF_ERROR(StorageBudgetWithWindow(c,output_window(accumulator,offset,count),
+            {&activated,out,params[6*h+4],params[6*h+5]}));
+      }
     }
     ORT_RETURN_IF_NOT(c.M0FullGpuClaimExtentV2(*out,*y,role,instance,output),"RW07 noise residual output claim");
     const m0_extent_abi2::OpaqueOwnership src{session,run,source.generation,carrier.generation,source_role,source_instance};
@@ -289,36 +172,63 @@ class NoiseResidualExtent final : public WebGpuKernel {
     ORT_RETURN_IF_NOT(src.Valid()&&dst.Valid(),"RW07 noise residual opaque ownership");
     const auto sw=src.UniformWords(),ow=dst.UniformWords();
     const auto source_identity=gsl::span<const uint32_t>{sw.data(),sw.size()},identity=gsl::span<const uint32_t>{ow.data(),ow.size()};
-    const uint32_t pc=uint32_t(x->Shape()[2]),oc=uint32_t(capacity_);
     const uint32_t minimum=branch_==0?20u:121u, maximum=branch_==0?2048000u:12288001u;
     const uint32_t modulus=branch_==0?20u:120u,remainder=branch_==0?0u:1u;
     Guard guard;guard.AddInput({e,ProgramTensorMetadataDependency::None}).AddOutput({out,ProgramTensorMetadataDependency::None})
         .SetWorkgroupSize(1).SetDispatchGroupSize(1)
         .AddUniformVariables({pc,oc,channels,minimum,maximum,modulus,remainder,uint32_t(paired),source_identity,identity});
     ORT_RETURN_IF_ERROR(c.RunProgram(guard));
-    const uint64_t gx=std::min(groups,limit),gy=(groups+gx-1)/gx;
+    const auto dispatch_window=[&](auto& program,uint32_t count)->Status{
+      const uint64_t window_groups=(uint64_t(count)*oc+63)/64;
+      const uint64_t gx=std::min(window_groups,limit),gy=(window_groups+gx-1)/gx;
+      program.SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy));
+      return c.RunProgram(program);
+    };
     for(uint32_t h=0;h<2;h++){
-      const auto* input=h==0?x:&conv;auto* normout=h==0?&activated:&second;auto* convout=h==0?&conv:y;
+      const auto* input=h==0?x:&conv;auto* normout=&activated;auto* convout=h==0?&conv:y;
       const uint32_t inputcap=h==0?pc:oc, dilation=h==0?uint32_t(1+2*block_):1u;
-      NoiseNormSnake norm;norm.AddInputs({{input,ProgramTensorMetadataDependency::None},{out,ProgramTensorMetadataDependency::None},
-          {style,ProgramTensorMetadataDependency::None},{params[6*h],ProgramTensorMetadataDependency::None},
-          {params[6*h+1],ProgramTensorMetadataDependency::None},{params[6*h+2],ProgramTensorMetadataDependency::None},
-          {params[6*h+3],ProgramTensorMetadataDependency::None}}).AddOutput({normout,ProgramTensorMetadataDependency::None})
+      GeneratorStyleParameters prepare;
+      prepare.AddInputs({{out,ProgramTensorMetadataDependency::None},{style,ProgramTensorMetadataDependency::None},
+          {params[6*h],ProgramTensorMetadataDependency::None},{params[6*h+1],ProgramTensorMetadataDependency::None},
+          {params[6*h+2],ProgramTensorMetadataDependency::None},{params[6*h+3],ProgramTensorMetadataDependency::None}})
+          .AddOutput({&coefficients,ProgramTensorMetadataDependency::None})
           .SetWorkgroupSize(64).SetDispatchGroupSize((channels+63)/64)
           .AddUniformVariables({inputcap,oc,channels,minimum,maximum,modulus,remainder,kernel,dilation,pc,identity});
-      ORT_RETURN_IF_ERROR(c.RunProgram(norm));
-      NoiseResidualConv convolution{h==1};convolution.CacheHint(h==0?"first":"residual");
-      convolution.AddInputs({{normout,ProgramTensorMetadataDependency::None},{out,ProgramTensorMetadataDependency::None},
-          {params[6*h+4],ProgramTensorMetadataDependency::None},{params[6*h+5],ProgramTensorMetadataDependency::None}});
-      if(h==1){convolution.AddInput({x,ProgramTensorMetadataDependency::None});}
-      convolution.AddOutput({convout,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64)
-          .SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
-          .AddUniformVariables({oc,oc,channels,minimum,maximum,modulus,remainder,kernel,dilation,pc,identity});
-      ORT_RETURN_IF_ERROR(c.RunProgram(convolution));
+      ORT_RETURN_IF_ERROR(c.RunProgram(prepare));
+      for(uint32_t offset=0;offset<channels;offset+=tile_channels){
+        const uint32_t count=std::min(tile_channels,channels-offset);
+        GeneratorNormSnake norm;
+        norm.AddInput(window(input,offset,count)).AddInputs({{out,ProgramTensorMetadataDependency::None},
+            {&coefficients,ProgramTensorMetadataDependency::None}}).AddOutput({normout,ProgramTensorMetadataDependency::None})
+            .SetWorkgroupSize(64).SetDispatchGroupSize((tile_channels+63)/64)
+            .AddUniformVariables({inputcap,oc,channels,minimum,maximum,modulus,remainder,kernel,dilation,pc,
+                                  offset,count,tile_channels,identity});
+        ORT_RETURN_IF_ERROR(c.RunProgram(norm));
+        for(uint32_t output_offset=0;output_offset<channels;output_offset+=output_tile_channels){
+          const uint32_t output_count=std::min(output_tile_channels,channels-output_offset);
+          GeneratorResidualConv convolution;
+          convolution.AddInputs({{normout,ProgramTensorMetadataDependency::None},{out,ProgramTensorMetadataDependency::None},
+              {params[6*h+4],ProgramTensorMetadataDependency::None},{params[6*h+5],ProgramTensorMetadataDependency::None}});
+          convolution.AddOutput(output_window(convout,output_offset,output_count))
+              .AddUniformVariables({oc,oc,channels,minimum,maximum,modulus,remainder,kernel,dilation,pc,
+                                    offset,count,output_offset,output_count,identity});
+          ORT_RETURN_IF_ERROR(dispatch_window(convolution,output_count));
+        }
+      }
+    }
+    for(uint32_t offset=0;offset<channels;offset+=output_tile_channels){
+      const uint32_t count=std::min(output_tile_channels,channels-offset);
+      GeneratorResidualAdd add;
+      add.AddInput({out,ProgramTensorMetadataDependency::None}).AddInput(window(x,offset,count))
+          .AddOutput(output_window(y,offset,count))
+          .AddUniformVariables({oc,oc,channels,minimum,maximum,modulus,remainder,kernel,1u,pc,count,identity});
+      ORT_RETURN_IF_ERROR(dispatch_window(add,count));
     }
     LOGS(c.Logger(),INFO)<<"M0_RW07_NOISE_RESIDUAL_V1 session="<<session<<" run="<<run<<" branch="<<branch_
       <<" block="<<block_<<" source_pair_valid="<<paired<<" role="<<role<<" instance="<<instance
-      <<" GPU_dispatches=5 host_payload_reads=0";
+      <<" GPU_dispatches="<<(3+2*((channels+tile_channels-1)/tile_channels)*
+          (1+(channels+output_tile_channels-1)/output_tile_channels)+(channels+output_tile_channels-1)/output_tile_channels)
+      <<" activation_tile_channels="<<tile_channels<<" output_tile_channels="<<output_tile_channels<<" host_payload_reads=0";
     return Status::OK();
   }
  private:
@@ -375,19 +285,12 @@ class Packet final : public WebGpuKernel {
     ORT_RETURN_IF_NOT(limits.maxStorageBuffersPerShaderStage >= 2 && limits.maxComputeWorkgroupsPerDimension >= 1 &&
                           limits.maxComputeWorkgroupSizeX >= 1 && limits.maxComputeInvocationsPerWorkgroup >= 1,
                       "RW07 noise residual after1600 packet resources");
-    auto binding = [&](const Tensor* t) -> Status {
-      ORT_RETURN_IF_NOT(t->DataRaw() && t->SizeInBytes() <= limits.maxBufferSize && t->SizeInBytes() <= limits.maxStorageBufferBindingSize,
-                        "RW07 noise residual after1600 packet binding descriptor");
-      const uint64_t bytes = wgpuBufferGetSize(static_cast<WGPUBuffer>(const_cast<void*>(t->DataRaw())));
-      ORT_RETURN_IF_NOT(bytes >= t->SizeInBytes() && bytes <= limits.maxBufferSize && bytes <= limits.maxStorageBufferBindingSize,
-                        "RW07 noise residual after1600 packet actual backing");
-      return Status::OK();
-    };
-    ORT_RETURN_IF_ERROR(binding(e)); ORT_RETURN_IF_ERROR(binding(y));
+    // The carrier is metadata here; only the sidecar and packet are bound.
+    ORT_RETURN_IF_ERROR(PhysicalBuffer(c,y));
     auto* p = c.Output(0, TensorShape{18});
     ORT_RETURN_IF_NOT(Gpu(p) && p->IsDataType<uint32_t>() && p->DataRaw() != e->DataRaw() && p->DataRaw() != y->DataRaw(),
                       "RW07 noise residual after1600 distinct packet output");
-    ORT_RETURN_IF_ERROR(binding(p));
+    ORT_RETURN_IF_ERROR(StorageBudget(c,{e,p}));
     const m0_extent_abi2::OpaqueOwnership owner{session, run, pair.generation, pair.data_generation, uint32_t(40 + 2 * block_ + branch_), uint32_t(1041 + 2 * block_ + branch_)};
     ORT_RETURN_IF_NOT(owner.Valid(), "RW07 noise residual after1600 packet opaque ownership");
     const auto words = owner.UniformWords();

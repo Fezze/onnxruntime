@@ -59,6 +59,11 @@ class OpKernelContextInternal : public OpKernelContext {
   uint64_t M0FullGpuExtentRunIdV2() const override {
     return session_state_.M0FullGpuExtentRunIdV2();
   }
+  bool M0ReadCancellationV1(uint32_t& cancelled) const noexcept override {
+    if(!session_state_.M0FullGpuExtentOwnerEpochV1()||!session_state_.M0FullGpuExtentRunIdV2())return false;
+    cancelled=terminate_flag_?1u:0u;
+    return true;
+  }
 
 #if !defined(ORT_MINIMAL_BUILD)
   KernelPilot* GetKernelPilot() const override {

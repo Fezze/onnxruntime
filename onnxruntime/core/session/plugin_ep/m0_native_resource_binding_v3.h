@@ -3,12 +3,15 @@
 #pragma once
 #include <cstdint>
 #include <type_traits>
-#include "core/session/onnxruntime_ep_c_api.h"
+#include "core/session/onnxruntime_c_api.h"
 namespace onnxruntime {
 // Source-private, payload-free metadata from the authenticated retained EP.
 // Context queries use handle=0/required_bytes=0. Resource queries require a live
 // allocation in that exact context before the provider may inspect its buffer.
 // The actual OrtEp is retained by the private native module, never user supplied.
+// Physical allocations are bounded by max_buffer_bytes. max_binding_bytes is
+// a per-shader-binding limit: a larger allocation requires independently
+// admitted segmented access at each actual dispatch, never a whole-buffer bind.
 // This does not authorize an upload, constructor, dispatch, readback or Run.
 struct M0NativeResourceBindingV3 {
   uint32_t abi=0,structure_bytes=0;

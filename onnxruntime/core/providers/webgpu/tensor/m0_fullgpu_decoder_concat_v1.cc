@@ -6,19 +6,13 @@
 #include "core/providers/webgpu/webgpu_kernel.h"
 #include "core/providers/webgpu/shader_helper.h"
 #include "core/providers/webgpu/m0_fullgpu_extent_abi2.h"
+#include "core/providers/webgpu/tensor/m0_fullgpu_residual_stages_v1.h"
 
 namespace onnxruntime::webgpu {
 namespace {
 bool Gpu(const Tensor* t) { return t && t->Location().device.Type() == OrtDevice::GPU; }
 Status Binding(ComputeContext& c, const Tensor* t) {
-  const auto& limits = c.DeviceLimits();
-  ORT_RETURN_IF_NOT(Gpu(t) && t->DataRaw() && t->SizeInBytes() > 0 &&
-                        t->SizeInBytes() <= limits.maxBufferSize && t->SizeInBytes() <= limits.maxStorageBufferBindingSize,
-                    "RW07 decoder concat GPU binding descriptor");
-  const uint64_t actual = wgpuBufferGetSize(static_cast<WGPUBuffer>(const_cast<void*>(t->DataRaw())));
-  ORT_RETURN_IF_NOT(actual >= t->SizeInBytes() && actual <= limits.maxBufferSize &&
-                        actual <= limits.maxStorageBufferBindingSize, "RW07 decoder concat actual GPU backing");
-  return Status::OK();
+  return m0_residual_stages::PhysicalBuffer(c,t);
 }
 void ValidOutput(ShaderHelper& s, const ShaderVariableHelper& e) {
   auto& f = s.AdditionalImplementation();
@@ -138,7 +132,7 @@ class DecoderConcat final : public WebGpuKernel {
     const uint64_t limit = limits.maxComputeWorkgroupsPerDimension;
     ORT_RETURN_IF_NOT(limits.maxStorageBuffersPerShaderStage >= 5 && limits.maxComputeWorkgroupSizeX >= 64 &&
                           limits.maxComputeInvocationsPerWorkgroup >= 64 && limit > 0 && groups <= limit * limit &&
-                          elements * 4 <= limits.maxBufferSize && elements * 4 <= limits.maxStorageBufferBindingSize,
+                          elements * 4 <= limits.maxBufferSize,
                       "RW07 decoder concat actual resource limits");
     for (const auto* input : inputs) ORT_RETURN_IF_ERROR(Binding(c, input));
     const uint64_t session = c.KernelContext().M0FullGpuExtentOwnerEpochV1(), run = c.KernelContext().M0FullGpuExtentRunIdV2();
@@ -162,6 +156,8 @@ class DecoderConcat final : public WebGpuKernel {
       for (size_t j = 0; j < i; ++j) ORT_RETURN_IF_NOT(outputs[i]->DataRaw() != outputs[j]->DataRaw(), "RW07 decoder concat output/scratch alias");
       for (const auto* input : inputs) ORT_RETURN_IF_NOT(outputs[i]->DataRaw() != input->DataRaw(), "RW07 decoder concat source/output alias");
     }
+    ORT_RETURN_IF_ERROR(m0_residual_stages::StorageBudget(c,{xe,fe,ne,out}));
+    ORT_RETURN_IF_ERROR(m0_residual_stages::StorageBudget(c,{x,f0,n,out,y}));
     M0FullGpuAllocationIdentity output;
     ORT_RETURN_IF_NOT(c.M0FullGpuClaimExtentV2(*out,*y,uint32_t(25+stage_),uint32_t(1026+stage_),output), "RW07 decoder concat final ownership claim");
     std::array<std::array<uint32_t,10>,3> source_words{};
@@ -233,6 +229,7 @@ class Packet final : public WebGpuKernel {
     auto* p=c.Output(0,TensorShape{18});
     ORT_RETURN_IF_NOT(Gpu(p)&&p->IsDataType<uint32_t>()&&p->DataRaw()!=e->DataRaw()&&p->DataRaw()!=y->DataRaw(),
                       "RW07 decoder concat terminal distinct output"); ORT_RETURN_IF_ERROR(Binding(c,p));
+    ORT_RETURN_IF_ERROR(m0_residual_stages::StorageBudget(c,{e,p}));
     const m0_extent_abi2::OpaqueOwnership owner{session,run,pair.generation,pair.data_generation,uint32_t(25+stage_),uint32_t(1026+stage_)};
     ORT_RETURN_IF_NOT(owner.Valid(),"RW07 decoder concat terminal identity");const auto words=owner.UniformWords();
     const uint32_t cap=uint32_t(y->Shape()[2]); PacketProgram program;

@@ -242,6 +242,14 @@ struct ProgramInput {
                                  uint32_t offset_in_elements,
                                  int component = 1);
 
+  // Read-only scalar-float view with an exact, aligned physical binding window.
+  // The shader offset is relative to that window, including its alignment prefix.
+  static ProgramInput FloatBufferWindow(const Tensor* backing_tensor,
+                                        ProgramTensorMetadataDependency dependency,
+                                        const TensorShape& shape,
+                                        uint32_t offset_in_elements,
+                                        uint32_t storage_offset_alignment);
+
   const Tensor* tensor;
   ProgramTensorMetadataDependency dependency;
   ProgramVariableDataType var_type;
@@ -249,6 +257,8 @@ struct ProgramInput {
   TensorShape override_shape;
   bool is_buffer_view{false};
   uint32_t buffer_offset_in_elements{0};
+  uint64_t buffer_binding_offset_bytes{0};
+  uint64_t buffer_binding_size_bytes{0};
 };
 
 struct ProgramOutput {
@@ -276,6 +286,14 @@ struct ProgramOutput {
                                   uint32_t offset_in_elements,
                                   int component = 1);
 
+  // Non-atomic scalar-float read_write window. A program must bind its backing
+  // only through this output, without another input/output alias.
+  static ProgramOutput FloatBufferWindow(Tensor* backing_tensor,
+                                         ProgramTensorMetadataDependency dependency,
+                                         const TensorShape& shape,
+                                         uint32_t offset_in_elements,
+                                         uint32_t storage_offset_alignment);
+
   Tensor* tensor;
   ProgramTensorMetadataDependency dependency;
   ProgramVariableDataType var_type;
@@ -284,6 +302,8 @@ struct ProgramOutput {
   TensorShape override_shape;
   bool is_buffer_view{false};
   uint32_t buffer_offset_in_elements{0};
+  uint64_t buffer_binding_offset_bytes{0};
+  uint64_t buffer_binding_size_bytes{0};
 };
 
 enum class ValidationMode {

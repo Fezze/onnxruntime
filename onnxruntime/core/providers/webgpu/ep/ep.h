@@ -11,6 +11,7 @@
 
 #include "core/providers/webgpu/webgpu_execution_provider.h"
 #include "core/session/plugin_ep/m0_native_resource_binding_v3.h"
+#include "core/session/plugin_ep/m0_native_device_limits_v1.h"
 
 namespace onnxruntime {
 namespace webgpu {
@@ -32,6 +33,8 @@ class Ep : public onnxruntime::ep::adapter::Ep {
   Ep(std::unique_ptr<IExecutionProvider> impl, Factory& factory, const OrtLogger& logger, const Config& config);
 
 #if defined(__ANDROID__) && defined(ORT_USE_EP_API_ADAPTERS) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
+  static bool M0NativeDescribeDeviceLimitsV1(const OrtEp* ep,uint64_t storage_bytes,uint64_t initializer_bytes,
+                                           uint64_t uniform_bytes,M0NativeDeviceLimitsV1& output) noexcept;
   static bool M0NativeDescribeResourceV3(const OrtEp* ep,uintptr_t handle,uint64_t required_bytes,
                                        M0NativeResourceBindingV3& output) noexcept;
 #endif

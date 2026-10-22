@@ -6,9 +6,11 @@
 #include "core/providers/webgpu/webgpu_kernel.h"
 #include "core/providers/webgpu/shader_helper.h"
 #include "core/providers/webgpu/m0_fullgpu_extent_abi2.h"
+#include "core/providers/webgpu/tensor/m0_fullgpu_residual_stages_v1.h"
 
 namespace onnxruntime::webgpu {
 namespace {
+constexpr uint32_t kTailTileChannels=64;
 ProgramInput Words(const Tensor* t) {
   ProgramInput p(t, ProgramTensorMetadataDependency::None, TensorShape{32}, 1);
   p.var_type = ProgramVariableDataType::Uint32;
@@ -77,13 +79,16 @@ class TailGuard final : public Program<TailGuard> {
 };
 class TailNormStyle final : public Program<TailNormStyle> {
  public:
-  TailNormStyle() : Program{"RW07PredictorTailNormStyleV1"} {}
+  TailNormStyle() : Program{"RW07PredictorTailNormStyleChannelWindowV2"} {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"input_capacity", ProgramUniformVariableDataType::Uint32},
       {"output_capacity", ProgramUniformVariableDataType::Uint32},
       {"channels", ProgramUniformVariableDataType::Uint32},
       {"features", ProgramUniformVariableDataType::Uint32},
       {"extent_divisor", ProgramUniformVariableDataType::Uint32},
+      {"channel_offset", ProgramUniformVariableDataType::Uint32},
+      {"channel_count", ProgramUniformVariableDataType::Uint32},
+      {"tile_channels", ProgramUniformVariableDataType::Uint32},
       {"final_capacity", ProgramUniformVariableDataType::Uint32},
       {"identity", ProgramUniformVariableDataType::Uint32});
   Status GenerateShaderCode(ShaderHelper& s) const override {
@@ -95,8 +100,10 @@ class TailNormStyle final : public Program<TailNormStyle> {
     const auto& y = s.AddOutput("y", ShaderUsage::UseValueTypeAlias);
     PayloadGuard(s, e);
     auto& f = s.MainFunctionBody();
-    f << "if(global_idx>=uniforms.channels){return;}for(var t=0u;t<uniforms.output_capacity;t++){"
+    f << "if(global_idx>=uniforms.tile_channels){return;}for(var t=0u;t<uniforms.output_capacity;t++){"
       << y.SetByOffset("global_idx*uniforms.output_capacity+t", "0.0") << "}if(!valid_output()){return;}"
+      << "if(global_idx>=uniforms.channel_count||uniforms.channel_offset>=uniforms.channels||uniforms.channel_count>uniforms.channels-uniforms.channel_offset){return;}"
+      << "let ch=uniforms.channel_offset+global_idx;"
       << "let d=" << e.GetByOffset("6u") << "/uniforms.extent_divisor;"
       << "if(d>uniforms.input_capacity||d>uniforms.output_capacity){return;}var sum:f32=0.0;"
       << "for(var t=0u;t<d;t++){sum=sum+" << x.GetByOffset("global_idx*uniforms.input_capacity+t") << ";}"
@@ -106,11 +113,11 @@ class TailNormStyle final : public Program<TailNormStyle> {
       << "let shifted:f32=variance+bitcast<f32>(0x3727c5acu);let denominator:f32=sqrt(shifted);"
       << "var gamma_sum:f32=0.0;var beta_sum:f32=0.0;for(var k=0u;k<uniforms.features;k++){"
       << "let style_value=" << style.GetByOffset("128u+k") << ";let gp:f32=style_value*"
-      << w.GetByOffset("global_idx*uniforms.features+k") << ";let bp:f32=style_value*"
-      << w.GetByOffset("(global_idx+uniforms.channels)*uniforms.features+k") << ";"
+      << w.GetByOffset("ch*uniforms.features+k") << ";let bp:f32=style_value*"
+      << w.GetByOffset("(ch+uniforms.channels)*uniforms.features+k") << ";"
       << "gamma_sum=gamma_sum+gp;beta_sum=beta_sum+bp;}let gamma_fc:f32=gamma_sum+"
-      << b.GetByOffset("global_idx") << ";let gamma:f32=gamma_fc+1.0;let beta:f32=beta_sum+"
-      << b.GetByOffset("global_idx+uniforms.channels") << ";for(var t=0u;t<d;t++){"
+      << b.GetByOffset("ch") << ";let gamma:f32=gamma_fc+1.0;let beta:f32=beta_sum+"
+      << b.GetByOffset("ch+uniforms.channels") << ";for(var t=0u;t<d;t++){"
       << "let centered:f32=" << x.GetByOffset("global_idx*uniforms.input_capacity+t") << "-mean;"
       << "let normalized:f32=centered/denominator;let product:f32=gamma*normalized;let affine:f32=product+beta;"
       << "let negative:f32=affine*bitcast<f32>(0x3e4ccccdu);"
@@ -120,13 +127,17 @@ class TailNormStyle final : public Program<TailNormStyle> {
 };
 class TailConv final : public Program<TailConv> {
  public:
-  TailConv(bool bias, bool nearest) : Program{"RW07PredictorTailConvV1"}, bias_(bias), nearest_(nearest) {}
+  TailConv(bool bias, bool nearest) : Program{"RW07PredictorTailConvChannelWindowsV2"}, bias_(bias), nearest_(nearest) {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"input_capacity", ProgramUniformVariableDataType::Uint32},
       {"output_capacity", ProgramUniformVariableDataType::Uint32},
       {"input_channels", ProgramUniformVariableDataType::Uint32},
       {"output_channels", ProgramUniformVariableDataType::Uint32},
       {"width", ProgramUniformVariableDataType::Uint32},
+      {"input_offset", ProgramUniformVariableDataType::Uint32},
+      {"input_count", ProgramUniformVariableDataType::Uint32},
+      {"output_offset", ProgramUniformVariableDataType::Uint32},
+      {"output_count", ProgramUniformVariableDataType::Uint32},
       {"extent_divisor", ProgramUniformVariableDataType::Uint32},
       {"final_capacity", ProgramUniformVariableDataType::Uint32},
       {"identity", ProgramUniformVariableDataType::Uint32});
@@ -138,19 +149,19 @@ class TailConv final : public Program<TailConv> {
     const auto& y = s.AddOutput("y", ShaderUsage::UseValueTypeAlias);
     PayloadGuard(s, e);
     auto& f = s.MainFunctionBody();
-    f << "if(global_idx>=uniforms.output_channels*uniforms.output_capacity){return;}"
-      << y.SetByOffset("global_idx", "0.0") << "if(!valid_output()){return;}"
+    f << "if(global_idx>=uniforms.output_count*uniforms.output_capacity){return;}"
+      << "if(!valid_output()){"<<y.SetByOffset("global_idx","0.0")<<"return;}"
       << "let d=" << e.GetByOffset("6u") << "/uniforms.extent_divisor;let t=global_idx%uniforms.output_capacity;"
-      << "let oc=global_idx/uniforms.output_capacity;if(t>=d){return;}var sum:f32=0.0;"
-      << "for(var ic=0u;ic<uniforms.input_channels;ic++){for(var k=0u;k<uniforms.width;k++){"
+      << "let oc=uniforms.output_offset+global_idx/uniforms.output_capacity;if(t>=d){"<<y.SetByOffset("global_idx","0.0")<<"return;}var sum:f32=0.0;"
+      << "if(uniforms.input_offset!=0u){sum="<<y.GetByOffset("global_idx")<<";}"
+      << "for(var local_ic=0u;local_ic<uniforms.input_count;local_ic++){let ic=uniforms.input_offset+local_ic;for(var k=0u;k<uniforms.width;k++){"
       << "let pos=i32(t)+i32(k)-i32(uniforms.width/2u);var value:f32=0.0;"
       << "if(pos>=0&&u32(pos)<d){let source_t=" << (nearest_ ? "u32(pos)/2u" : "u32(pos)") << ";"
-      << "if(source_t<uniforms.input_capacity){value=" << x.GetByOffset("ic*uniforms.input_capacity+source_t") << ";}}"
+      << "if(source_t<uniforms.input_capacity){value=" << x.GetByOffset("local_ic*uniforms.input_capacity+source_t") << ";}}"
       << "let product:f32=value*" << w.GetByOffset("(oc*uniforms.input_channels+ic)*uniforms.width+k")
       << ";sum=sum+product;}}";
-    if (bias_) f << "let result:f32=sum+" << b->GetByOffset("oc") << ";";
-    else f << "let result:f32=sum;";
-    f << y.SetByOffset("global_idx", "result");
+    if (bias_) f << "if(uniforms.input_offset+uniforms.input_count==uniforms.input_channels){sum=sum+" << b->GetByOffset("oc") << ";}";
+    f << y.SetByOffset("global_idx", "sum");
     return Status::OK();
   }
  private:
@@ -158,11 +169,13 @@ class TailConv final : public Program<TailConv> {
 };
 class TailPool final : public Program<TailPool> {
  public:
-  TailPool() : Program{"RW07PredictorTailDepthwisePoolV1"} {}
+  TailPool() : Program{"RW07PredictorTailDepthwisePoolChannelWindowV2"} {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"input_capacity", ProgramUniformVariableDataType::Uint32},
       {"output_capacity", ProgramUniformVariableDataType::Uint32},
       {"channels", ProgramUniformVariableDataType::Uint32},
+      {"channel_offset", ProgramUniformVariableDataType::Uint32},
+      {"channel_count", ProgramUniformVariableDataType::Uint32},
       {"final_capacity", ProgramUniformVariableDataType::Uint32},
       {"identity", ProgramUniformVariableDataType::Uint32});
   Status GenerateShaderCode(ShaderHelper& s) const override {
@@ -176,12 +189,12 @@ class TailPool final : public Program<TailPool> {
     f << "if(global_idx>=uniforms.channels*uniforms.output_capacity){return;}"
       << y.SetByOffset("global_idx", "0.0") << "if(!valid_output()){return;}"
       << "let d=" << e.GetByOffset("6u") << ";let t=global_idx%uniforms.output_capacity;"
-      << "let ch=global_idx/uniforms.output_capacity;if(t>=d){return;}var sum:f32=0.0;"
+      << "let local_ch=global_idx/uniforms.output_capacity;let ch=uniforms.channel_offset+local_ch;if(t>=d||local_ch>=uniforms.channel_count){return;}var sum:f32=0.0;"
       // Original CPU Col2im visits kernel taps in ascending order.
       << "for(var k=0u;k<3u;k++){"
       << "let numerator=i32(t)+1-i32(k);if(numerator>=0&&numerator%2==0){"
       << "let source_t=u32(numerator/2);if(source_t<d/2u&&source_t<uniforms.input_capacity){"
-      << "let product:f32=" << x.GetByOffset("ch*uniforms.input_capacity+source_t") << "*"
+      << "let product:f32=" << x.GetByOffset("local_ch*uniforms.input_capacity+source_t") << "*"
       << w.GetByOffset("ch*3u+k") << ";sum=sum+product;}}}let result:f32=sum+"
       << b.GetByOffset("ch") << ";" << y.SetByOffset("global_idx", "result");
     return Status::OK();
@@ -189,32 +202,30 @@ class TailPool final : public Program<TailPool> {
 };
 class TailResidualAdd final : public Program<TailResidualAdd> {
  public:
-  TailResidualAdd() : Program{"RW07PredictorTailResidualAddV1"} {}
+  TailResidualAdd() : Program{"RW07PredictorTailResidualAddInPlaceWindowV2"} {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"capacity", ProgramUniformVariableDataType::Uint32},
       {"channels", ProgramUniformVariableDataType::Uint32},
       {"final_capacity", ProgramUniformVariableDataType::Uint32},
       {"identity", ProgramUniformVariableDataType::Uint32});
   Status GenerateShaderCode(ShaderHelper& s) const override {
-    const auto& main = s.AddInput("main", ShaderUsage::UseValueTypeAlias);
     const auto& skip = s.AddInput("skip", ShaderUsage::UseValueTypeAlias);
     const auto& e = s.AddInput("extent", ShaderUsage::UseValueTypeAlias);
     const auto& y = s.AddOutput("y", ShaderUsage::UseValueTypeAlias);
     PayloadGuard(s, e);
     auto& f = s.MainFunctionBody();
     f << "if(global_idx>=uniforms.channels*uniforms.capacity){return;}"
-      << y.SetByOffset("global_idx", "0.0") << "if(!valid_output()){return;}"
-      << "if(global_idx%uniforms.capacity>=" << e.GetByOffset("6u") << "){return;}"
-      << "let added:f32=" << main.GetByOffset("global_idx") << "+" << skip.GetByOffset("global_idx") << ";"
+      << "if(!valid_output()||global_idx%uniforms.capacity>=" << e.GetByOffset("6u") << "){"<<y.SetByOffset("global_idx","0.0")<<"return;}"
+      << "let added:f32=" << y.GetByOffset("global_idx") << "+" << skip.GetByOffset("global_idx") << ";"
       << y.SetByOffset("global_idx", "added/bitcast<f32>(0x3fb504f3u)");
     return Status::OK();
   }
 };
 Status Binding(ComputeContext& c, const Tensor* t) {
-  ORT_RETURN_IF_NOT(t && t->Location().device.Type() == OrtDevice::GPU && t->DataRaw() && t->SizeInBytes() > 0,
-                    "RW07 predictor tail missing GPU binding");
+  M0FullGpuStorageAllocationV1 allocation;
+  ORT_RETURN_IF_NOT(t&&c.M0FullGpuDescribeStorageV1(*t,allocation),"RW07 live physical storage allocation");
   const auto& limits = c.DeviceLimits();
-  const uint64_t bytes = wgpuBufferGetSize(static_cast<WGPUBuffer>(const_cast<void*>(t->DataRaw())));
+  const uint64_t bytes=allocation.backing_bytes;
   ORT_RETURN_IF_NOT(bytes >= t->SizeInBytes() && bytes <= limits.maxBufferSize && bytes <= limits.maxStorageBufferBindingSize,
                     "RW07 predictor tail whole-buffer binding limit");
   return Status::OK();
@@ -249,15 +260,22 @@ class PredictorTail final : public WebGpuKernel {
       ORT_RETURN_IF_NOT(p && p->IsDataType<float>() && p->Shape() == shapes[i],
                         "RW07 predictor tail exact immutable parameter descriptor at ", i + 3);
     }
-    for (int i = 0; i < 24; ++i) ORT_RETURN_IF_ERROR(Binding(c, c.Input<Tensor>(i)));
+    ORT_RETURN_IF_ERROR(m0_residual_stages::PhysicalBuffer(c,x));
+    for(int i=1;i<24;++i)ORT_RETURN_IF_ERROR(Binding(c,c.Input<Tensor>(i)));
     const auto& limits = c.DeviceLimits();
-    const uint64_t max_count = 512 * std::max<uint64_t>(uint64_t(x->Shape()[2]), uint64_t(capacity_));
+    const uint32_t cap=uint32_t(capacity_),in_cap=uint32_t(x->Shape()[2]),norm_cap=std::max(cap,in_cap);
     const uint64_t limit = limits.maxComputeWorkgroupsPerDimension;
+    const uint64_t alignment=limits.minStorageBufferOffsetAlignment;
+    ORT_RETURN_IF_NOT(alignment>0&&alignment%4==0,"RW07 predictor tail window alignment");
+    const uint64_t prefix=alignment-4,row_bytes=uint64_t(cap)*4;
+    ORT_RETURN_IF_NOT(uint64_t(kTailTileChannels)*norm_cap*4+prefix<=limits.maxStorageBufferBindingSize,
+                      "RW07 predictor tail normalization tile binding limit");
+    const uint32_t output_tile=uint32_t(std::min<uint64_t>(256,(limits.maxStorageBufferBindingSize-prefix)/row_bytes));
+    const uint64_t max_count=std::max<uint64_t>(uint64_t(kTailTileChannels)*norm_cap,uint64_t(output_tile)*cap);
     ORT_RETURN_IF_NOT(limits.maxStorageBuffersPerShaderStage >= 6 && limits.maxComputeWorkgroupSizeX >= 64 &&
                           limits.maxComputeInvocationsPerWorkgroup >= 64 && limit >= 8 &&
                           (max_count + 63) / 64 <= limit * limit && max_count <= UINT32_MAX &&
-                          max_count * sizeof(float) <= limits.maxBufferSize &&
-                          max_count * sizeof(float) <= limits.maxStorageBufferBindingSize,
+                          output_tile>0&&256ull*cap*4<=limits.maxBufferSize,
                       "RW07 predictor tail physical scratch/dispatch limits");
     const uint64_t session = c.KernelContext().M0FullGpuExtentOwnerEpochV1();
     const uint64_t run = c.KernelContext().M0FullGpuExtentRunIdV2();
@@ -273,13 +291,77 @@ class PredictorTail final : public WebGpuKernel {
     auto* out = c.Output(1, TensorShape{32});
     ORT_RETURN_IF_NOT(y && y->IsDataType<float>() && out && out->IsDataType<uint32_t>(),
                       "RW07 predictor tail output types");
-    for (const auto* t : {y, out}) ORT_RETURN_IF_ERROR(Binding(c, t));
+    ORT_RETURN_IF_ERROR(m0_residual_stages::PhysicalBuffer(c,y));ORT_RETURN_IF_ERROR(Binding(c,out));
     ORT_RETURN_IF_NOT(y->DataRaw() != out->DataRaw(), "RW07 predictor tail distinct outputs");
     for (int i = 0; i < 24; ++i) {
       const auto* input = c.Input<Tensor>(i);
       ORT_RETURN_IF_NOT(input->DataRaw() != y->DataRaw() && input->DataRaw() != out->DataRaw(),
                         "RW07 predictor tail source/output alias");
     }
+    auto main=c.CreateGPUTensor(x->DataType(),TensorShape{1,256,cap});
+    auto block1=c.CreateGPUTensor(x->DataType(),TensorShape{1,256,cap});
+    auto block2=c.CreateGPUTensor(x->DataType(),TensorShape{1,256,cap});
+    auto normalized=c.CreateGPUTensor(x->DataType(),TensorShape{1,kTailTileChannels,norm_cap});
+    auto pool=c.CreateGPUTensor(x->DataType(),TensorShape{1,kTailTileChannels,cap});
+    const std::array<const Tensor*,5> scratch{&main,&block1,&block2,&normalized,&pool};
+    for(size_t i=0;i<scratch.size();++i){
+      ORT_RETURN_IF_ERROR(m0_residual_stages::PhysicalBuffer(c,scratch[i]));
+      for(int j=0;j<24;++j)ORT_RETURN_IF_NOT(scratch[i]->DataRaw()!=c.Input<Tensor>(j)->DataRaw(),"RW07 predictor tail scratch/input alias");
+      ORT_RETURN_IF_NOT(scratch[i]->DataRaw()!=y->DataRaw()&&scratch[i]->DataRaw()!=out->DataRaw(),"RW07 predictor tail scratch/output alias");
+      for(size_t j=0;j<i;++j)ORT_RETURN_IF_NOT(scratch[i]->DataRaw()!=scratch[j]->DataRaw(),"RW07 predictor tail live scratch alias");
+    }
+    const auto input_window=[&](const Tensor* src,uint32_t offset,uint32_t count){
+      return ProgramInput::FloatBufferWindow(src,ProgramTensorMetadataDependency::None,TensorShape{1,count,src->Shape()[2]},
+          offset*uint32_t(src->Shape()[2]),uint32_t(alignment));
+    };
+    const auto output_window=[&](Tensor* dst,uint32_t offset,uint32_t count){
+      return ProgramOutput::FloatBufferWindow(dst,ProgramTensorMetadataDependency::None,TensorShape{1,count,cap},offset*cap,uint32_t(alignment));
+    };
+    const auto admit_norm=[&](const Tensor* src,int wi)->Status{
+      for(uint32_t offset=0;offset<uint32_t(src->Shape()[1]);offset+=kTailTileChannels){
+        const uint32_t count=std::min(kTailTileChannels,uint32_t(src->Shape()[1])-offset);
+        ORT_RETURN_IF_ERROR(m0_residual_stages::StorageBudgetWithWindow(c,input_window(src,offset,count),
+            {out,style,c.Input<Tensor>(wi),c.Input<Tensor>(wi+1),&normalized}));
+      }
+      return Status::OK();
+    };
+    const auto admit_conv=[&](const Tensor* src,Tensor* dst,int wi,int bi,uint32_t channels,bool windowed_input)->Status{
+      const uint32_t outputs=uint32_t(dst->Shape()[1]);
+      for(uint32_t offset=0;offset<channels;offset+=kTailTileChannels){
+        const uint32_t count=std::min(kTailTileChannels,channels-offset);
+        for(uint32_t o=0;o<outputs;o+=output_tile){
+          const auto view=output_window(dst,o,std::min(output_tile,outputs-o));
+          if(windowed_input){
+            if(bi>=0){ORT_RETURN_IF_ERROR(m0_residual_stages::StorageBudgetWithWindows(c,input_window(src,offset,count),view,{c.Input<Tensor>(wi),c.Input<Tensor>(bi),out}));}
+            else{ORT_RETURN_IF_ERROR(m0_residual_stages::StorageBudgetWithWindows(c,input_window(src,offset,count),view,{c.Input<Tensor>(wi),out}));}
+          }else{
+            ORT_RETURN_IF_ERROR(m0_residual_stages::StorageBudgetWithWindow(c,view,{src,c.Input<Tensor>(wi),c.Input<Tensor>(bi),out}));
+          }
+        }
+      }
+      return Status::OK();
+    };
+    const auto admit_add=[&](const Tensor* skip,Tensor* dst)->Status{
+      for(uint32_t o=0;o<256;o+=output_tile){
+        const uint32_t count=std::min(output_tile,256u-o);
+        ORT_RETURN_IF_ERROR(m0_residual_stages::StorageBudgetWithWindows(c,input_window(skip,o,count),output_window(dst,o,count),{out}));
+      }
+      return Status::OK();
+    };
+    ORT_RETURN_IF_ERROR(m0_residual_stages::StorageBudget(c,{e,out}));
+    ORT_RETURN_IF_ERROR(admit_norm(x,3));
+    ORT_RETURN_IF_ERROR(m0_residual_stages::StorageBudget(c,{&normalized,c.Input<Tensor>(5),c.Input<Tensor>(6),out,&pool}));
+    ORT_RETURN_IF_ERROR(admit_conv(&pool,&main,7,8,512,false));
+    ORT_RETURN_IF_ERROR(admit_norm(&main,9));
+    ORT_RETURN_IF_ERROR(admit_conv(&normalized,&block1,11,12,256,false));
+    ORT_RETURN_IF_ERROR(admit_conv(x,&main,13,-1,512,true));
+    ORT_RETURN_IF_ERROR(admit_add(&main,&block1));
+    ORT_RETURN_IF_ERROR(admit_norm(&block1,14));
+    ORT_RETURN_IF_ERROR(admit_conv(&normalized,&main,16,17,256,false));
+    ORT_RETURN_IF_ERROR(admit_norm(&main,18));
+    ORT_RETURN_IF_ERROR(admit_conv(&normalized,&block2,20,21,256,false));
+    ORT_RETURN_IF_ERROR(admit_add(&block1,&block2));
+    ORT_RETURN_IF_ERROR(admit_conv(&block2,y,22,23,256,true));
     M0FullGpuAllocationIdentity output;
     ORT_RETURN_IF_NOT(c.M0FullGpuClaimExtentV2(*out, *y, role, instance, output),
                       "RW07 predictor tail output pair claim");
@@ -288,118 +370,83 @@ class PredictorTail final : public WebGpuKernel {
     ORT_RETURN_IF_NOT(input_owner.Valid() && owner.Valid(), "RW07 predictor tail opaque ownership");
     const auto source_words = input_owner.UniformWords(), words = owner.UniformWords();
     const auto span = [](const auto& a) { return gsl::span<const uint32_t>{a.data(), a.size()}; };
-    const uint32_t cap = uint32_t(capacity_), in_cap = uint32_t(x->Shape()[2]);
     TailGuard guard;
     guard.AddInput(Words(e)).AddOutput(Words(out)).SetWorkgroupSize(1).SetDispatchGroupSize(1)
         .AddUniformVariables({in_cap, cap, uint32_t(valid), span(source_words), span(words)});
     ORT_RETURN_IF_ERROR(c.RunProgram(guard));
-    const auto scratch = [&](int64_t channels, int64_t capacity) {
-      return c.CreateGPUTensor(x->DataType(), TensorShape{1, channels, capacity});
-    };
-    const auto check_scratch = [&](const Tensor& t, gsl::span<const Tensor* const> live) -> Status {
-      ORT_RETURN_IF_ERROR(Binding(c, &t));
-      for (int i = 0; i < 24; ++i) {
-        ORT_RETURN_IF_NOT(t.DataRaw() != c.Input<Tensor>(i)->DataRaw(), "RW07 predictor tail scratch/input alias");
-      }
-      ORT_RETURN_IF_NOT(t.DataRaw() != y->DataRaw() && t.DataRaw() != out->DataRaw(),
-                        "RW07 predictor tail scratch/output alias");
-      for (const auto* other : live) ORT_RETURN_IF_NOT(t.DataRaw() != other->DataRaw(), "RW07 predictor tail live scratch alias");
-      return Status::OK();
-    };
+    uint64_t dispatches=1;
     const auto dispatch = [&](auto& program, uint64_t count) -> Status {
       const uint64_t groups = (count + 63) / 64, gx = std::min(groups, limit), gy = (groups + gx - 1) / gx;
       program.SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx), uint32_t(gy));
-      return c.RunProgram(program);
+      ORT_RETURN_IF_ERROR(c.RunProgram(program));++dispatches;return Status::OK();
     };
-    const auto norm = [&](const Tensor* src, Tensor* dst, int weight_index, uint32_t divisor) -> Status {
+    const auto norm = [&](const Tensor* src,int weight_index,uint32_t divisor,uint32_t offset,uint32_t count) -> Status {
       TailNormStyle p;
-      p.AddInputs({{src, ProgramTensorMetadataDependency::None}, Words(static_cast<const Tensor*>(out)),
+      p.AddInput(input_window(src,offset,count));
+      p.AddInputs({Words(static_cast<const Tensor*>(out)),
                    {style, ProgramTensorMetadataDependency::None}, {c.Input<Tensor>(weight_index), ProgramTensorMetadataDependency::None},
                    {c.Input<Tensor>(weight_index + 1), ProgramTensorMetadataDependency::None}})
-          .AddOutput({dst, ProgramTensorMetadataDependency::None})
-          .AddUniformVariables({uint32_t(src->Shape()[2]), uint32_t(dst->Shape()[2]), uint32_t(src->Shape()[1]),
-                                uint32_t(128), divisor, cap, span(words)});
-      return dispatch(p, uint64_t(src->Shape()[1]));
+          .AddOutput({&normalized, ProgramTensorMetadataDependency::None})
+          .AddUniformVariables({uint32_t(src->Shape()[2]),norm_cap,uint32_t(src->Shape()[1]),128u,divisor,offset,count,kTailTileChannels,cap,span(words)});
+      return dispatch(p,kTailTileChannels);
     };
-    const auto conv = [&](const Tensor* src, Tensor* dst, int wi, int bi, uint32_t width, bool nearest) -> Status {
-      TailConv p{bi >= 0, nearest};
-      p.CacheHint(bi >= 0 ? "bias" : "no-bias", nearest ? "nearest" : "direct");
-      p.AddInputs({{src, ProgramTensorMetadataDependency::None}, {c.Input<Tensor>(wi), ProgramTensorMetadataDependency::None}});
-      if (bi >= 0) p.AddInput({c.Input<Tensor>(bi), ProgramTensorMetadataDependency::None});
-      p.AddInput(Words(static_cast<const Tensor*>(out))).AddOutput({dst, ProgramTensorMetadataDependency::None})
-          .AddUniformVariables({uint32_t(src->Shape()[2]), uint32_t(dst->Shape()[2]), uint32_t(src->Shape()[1]),
-                                uint32_t(dst->Shape()[1]), width, uint32_t(1), cap, span(words)});
-      return dispatch(p, uint64_t(dst->Shape().Size()));
-    };
-    const auto add = [&](const Tensor* main, const Tensor* skip, Tensor* dst) -> Status {
-      TailResidualAdd p;
-      p.AddInputs({{main, ProgramTensorMetadataDependency::None}, {skip, ProgramTensorMetadataDependency::None},
-                   Words(static_cast<const Tensor*>(out))}).AddOutput({dst, ProgramTensorMetadataDependency::None})
-          .AddUniformVariables({cap, uint32_t(256), cap, span(words)});
-      return dispatch(p, uint64_t(dst->Shape().Size()));
-    };
-    auto block1 = scratch(256, cap);
-    ORT_RETURN_IF_ERROR(check_scratch(block1, {}));
-    {
-      auto skip = scratch(256, cap);
-      const std::array<const Tensor*, 1> live1{&block1};
-      ORT_RETURN_IF_ERROR(check_scratch(skip, live1));
-      ORT_RETURN_IF_ERROR(conv(x, &skip, 13, -1, 1, true));
-      auto main = scratch(256, cap);
-      const std::array<const Tensor*, 2> live2{&block1, &skip};
-      ORT_RETURN_IF_ERROR(check_scratch(main, live2));
-      {
-        auto n1 = scratch(512, in_cap);
-        const std::array<const Tensor*, 3> live3{&block1, &skip, &main};
-        ORT_RETURN_IF_ERROR(check_scratch(n1, live3));
-        ORT_RETURN_IF_ERROR(norm(x, &n1, 3, 2));
-        auto pool = scratch(512, cap);
-        const std::array<const Tensor*, 4> live4{&block1, &skip, &main, &n1};
-        ORT_RETURN_IF_ERROR(check_scratch(pool, live4));
-        TailPool p;
-        p.AddInputs({{&n1, ProgramTensorMetadataDependency::None}, {c.Input<Tensor>(5), ProgramTensorMetadataDependency::None},
-                     {c.Input<Tensor>(6), ProgramTensorMetadataDependency::None}, Words(static_cast<const Tensor*>(out))})
-            .AddOutput({&pool, ProgramTensorMetadataDependency::None})
-            .AddUniformVariables({in_cap, cap, uint32_t(512), cap, span(words)});
-        ORT_RETURN_IF_ERROR(dispatch(p, uint64_t(pool.Shape().Size())));
-        ORT_RETURN_IF_ERROR(conv(&pool, &main, 7, 8, 3, false));
+    const auto conv=[&](const Tensor* src,Tensor* dst,int wi,int bi,uint32_t width,bool nearest,
+                        uint32_t channels,uint32_t offset,uint32_t count,bool windowed_input)->Status{
+      const uint32_t outputs=uint32_t(dst->Shape()[1]);
+      for(uint32_t o=0;o<outputs;o+=output_tile){
+        const uint32_t output_count=std::min(output_tile,outputs-o);
+        TailConv p{bi>=0,nearest};p.CacheHint(bi>=0?"bias":"no-bias",nearest?"nearest":"direct");
+        p.AddInput(windowed_input?input_window(src,offset,count):ProgramInput{src,ProgramTensorMetadataDependency::None});
+        p.AddInput({c.Input<Tensor>(wi),ProgramTensorMetadataDependency::None});
+        if(bi>=0)p.AddInput({c.Input<Tensor>(bi),ProgramTensorMetadataDependency::None});
+        p.AddInput(Words(static_cast<const Tensor*>(out))).AddOutput(output_window(dst,o,output_count))
+            .AddUniformVariables({uint32_t(src->Shape()[2]),cap,channels,outputs,width,offset,count,o,output_count,1u,cap,span(words)});
+        ORT_RETURN_IF_ERROR(dispatch(p,uint64_t(output_count)*cap));
       }
-      auto n2 = scratch(256, cap);
-      const std::array<const Tensor*, 3> live3{&block1, &skip, &main};
-      ORT_RETURN_IF_ERROR(check_scratch(n2, live3));
-      ORT_RETURN_IF_ERROR(norm(&main, &n2, 9, 1));
-      auto convolved = scratch(256, cap);
-      const std::array<const Tensor*, 4> live4{&block1, &skip, &main, &n2};
-      ORT_RETURN_IF_ERROR(check_scratch(convolved, live4));
-      ORT_RETURN_IF_ERROR(conv(&n2, &convolved, 11, 12, 3, false));
-      ORT_RETURN_IF_ERROR(add(&convolved, &skip, &block1));
+      return Status::OK();
+    };
+    const auto add=[&](const Tensor* skip,Tensor* dst)->Status{
+      for(uint32_t o=0;o<256;o+=output_tile){
+        const uint32_t count=std::min(output_tile,256u-o);
+        TailResidualAdd p;p.AddInput(input_window(skip,o,count)).AddInput(Words(static_cast<const Tensor*>(out)))
+            .AddOutput(output_window(dst,o,count)).AddUniformVariables({cap,count,cap,span(words)});
+        ORT_RETURN_IF_ERROR(dispatch(p,uint64_t(count)*cap));
+      }
+      return Status::OK();
+    };
+    for(uint32_t offset=0;offset<512;offset+=kTailTileChannels){
+      ORT_RETURN_IF_ERROR(norm(x,3,2,offset,kTailTileChannels));
+      TailPool p;
+      p.AddInputs({{&normalized,ProgramTensorMetadataDependency::None},{c.Input<Tensor>(5),ProgramTensorMetadataDependency::None},
+                   {c.Input<Tensor>(6),ProgramTensorMetadataDependency::None},Words(static_cast<const Tensor*>(out))})
+          .AddOutput({&pool,ProgramTensorMetadataDependency::None})
+          .AddUniformVariables({norm_cap,cap,kTailTileChannels,offset,kTailTileChannels,cap,span(words)});
+      ORT_RETURN_IF_ERROR(dispatch(p,uint64_t(kTailTileChannels)*cap));
+      ORT_RETURN_IF_ERROR(conv(&pool,&main,7,8,3,false,512,offset,kTailTileChannels,false));
     }
-    auto block2 = scratch(256, cap);
-    const std::array<const Tensor*, 1> live1{&block1};
-    ORT_RETURN_IF_ERROR(check_scratch(block2, live1));
-    {
-      auto n1 = scratch(256, cap);
-      const std::array<const Tensor*, 2> live2{&block1, &block2};
-      ORT_RETURN_IF_ERROR(check_scratch(n1, live2));
-      ORT_RETURN_IF_ERROR(norm(&block1, &n1, 14, 1));
-      auto main = scratch(256, cap);
-      const std::array<const Tensor*, 3> live3{&block1, &block2, &n1};
-      ORT_RETURN_IF_ERROR(check_scratch(main, live3));
-      ORT_RETURN_IF_ERROR(conv(&n1, &main, 16, 17, 3, false));
-      auto n2 = scratch(256, cap);
-      const std::array<const Tensor*, 4> live4{&block1, &block2, &n1, &main};
-      ORT_RETURN_IF_ERROR(check_scratch(n2, live4));
-      ORT_RETURN_IF_ERROR(norm(&main, &n2, 18, 1));
-      auto convolved = scratch(256, cap);
-      const std::array<const Tensor*, 5> live5{&block1, &block2, &n1, &main, &n2};
-      ORT_RETURN_IF_ERROR(check_scratch(convolved, live5));
-      ORT_RETURN_IF_ERROR(conv(&n2, &convolved, 20, 21, 3, false));
-      ORT_RETURN_IF_ERROR(add(&convolved, &block1, &block2));
+    const auto normalized_conv=[&](const Tensor* src,Tensor* dst,int nw,int cw,int cb)->Status{
+      for(uint32_t offset=0;offset<256;offset+=kTailTileChannels){
+        ORT_RETURN_IF_ERROR(norm(src,nw,1,offset,kTailTileChannels));
+        ORT_RETURN_IF_ERROR(conv(&normalized,dst,cw,cb,3,false,256,offset,kTailTileChannels,false));
+      }
+      return Status::OK();
+    };
+    ORT_RETURN_IF_ERROR(normalized_conv(&main,&block1,9,11,12));
+    // No first-convolution reader remains when main becomes the skip branch.
+    for(uint32_t offset=0;offset<512;offset+=kTailTileChannels){
+      ORT_RETURN_IF_ERROR(conv(x,&main,13,-1,1,true,512,offset,kTailTileChannels,true));
     }
-    ORT_RETURN_IF_ERROR(conv(&block2, y, 22, 23, 1, false));
+    ORT_RETURN_IF_ERROR(add(&main,&block1));
+    ORT_RETURN_IF_ERROR(normalized_conv(&block1,&main,14,16,17));
+    ORT_RETURN_IF_ERROR(normalized_conv(&main,&block2,18,20,21));
+    ORT_RETURN_IF_ERROR(add(&block1,&block2));
+    for(uint32_t offset=0;offset<256;offset+=kTailTileChannels){
+      ORT_RETURN_IF_ERROR(conv(&block2,y,22,23,1,false,256,offset,kTailTileChannels,true));
+    }
     LOGS(c.Logger(), INFO) << "M0_RW07_PREDICTOR_TAIL_V1 session=" << session << " run=" << run
       << " branch=" << branch_ << " source_pair_valid=" << valid << " role=" << role << " instance=" << instance
-      << " source_capacity=" << in_cap << " output_capacity=" << cap << " GPU_dispatches=14 host_payload_reads=0";
+      << " source_capacity=" << in_cap << " output_capacity=" << cap << " GPU_dispatches="<<dispatches
+      << " input_tile_channels="<<kTailTileChannels<<" output_tile_channels="<<output_tile<<" host_payload_reads=0";
     return Status::OK();
   }
  private:

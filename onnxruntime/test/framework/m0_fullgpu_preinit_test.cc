@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <iostream>
 #include <sstream>
 #include <string>
 
@@ -3124,7 +3125,12 @@ void ExpectWholeOriginalInitializeResult(InferenceSession& session) {
   ASSERT_FALSE(dynamic_plugin_ep_infra::IsInitialized());
   ASSERT_STATUS_OK(session.Initialize());
 #else
-  ExpectPreloadDenial(session.Initialize());
+  // Host qualification checks the original graph and immutable backing above.
+  // It cannot open the Android-only physical provider for initialization.
+  const auto status = session.Initialize();
+  EXPECT_FALSE(status.IsOK());
+  EXPECT_NE(status.ErrorMessage().find("RW07_NATIVE_LOWERING_FAILED"), std::string::npos);
+  EXPECT_NE(status.ErrorMessage().find("RW07_LSTM_MODULE_UNSUPPORTED"), std::string::npos);
 #endif
 }
 }  // namespace
@@ -3148,6 +3154,7 @@ TEST(M0OriginalPreload, WholeOriginalStrictBufferLoadResolvesWithoutModelValues)
   input.seekg(0);
   input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
   ASSERT_TRUE(input.good());
+  std::cerr << "M0_ORIGINAL_PRELOAD phase=descriptor_rules_begin" << std::endl;
   const auto rules = M0QualifyWholeDescriptorRulesV1(bytes);
   EXPECT_EQ(rules.profiles, 49u);
   EXPECT_EQ(rules.actual_dp_profiles, 10u);
@@ -3156,10 +3163,17 @@ TEST(M0OriginalPreload, WholeOriginalStrictBufferLoadResolvesWithoutModelValues)
   EXPECT_GT(rules.copied_default_denials, 0u);
   EXPECT_EQ(rules.lstm_optional_holes, 1u);
   EXPECT_EQ(rules.multiple_outputs, 1u);
+  std::cerr << "M0_ORIGINAL_PRELOAD phase=descriptor_rules_done" << std::endl;
+  std::cerr << "M0_ORIGINAL_PRELOAD phase=retirement_begin" << std::endl;
   EXPECT_EQ(M0QualifyWholeRetirementV1(bytes), 1u);
+  std::cerr << "M0_ORIGINAL_PRELOAD phase=retirement_done" << std::endl;
   {
-    InferenceSession session(StrictIngressOptions(), GetEnvironment());
+    auto options = StrictIngressOptions();
+    options.session_log_severity_level = 1;
+    InferenceSession session(options, GetEnvironment());
+    std::cerr << "M0_ORIGINAL_PRELOAD phase=load_begin" << std::endl;
     ASSERT_STATUS_OK(session.Load(bytes.data(), static_cast<int>(bytes.size())));
+    std::cerr << "M0_ORIGINAL_PRELOAD phase=load_done" << std::endl;
     const auto& graph = session.GetModel().MainGraph();
     ASSERT_EQ(graph.NumberOfNodes(), 2464);
     ASSERT_EQ(graph.GetAllInitializedTensors().size(), 554u);
@@ -3176,8 +3190,11 @@ TEST(M0OriginalPreload, WholeOriginalStrictBufferLoadResolvesWithoutModelValues)
     const auto replay = session.Load(bytes.data(), static_cast<int>(bytes.size()));
     EXPECT_FALSE(replay.IsOK());
     EXPECT_NE(replay.ErrorMessage().find("RW07_ORIGINAL_LOAD_REUSE"), std::string::npos);
+    std::cerr << "M0_ORIGINAL_PRELOAD phase=initialize_begin" << std::endl;
     ExpectWholeOriginalInitializeResult(session);
+    std::cerr << "M0_ORIGINAL_PRELOAD phase=initialize_returned" << std::endl;
   }
+  std::cerr << "M0_ORIGINAL_PRELOAD phase=source_mutation_rejection_begin" << std::endl;
   bytes[0] ^= 1;
   InferenceSession changed(StrictIngressOptions(), GetEnvironment());
   const auto rejected = changed.Load(bytes.data(), static_cast<int>(bytes.size()));
@@ -3185,6 +3202,7 @@ TEST(M0OriginalPreload, WholeOriginalStrictBufferLoadResolvesWithoutModelValues)
   EXPECT_NE(rejected.ErrorMessage().find("RW07_ORIGINAL_BYTE_IDENTITY"), std::string::npos);
   EXPECT_FALSE(changed.GetModelMetadata().first.IsOK());
   EXPECT_NE(changed.Load(bytes.data(), static_cast<int>(bytes.size())).ErrorMessage().find("RW07_ORIGINAL_LOAD_REUSE"), std::string::npos);
+  std::cerr << "M0_ORIGINAL_PRELOAD phase=source_mutation_rejection_done" << std::endl;
 }
 
 TEST(M0OriginalPreload, OriginalBufferLoaderRejectsCancellationConfigAndExternalPoolsBeforeParsing) {

@@ -48,7 +48,7 @@ class ComputeContextBase {
                      const WebGpuExecutionProvider& ep,
                      const OpKernel& op_kernel);
 
-  ~ComputeContextBase() = default;
+  virtual ~ComputeContextBase() = default;
 
   //
   // Get the node name.
@@ -140,10 +140,12 @@ class ComputeContextBase {
   // Run a compute shader program.
   //
   inline Status RunProgram(const ProgramBase& program) {
+    ORT_RETURN_IF_ERROR(M0CheckCancellationV1());
     return webgpu_context_.Run(*this, program);
   }
 
  protected:
+  virtual Status M0CheckCancellationV1() const { return Status::OK(); }
   WebGpuContext& webgpu_context_;
   const WebGpuExecutionProvider& ep_;
   const OpKernel& op_kernel_;
@@ -161,6 +163,7 @@ class ComputeContext final : public ComputeContextBase {
                  OpKernelContext& kernel_context);
 
   ~ComputeContext() = default;
+  Status M0CheckCancellationV1() const override;
 
   //
   // Get the kernel context.
@@ -187,6 +190,12 @@ class ComputeContext final : public ComputeContextBase {
     if (tensor.Location().device.Type() != OrtDevice::GPU || !tensor.DataRaw()) return false;
     return webgpu_context_.M0OwnershipV2().Describe(
         reinterpret_cast<uintptr_t>(tensor.DataRaw()), out);
+  }
+
+  bool M0FullGpuDescribeStorageV1(const Tensor& tensor,M0FullGpuStorageAllocationV1& out) const {
+    if(tensor.Location().device.Type()!=OrtDevice::GPU||!tensor.DataRaw()||tensor.SizeInBytes()==0)return false;
+    return webgpu_context_.M0DescribeStorageAllocationV1(
+        reinterpret_cast<uintptr_t>(tensor.DataRaw()),tensor.SizeInBytes(),out);
   }
 
   bool M0FullGpuDescribePairV2(const Tensor& sidecar, const Tensor& carrier,

@@ -621,11 +621,24 @@ struct WebGpuDataTransferImpl : OrtDataTransferImpl {
         auto release_context = gsl::finally([context_id]() { WebGpuContextFactory::ReleaseContext(context_id); });
         auto& context = WebGpuContextFactory::GetContext(context_id);
         CommandRecordingState recording;
+        // Native owner transfers are synchronous but streamless. Keep their
+        // call-local encoder separate and drain it before returning to that owner.
+        const bool bounded=context.M0BoundedSubmissionsActiveV1();
+        if(bounded)recording.m0_submission_budget_bytes=context.DeviceLimits().maxBufferSize;
+        bool completed=false;
+        auto bounded_failure=gsl::finally([&](){
+          if(bounded&&!completed)context.M0OwnershipV2().Poison();
+        });
         DataTransferImpl data_transfer{context.BufferManager(), recording};
         status = data_transfer.CopyTensor(src_data, src_is_gpu, dst_data, dst_is_gpu, size);
-        if (status.IsOK() && src_is_gpu && dst_is_gpu) {
+        if(status.IsOK()&&bounded){
+          if(recording.m0_queued_reference_bytes||recording.command_encoder||
+              !recording.deferred_dispatches.empty()||recording.has_unsubmitted_work.load(std::memory_order_relaxed))
+            status=context.FlushAndWaitChecked(context.BufferManager(),recording);
+        }else if (status.IsOK() && src_is_gpu && dst_is_gpu) {
           ORT_THROW_IF_ERROR(context.Flush(context.BufferManager(), recording));
         }
+        completed=status.IsOK();
       }
       if (!status.IsOK()) {
         return OrtApis::CreateStatus(ORT_RUNTIME_EXCEPTION, status.ErrorMessage().c_str());

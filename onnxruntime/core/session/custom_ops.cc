@@ -1526,3 +1526,13 @@ extern "C" ORT_EXPORT int ORT_API_CALL OrtM0FullGpuExtentRunIdV2(
   *run_id = native_context->M0FullGpuExtentRunIdV2();
   return *run_id ? 1 : 0;
 }
+
+extern "C" ORT_EXPORT int ORT_API_CALL OrtM0FullGpuReadCancellationV1(
+    const OrtKernelContext* context,uint32_t version,uint32_t* cancelled) noexcept {
+  if(!context||version!=1||!cancelled)return 0;
+  const auto* native_context=reinterpret_cast<const onnxruntime::OpKernelContext*>(context);
+  uint32_t pending=0;
+  if(!native_context->M0ReadCancellationV1(pending)||pending>1)return 0;
+  *cancelled=pending;
+  return 1;
+}

@@ -22,11 +22,20 @@ uint64_t M0FullGpuResourceOwnership::Acquire(uintptr_t handle, uint64_t requeste
   if (!handle || !requested_bytes) throw std::invalid_argument("RW07 invalid resource descriptor");
   std::lock_guard<std::mutex> lock{mutex_};
   if (live_.count(handle)) throw std::logic_error("RW07 allocation aliases a live resource");
+  if (statistics_.acquisitions == std::numeric_limits<uint64_t>::max() ||
+      requested_bytes > std::numeric_limits<uint64_t>::max() - statistics_.live_requested_bytes) {
+    throw std::overflow_error("RW07 resource statistics exhausted");
+  }
   const uint64_t id = NextAllocation();
   M0FullGpuAllocationIdentity identity{};
   identity.generation = id;
   identity.requested_bytes = requested_bytes;
   live_.emplace(handle, identity);
+  ++statistics_.acquisitions;
+  ++statistics_.live_allocations;
+  statistics_.live_requested_bytes += requested_bytes;
+  if (statistics_.live_requested_bytes > statistics_.peak_live_requested_bytes)
+    statistics_.peak_live_requested_bytes = statistics_.live_requested_bytes;
   return id;
 }
 
@@ -34,8 +43,16 @@ bool M0FullGpuResourceOwnership::Retire(uintptr_t handle, uint64_t generation) {
   std::lock_guard<std::mutex> lock{mutex_};
   auto it = live_.find(handle);
   if (it == live_.end() || !generation || it->second.generation != generation) return false;
+  statistics_.live_requested_bytes -= it->second.requested_bytes;
+  --statistics_.live_allocations;
+  ++statistics_.retirements;
   live_.erase(it);
   return true;
+}
+
+M0FullGpuResourceStatisticsV1 M0FullGpuResourceOwnership::Statistics() const {
+  std::lock_guard<std::mutex> lock{mutex_};
+  return statistics_;
 }
 
 bool M0FullGpuResourceOwnership::Describe(uintptr_t handle, M0FullGpuAllocationIdentity& out) const {

@@ -31,6 +31,12 @@ common::Status M0FullGpuNativeLoweringOwnerV1::RunExecution(
  ORT_RETURN_IF_NOT(names==std::set<std::string>({"tokens","style","speed"}),"RW07_NATIVE_RUN_INPUT_INVENTORY");
  for(const auto& feed:feeds)ORT_RETURN_IF_NOT(feed.IsAllocated()&&feed.IsTensor()&&feed.Get<Tensor>().Location().device==OrtDevice()&&
   feed.Get<Tensor>().DataRaw()&&feed.Get<Tensor>().SizeInBytes(),"RW07_NATIVE_RUN_EXTERNAL_INPUT_DESCRIPTOR");
+#ifdef ENABLE_STRIDED_TENSORS
+ // Public snapshots and publication copy whole byte spans. A noncontiguous
+ // view must never be interpreted as a contiguous tokens/style/speed buffer.
+ for(const auto& feed:feeds)
+  ORT_RETURN_IF_NOT(feed.Get<Tensor>().IsContiguous(),"RW07_NATIVE_RUN_STRIDED_INPUT");
+#endif
  // Generic sparse validation consults the ordinary SessionState, which this
  // closed path intentionally does not create. Reject every non-dense public
  // value before entering that generic validator, including allocated outputs.
@@ -40,6 +46,9 @@ common::Status M0FullGpuNativeLoweringOwnerV1::RunExecution(
    value.Get<Tensor>().Location().device==OrtDevice()&&value.Get<Tensor>().Shape().NumDimensions()==1&&
    value.Get<Tensor>().Shape()[0]>0&&value.Get<Tensor>().DataRaw(),
    "RW07_NATIVE_RUN_EXTERNAL_OUTPUT_DESCRIPTOR");
+#ifdef ENABLE_STRIDED_TENSORS
+  ORT_RETURN_IF_NOT(value.Get<Tensor>().IsContiguous(),"RW07_NATIVE_RUN_STRIDED_OUTPUT");
+#endif
  }
  for(size_t i=0;i<feeds.size();++i){
   const auto& tensor=feeds[i].Get<Tensor>();const auto& name=feed_names[i];
@@ -77,6 +86,7 @@ common::Status M0FullGpuNativeLoweringOwnerV1::RunExecution(
    ORT_THROW_IF_ERROR(callbacks.config_options.AddConfigEntry(key,value.c_str()));
   };
   configure("m0.fullgpu.extent_ownership_v2","1");
+  configure("m0.fullgpu.bounded_submissions_v1","1");
   configure("m0.fullgpu.actual_session_v2",std::to_string(p.epoch));
   configure("m0.fullgpu.actual_run_v2",std::to_string(scope->Id()));
   configure("m0.fullgpu.fault_authorized_v2","0");configure("m0.fullgpu.diagnostic_fault_mode_v2","0");

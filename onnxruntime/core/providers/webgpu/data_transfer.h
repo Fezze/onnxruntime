@@ -51,6 +51,8 @@ struct CommandRecordingState;
 // ep/sync_stream.cc to construct a temporary webgpu::DataTransferImpl with the
 // owning EP's BufferManager and recording, rather than the C API wrapper's
 // call-local recording.
+// The private native-original submission scope also gives streamless calls a
+// bounded local recording and checked completion before returning to its owner.
 //
 // DataTransferImpl is the shared raw-pointer copy implementation used by both
 // DataTransfer (IDataTransfer subclass) and the C API wrapper.

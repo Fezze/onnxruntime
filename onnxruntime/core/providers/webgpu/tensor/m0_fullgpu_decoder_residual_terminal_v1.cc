@@ -3,6 +3,7 @@
 #include "core/providers/webgpu/webgpu_kernel.h"
 #include "core/providers/webgpu/shader_helper.h"
 #include "core/providers/webgpu/m0_fullgpu_extent_abi2.h"
+#include "core/providers/webgpu/tensor/m0_fullgpu_residual_stages_v1.h"
 namespace onnxruntime::webgpu {
 namespace {
 class DecoderResidualPacketProgram final : public Program<DecoderResidualPacketProgram> {
@@ -59,14 +60,7 @@ class DecoderResidualPacket final : public WebGpuKernel {
                           identity.producer_instance == uint32_t(instance_),
                       "RW07 decoder residual terminal actual producer pair");
     const auto& limits = c.DeviceLimits();
-    for (const auto* input : {extent, y}) {
-      ORT_RETURN_IF_NOT(input->DataRaw(), "RW07 decoder residual terminal missing backing");
-      const auto handle = static_cast<WGPUBuffer>(const_cast<void*>(input->DataRaw()));
-      const uint64_t bytes = wgpuBufferGetSize(handle);
-      ORT_RETURN_IF_NOT(bytes >= input->SizeInBytes() && bytes <= limits.maxBufferSize &&
-                            bytes <= limits.maxStorageBufferBindingSize,
-                        "RW07 decoder residual terminal actual binding limit");
-    }
+    for(const auto* input:{extent,y})ORT_RETURN_IF_ERROR(m0_residual_stages::PhysicalBuffer(c,input));
     ORT_RETURN_IF_NOT(limits.maxStorageBuffersPerShaderStage >= 2 && limits.maxBufferSize >= 128 &&
                           limits.maxStorageBufferBindingSize >= 128 && limits.maxComputeWorkgroupsPerDimension >= 1 &&
                           limits.maxComputeWorkgroupSizeX >= 1 && limits.maxComputeInvocationsPerWorkgroup >= 1,
@@ -75,11 +69,7 @@ class DecoderResidualPacket final : public WebGpuKernel {
     ORT_RETURN_IF_NOT(packet->IsDataType<uint32_t>() && packet->Location().device.Type() == OrtDevice::GPU &&
                           packet->DataRaw() != extent->DataRaw() && packet->DataRaw() != y->DataRaw(),
                       "RW07 decoder residual terminal packet allocation");
-    const auto packet_handle = static_cast<WGPUBuffer>(const_cast<void*>(packet->DataRaw()));
-    ORT_RETURN_IF_NOT(packet_handle && wgpuBufferGetSize(packet_handle) >= packet->SizeInBytes() &&
-                          wgpuBufferGetSize(packet_handle) <= limits.maxBufferSize &&
-                          wgpuBufferGetSize(packet_handle) <= limits.maxStorageBufferBindingSize,
-                      "RW07 decoder residual terminal actual packet binding limit");
+    ORT_RETURN_IF_ERROR(m0_residual_stages::StorageBudget(c,{extent,packet}));
     const m0_extent_abi2::OpaqueOwnership ownership{session, run, identity.generation,
                                                     identity.data_generation, uint32_t(role_), uint32_t(instance_)};
     ORT_RETURN_IF_NOT(ownership.Valid(), "RW07 decoder residual terminal identity");

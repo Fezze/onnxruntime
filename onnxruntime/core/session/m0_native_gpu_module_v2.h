@@ -5,6 +5,8 @@
 #include <memory>
 #include "core/session/plugin_ep/m0_native_kernel_inspection_v2.h"
 #include "core/session/plugin_ep/m0_native_resource_binding_v3.h"
+#include "core/session/plugin_ep/m0_native_device_limits_v1.h"
+#include "core/session/m0_original_lstm_module_v1.h"
 namespace onnxruntime {
 class M0OriginalLstmModuleV1;
 class M0FullGpuNativeLoweringOwnerV1;
@@ -25,7 +27,8 @@ class M0NativeGpuModuleV2 final {
   ~M0NativeGpuModuleV2();
   M0NativeGpuModuleV2(const M0NativeGpuModuleV2&)=delete;
   M0NativeGpuModuleV2& operator=(const M0NativeGpuModuleV2&)=delete;
-  void ValidateCurrent()const;
+  M0OriginalLstmModuleV1::NativeSnapshotV1 ValidateCurrent(uintptr_t handle=0,uint64_t required_bytes=0)const;
+  M0NativeDeviceLimitsV1 DeviceLimits(uint64_t storage_bytes=0,uint64_t initializer_bytes=0,uint64_t uniform_bytes=0)const;
   M0NativeResourceBindingV3 Resource(uintptr_t handle,uint64_t required_bytes)const;
   const ExecutionProviders& Providers()const;
   PluginExecutionProvider& Provider()const;

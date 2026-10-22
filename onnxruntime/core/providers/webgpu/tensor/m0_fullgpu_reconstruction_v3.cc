@@ -3,18 +3,18 @@
 // Actual original2426 ->2427..2463, with genuine generator ownership.
 #include <algorithm>
 #include <array>
+#include <optional>
 #include "core/providers/webgpu/webgpu_kernel.h"
 #include "core/providers/webgpu/shader_helper.h"
 #include "core/providers/webgpu/m0_fullgpu_extent_abi2.h"
+#include "core/providers/webgpu/tensor/m0_fullgpu_residual_stages_v1.h"
 namespace onnxruntime::webgpu {
 namespace {
 bool Gpu(const Tensor* t){return t&&t->Location().device.Type()==OrtDevice::GPU;}
-Status Binding(ComputeContext& c,const Tensor* t){
- const auto& l=c.DeviceLimits();
- ORT_RETURN_IF_NOT(Gpu(t)&&t->DataRaw()&&t->SizeInBytes()>0&&t->SizeInBytes()<=l.maxBufferSize&&t->SizeInBytes()<=l.maxStorageBufferBindingSize,"RW07 reconstruction3 GPU binding");
- const uint64_t actual=wgpuBufferGetSize(static_cast<WGPUBuffer>(const_cast<void*>(t->DataRaw())));
- ORT_RETURN_IF_NOT(actual>=t->SizeInBytes()&&actual<=l.maxBufferSize&&actual<=l.maxStorageBufferBindingSize,"RW07 reconstruction3 actual backing");return Status::OK();
-}
+using m0_residual_stages::PhysicalBuffer;
+using m0_residual_stages::StorageBudget;
+using m0_residual_stages::StorageBudgetWithWindow;
+using m0_residual_stages::StorageBudgetWithWindows;
 void ValidOutput(ShaderHelper& s,const ShaderVariableHelper& e){
  auto& f=s.AdditionalImplementation();
  f<<"fn valid_output()->bool{if("<<e.GetByOffset("0u")<<"!=2u||"<<e.GetByOffset("1u")<<"!=1u||"<<e.GetByOffset("20u")<<"!=0u||"<<e.GetByOffset("21u")<<"!=63u){return false;}"
@@ -66,27 +66,42 @@ class Guard final:public Program<Guard>{
    <<o.SetByOffset("2u","n")<<o.SetByOffset("18u","n")<<o.SetByOffset("21u","63u");return Status::OK();
  }
 };
-class Inverse final:public Program<Inverse>{
+class GatherSpectrumWindow final:public Program<GatherSpectrumWindow>{
  public:
- Inverse():Program{"RW07Original2427InverseGemmV3"}{}
- WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"input_capacity",ProgramUniformVariableDataType::Uint32},{"output_capacity",ProgramUniformVariableDataType::Uint32},{"identity",ProgramUniformVariableDataType::Uint32});
+ GatherSpectrumWindow():Program{"RW07ReconstructionSpectrumWindowGatherV1"}{}
+ WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+  {"input_capacity",ProgramUniformVariableDataType::Uint32},{"output_capacity",ProgramUniformVariableDataType::Uint32},
+  {"sample_begin",ProgramUniformVariableDataType::Uint32},{"first_frame",ProgramUniformVariableDataType::Uint32},
+  {"frame_count",ProgramUniformVariableDataType::Uint32},{"identity",ProgramUniformVariableDataType::Uint32});
  Status GenerateShaderCode(ShaderHelper& s)const override{
-  const auto& x=s.AddInput("spectrum",ShaderUsage::UseValueTypeAlias);const auto& w=s.AddInput("basis",ShaderUsage::UseValueTypeAlias);const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);const auto& y=s.AddOutput("col",ShaderUsage::UseValueTypeAlias);
-  ValidOutput(s,e);Arithmetic(s);auto& f=s.MainFunctionBody();
-  f<<"if(global_idx>=20u*uniforms.input_capacity){return;}"<<y.SetByOffset("global_idx","0.0")<<"if(!valid_output()){return;}let frame=global_idx%uniforms.input_capacity;let k=global_idx/uniforms.input_capacity;let frames="<<e.GetByOffset("2u")<<"/5u+1u;if(frame>=frames){return;}var sum:f32=0.0;"
-   <<"for(var c=0u;c<22u;c++){let product=original_mul("<<x.GetByOffset("c*uniforms.input_capacity+frame")<<","<<w.GetByOffset("c*20u+k")<<");sum=original_add(sum,product);}"<<y.SetByOffset("global_idx","sum");return Status::OK();
+  const auto& x=s.AddInput("source",ShaderUsage::UseValueTypeAlias);
+  const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
+  const auto& y=s.AddOutput("packed",ShaderUsage::UseValueTypeAlias);
+  ValidOutput(s,e);auto& f=s.MainFunctionBody();
+  f<<"if(global_idx>=uniforms.frame_count){return;}"<<y.SetByOffset("global_idx","0.0")
+   <<"if(!valid_output()||uniforms.sample_begin>="<<e.GetByOffset("2u")<<"){return;}"
+   <<"if(uniforms.first_frame+global_idx>="<<e.GetByOffset("2u")<<"/5u+1u){return;}"
+   <<y.SetByOffset("global_idx",x.GetByOffset("global_idx"));return Status::OK();
  }
 };
 class Finish final:public Program<Finish>{
  public:
- Finish():Program{"RW07Original2427To2463OverlapScatterCropV3"}{}
- WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"input_capacity",ProgramUniformVariableDataType::Uint32},{"output_capacity",ProgramUniformVariableDataType::Uint32},{"identity",ProgramUniformVariableDataType::Uint32});
+ Finish():Program{"RW07Original2427To2463DirectOverlapScatterCropV4"}{}
+ WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+  {"input_capacity",ProgramUniformVariableDataType::Uint32},{"output_capacity",ProgramUniformVariableDataType::Uint32},
+  {"sample_begin",ProgramUniformVariableDataType::Uint32},{"sample_count",ProgramUniformVariableDataType::Uint32},
+  {"first_frame",ProgramUniformVariableDataType::Uint32},{"packed_capacity",ProgramUniformVariableDataType::Uint32},
+  {"identity",ProgramUniformVariableDataType::Uint32});
  Status GenerateShaderCode(ShaderHelper& s)const override{
-  const auto& col=s.AddInput("col",ShaderUsage::UseValueTypeAlias);const auto& w=s.AddInput("window",ShaderUsage::UseValueTypeAlias);const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);const auto& y=s.AddOutput("pcm",ShaderUsage::UseValueTypeAlias);
+  const auto& x=s.AddInput("spectrum",ShaderUsage::UseValueTypeAlias);const auto& basis=s.AddInput("basis",ShaderUsage::UseValueTypeAlias);
+  const auto& w=s.AddInput("window",ShaderUsage::UseValueTypeAlias);const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);const auto& y=s.AddOutput("pcm",ShaderUsage::UseValueTypeAlias);
   ValidOutput(s,e);Arithmetic(s);auto& f=s.MainFunctionBody();
-  f<<"if(global_idx>=uniforms.output_capacity){return;}"<<y.SetByOffset("global_idx","0.0")<<"if(!valid_output()||global_idx>="<<e.GetByOffset("2u")<<"){return;}let frames="<<e.GetByOffset("2u")<<"/5u+1u;let sample=global_idx+10u;var value:f32=0.0;"
-   // Original Col2imNd visits kernel taps first; omit noncontributing taps.
-   <<"for(var k=0u;k<20u;k++){if(sample>=k){let delta=sample-k;if(delta%5u==0u){let frame=delta/5u;if(frame<frames){value=original_add(value,"<<col.GetByOffset("k*uniforms.input_capacity+frame")<<");}}}}"
+  f<<"if(global_idx>=uniforms.sample_count){return;}"<<y.SetByOffset("global_idx","0.0")<<"let output_sample=uniforms.sample_begin+global_idx;if(!valid_output()||output_sample>="<<e.GetByOffset("2u")<<"){return;}let frames="<<e.GetByOffset("2u")<<"/5u+1u;let sample=output_sample+10u;var value:f32=0.0;"
+   // Each inverse-Gemm col[k,frame] contributes to only sample=k+5*frame.
+   // Keep its complete channel sum separate from Col2imNd's ordered tap sum.
+   <<"for(var k=0u;k<20u;k++){if(sample>=k){let delta=sample-k;if(delta%5u==0u){let frame=delta/5u;if(frame<frames){var sum:f32=0.0;"
+   <<"for(var c=0u;c<22u;c++){let product:f32=original_mul("<<x.GetByOffset("c*uniforms.packed_capacity+frame-uniforms.first_frame")<<","<<basis.GetByOffset("c*20u+k")<<");sum=original_add(sum,product);}"
+   <<"value=original_add(value,sum);}}}}"
    // Original NonZero/ScatterND overwrites only indices1..19, then crop10.
    <<"if(sample<20u){value=original_div(value,"<<w.GetByOffset("sample")<<");}let result=original_mul(value,4.0);"<<y.SetByOffset("global_idx","result");return Status::OK();
  }
@@ -100,29 +115,104 @@ class Reconstruction final:public WebGpuKernel{
                         Gpu(e)&&e->IsDataType<uint32_t>()&&e->Shape()==TensorShape{32}&&Gpu(w)&&w->IsDataType<float>()&&w->Shape()==TensorShape({22,1,20})&&
                         Gpu(window)&&window->IsDataType<float>()&&window->Shape()==TensorShape{20}&&capacity_>0&&capacity_<=61440000,"RW07 reconstruction3 exact physical descriptors");
   const auto& l=c.DeviceLimits();const uint64_t limit=l.maxComputeWorkgroupsPerDimension,pc=uint64_t(x->Shape()[2]);
-  ORT_RETURN_IF_NOT(l.maxStorageBuffersPerShaderStage>=4&&l.maxComputeWorkgroupSizeX>=64&&l.maxComputeInvocationsPerWorkgroup>=64&&limit>0,"RW07 reconstruction3 dispatch resources");
-  for(uint64_t n:{20*pc,uint64_t(capacity_)})ORT_RETURN_IF_NOT(n<=UINT32_MAX&&n*4<=l.maxBufferSize&&n*4<=l.maxStorageBufferBindingSize&&(n+63)/64<=limit*limit,"RW07 reconstruction3 physical resource capacity");
-  const std::array<const Tensor*,4> inputs{x,e,w,window};for(const auto* t:inputs)ORT_RETURN_IF_ERROR(Binding(c,t));
+  ORT_RETURN_IF_NOT(l.maxStorageBuffersPerShaderStage>=5&&l.maxComputeWorkgroupSizeX>=64&&l.maxComputeInvocationsPerWorkgroup>=64&&limit>0,"RW07 reconstruction3 dispatch resources");
+  const uint64_t count=uint64_t(capacity_);
+  ORT_RETURN_IF_NOT(count<=UINT32_MAX&&count*4<=l.maxBufferSize,"RW07 reconstruction3 physical resource capacity");
+  const bool windowed=x->SizeInBytes()>l.maxStorageBufferBindingSize||count*4>l.maxStorageBufferBindingSize;
+  const uint64_t alignment=l.minStorageBufferOffsetAlignment;
+  uint64_t samples_per_window=count,packed_capacity=pc;
+  if(windowed){
+   ORT_RETURN_IF_NOT(alignment>0&&alignment%4==0,"RW07 reconstruction3 window alignment");
+   const uint64_t prefix=alignment-4,minimum=22ull*6*4;
+   ORT_RETURN_IF_NOT(l.maxStorageBufferBindingSize>=prefix+minimum,"RW07 reconstruction3 minimum packed window");
+   const uint64_t budget=std::min<uint64_t>(l.maxStorageBufferBindingSize,std::max<uint64_t>(8ull*1024*1024,prefix+minimum));
+   const uint64_t frame_budget=(budget-prefix)/(22*4);
+   const uint64_t dispatch_capacity=std::min<uint64_t>(UINT32_MAX/64,limit*limit)*64;
+   samples_per_window=std::min({count,5*(frame_budget-5),dispatch_capacity});
+   ORT_RETURN_IF_NOT(samples_per_window>0,"RW07 reconstruction3 positive PCM window");
+   packed_capacity=(samples_per_window+4)/5+5;
+  }
+  const uint64_t groups=(samples_per_window+63)/64;
+  ORT_RETURN_IF_NOT(groups<=limit*limit,"RW07 reconstruction3 window dispatch capacity");
+  const std::array<const Tensor*,4> inputs{x,e,w,window};for(const auto* t:inputs)ORT_RETURN_IF_ERROR(PhysicalBuffer(c,t));
   const uint64_t session=c.KernelContext().M0FullGpuExtentOwnerEpochV1(),run=c.KernelContext().M0FullGpuExtentRunIdV2();
   M0FullGpuAllocationIdentity sid,data,pair,output;
   ORT_RETURN_IF_NOT(session&&run&&c.M0FullGpuDescribeResourceV2(*e,sid)&&c.M0FullGpuDescribeResourceV2(*x,data),"RW07 reconstruction3 live source allocations");
   const bool paired=c.M0FullGpuDescribePairV2(*e,*x,pair)&&pair.session==session&&pair.run==run&&pair.generation==sid.generation&&pair.data_generation==data.generation&&pair.producer_role==74&&pair.producer_instance==1075;
-  auto* y=c.Output(0,TensorShape{capacity_});auto* out=c.Output(1,TensorShape{32});auto col=c.CreateGPUTensor(x->DataType(),TensorShape{20,int64_t(pc)});
+  auto* y=c.Output(0,TensorShape{capacity_});auto* out=c.Output(1,TensorShape{32});
   ORT_RETURN_IF_NOT(Gpu(y)&&y->IsDataType<float>()&&Gpu(out)&&out->IsDataType<uint32_t>(),"RW07 reconstruction3 output types");
-  const std::array<const Tensor*,3> allocated{y,out,&col};
-  for(size_t i=0;i<allocated.size();++i){ORT_RETURN_IF_ERROR(Binding(c,allocated[i]));for(size_t j=0;j<i;++j)ORT_RETURN_IF_NOT(allocated[i]->DataRaw()!=allocated[j]->DataRaw(),"RW07 reconstruction3 distinct scratch/output");for(const auto* t:inputs)ORT_RETURN_IF_NOT(allocated[i]->DataRaw()!=t->DataRaw(),"RW07 reconstruction3 distinct input/output");}
+  const std::array<const Tensor*,2> allocated{y,out};
+  for(size_t i=0;i<allocated.size();++i){ORT_RETURN_IF_ERROR(PhysicalBuffer(c,allocated[i]));for(size_t j=0;j<i;++j)ORT_RETURN_IF_NOT(allocated[i]->DataRaw()!=allocated[j]->DataRaw(),"RW07 reconstruction3 distinct outputs");for(const auto* t:inputs)ORT_RETURN_IF_NOT(allocated[i]->DataRaw()!=t->DataRaw(),"RW07 reconstruction3 distinct input/output");}
+  std::optional<Tensor> packed;
+  if(windowed){
+   packed.emplace(c.CreateGPUTensor(x->DataType(),TensorShape{22,int64_t(packed_capacity)}));
+   ORT_RETURN_IF_ERROR(PhysicalBuffer(c,&*packed));
+   for(const auto* t:inputs)ORT_RETURN_IF_NOT(packed->DataRaw()!=t->DataRaw(),"RW07 reconstruction3 distinct packed input");
+   for(const auto* t:allocated)ORT_RETURN_IF_NOT(packed->DataRaw()!=t->DataRaw(),"RW07 reconstruction3 distinct packed output");
+  }
+  // Cover all inverse frames for samples [begin+10,begin+size+9].
+  // Extra frames at either edge are harmless; live taps retain their original order.
+  const auto frames_for=[&](uint64_t begin,uint64_t size){
+   const uint64_t first=std::min<uint64_t>(begin>=9?(begin-9)/5:0,pc-1);
+   const uint64_t last=std::min<uint64_t>((begin+size+9)/5,pc-1);
+   return std::array<uint64_t,2>{first,last-first+1};
+  };
+  const auto source_view=[&](uint32_t channel,uint64_t first,uint64_t size){
+   return ProgramInput::FloatBufferWindow(x,ProgramTensorMetadataDependency::None,TensorShape{int64_t(size)},
+       uint32_t(channel*pc+first),uint32_t(alignment));
+  };
+  const auto packed_view=[&](uint32_t channel,uint64_t size){
+   return ProgramOutput::FloatBufferWindow(&*packed,ProgramTensorMetadataDependency::None,TensorShape{int64_t(size)},
+       uint32_t(channel*packed_capacity),uint32_t(alignment));
+  };
+  const auto pcm_view=[&](uint64_t begin,uint64_t size){
+   return ProgramOutput::FloatBufferWindow(y,ProgramTensorMetadataDependency::None,TensorShape{int64_t(size)},
+       uint32_t(begin),uint32_t(alignment));
+  };
+  ORT_RETURN_IF_ERROR(StorageBudget(c,{e,window,out}));
+  if(windowed){
+   for(uint64_t begin=0;begin<count;begin+=samples_per_window){
+    const uint64_t size=std::min(samples_per_window,count-begin);const auto frames=frames_for(begin,size);
+    ORT_RETURN_IF_NOT(frames[1]<=packed_capacity,"RW07 reconstruction3 packed frame span");
+    for(uint32_t channel=0;channel<22;++channel){
+     ORT_RETURN_IF_ERROR(StorageBudgetWithWindows(c,source_view(channel,frames[0],frames[1]),packed_view(channel,frames[1]),{out}));
+    }
+    ORT_RETURN_IF_ERROR(StorageBudgetWithWindow(c,pcm_view(begin,size),{&*packed,w,window,out}));
+   }
+  }else{
+   ORT_RETURN_IF_ERROR(StorageBudget(c,{x,w,window,out,y}));
+  }
   ORT_RETURN_IF_NOT(c.M0FullGpuClaimExtentV2(*out,*y,75,1076,output),"RW07 reconstruction3 actual PCM ownership");
   const m0_extent_abi2::OpaqueOwnership source{session,run,sid.generation,data.generation,74,1075},owner{session,run,output.generation,output.data_generation,75,1076};
   ORT_RETURN_IF_NOT(source.Valid()&&owner.Valid(),"RW07 reconstruction3 identities");const auto sw=source.UniformWords(),ow=owner.UniformWords();
   const auto span=[](const auto& a){return gsl::span<const uint32_t>{a.data(),a.size()};};
   Guard guard;guard.AddInputs({{e,ProgramTensorMetadataDependency::None},{window,ProgramTensorMetadataDependency::None}}).AddOutput({out,ProgramTensorMetadataDependency::None})
    .SetWorkgroupSize(1).SetDispatchGroupSize(1).AddUniformVariables({uint32_t(pc),uint32_t(capacity_),uint32_t(paired),span(sw),span(ow)});ORT_RETURN_IF_ERROR(c.RunProgram(guard));
-  const auto dispatch=[&](auto& p,uint64_t count)->Status{const uint64_t groups=(count+63)/64,gx=std::min(groups,limit),gy=(groups+gx-1)/gx;p.SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy));return c.RunProgram(p);};
-  Inverse inverse;inverse.AddInputs({{x,ProgramTensorMetadataDependency::None},{w,ProgramTensorMetadataDependency::None},{out,ProgramTensorMetadataDependency::None}}).AddOutput({&col,ProgramTensorMetadataDependency::None})
-   .AddUniformVariables({uint32_t(pc),uint32_t(capacity_),span(ow)});ORT_RETURN_IF_ERROR(dispatch(inverse,20*pc));
-  Finish finish;finish.AddInputs({{&col,ProgramTensorMetadataDependency::None},{window,ProgramTensorMetadataDependency::None},{out,ProgramTensorMetadataDependency::None}}).AddOutput({y,ProgramTensorMetadataDependency::None})
-   .AddUniformVariables({uint32_t(pc),uint32_t(capacity_),span(ow)});ORT_RETURN_IF_ERROR(dispatch(finish,uint64_t(capacity_)));
-  LOGS(c.Logger(),INFO)<<"M0_RW07_RECONSTRUCTION_V3 actual_original2426=1 role=75 instance=1076 GPU_dispatches=3 host_payload_reads=0";return Status::OK();
+  for(uint64_t begin=0;begin<count;begin+=samples_per_window){
+   const uint64_t size=std::min(samples_per_window,count-begin);
+   const auto frames=windowed?frames_for(begin,size):std::array<uint64_t,2>{0,pc};
+   if(windowed){
+    const uint64_t gather_groups=(frames[1]+63)/64,gx=std::min(gather_groups,limit),gy=(gather_groups+gx-1)/gx;
+    for(uint32_t channel=0;channel<22;++channel){
+     GatherSpectrumWindow gather;
+     gather.AddInput(source_view(channel,frames[0],frames[1])).AddInput({out,ProgramTensorMetadataDependency::None})
+      .AddOutput(packed_view(channel,frames[1])).SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
+      .AddUniformVariables({uint32_t(pc),uint32_t(capacity_),uint32_t(begin),uint32_t(frames[0]),uint32_t(frames[1]),span(ow)});
+     ORT_RETURN_IF_ERROR(c.RunProgram(gather));
+    }
+   }
+   const uint64_t finish_groups=(size+63)/64,gx=std::min(finish_groups,limit),gy=(finish_groups+gx-1)/gx;
+   Finish finish;
+   finish.AddInputs({{windowed?&*packed:x,ProgramTensorMetadataDependency::None},{w,ProgramTensorMetadataDependency::None},
+       {window,ProgramTensorMetadataDependency::None},{out,ProgramTensorMetadataDependency::None}})
+    .AddOutput(windowed?pcm_view(begin,size):ProgramOutput{y,ProgramTensorMetadataDependency::None})
+    .SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
+    .AddUniformVariables({uint32_t(pc),uint32_t(capacity_),uint32_t(begin),uint32_t(size),uint32_t(frames[0]),uint32_t(packed_capacity),span(ow)});
+   ORT_RETURN_IF_ERROR(c.RunProgram(finish));
+  }
+  LOGS(c.Logger(),INFO)<<"M0_RW07_RECONSTRUCTION_V3 actual_original2426=1 role=75 instance=1076 GPU_dispatches="
+   <<1+((count+samples_per_window-1)/samples_per_window)*(windowed?23:1)
+   <<" packed_spectrum_bytes="<<(windowed?packed->SizeInBytes():0)<<" inverse_scratch_bytes=0 host_payload_reads=0";return Status::OK();
  }
  private:const int64_t capacity_;
 };
@@ -145,10 +235,11 @@ class Packet final:public WebGpuKernel{
   const auto* e=c.Input<Tensor>(0);const auto* y=c.Input<Tensor>(1);
   ORT_RETURN_IF_NOT(Gpu(e)&&e->IsDataType<uint32_t>()&&e->Shape()==TensorShape{32}&&Gpu(y)&&y->IsDataType<float>()&&y->Shape().NumDimensions()==1&&y->Shape()[0]>0&&y->Shape()[0]<=61440000,"RW07 PCM3 terminal descriptors");
   const auto& l=c.DeviceLimits();ORT_RETURN_IF_NOT(l.maxStorageBuffersPerShaderStage>=2&&l.maxComputeWorkgroupsPerDimension>=1&&l.maxComputeWorkgroupSizeX>=1&&l.maxComputeInvocationsPerWorkgroup>=1,"RW07 PCM3 terminal resources");
-  ORT_RETURN_IF_ERROR(Binding(c,e));ORT_RETURN_IF_ERROR(Binding(c,y));
+  ORT_RETURN_IF_ERROR(PhysicalBuffer(c,e));ORT_RETURN_IF_ERROR(PhysicalBuffer(c,y));
   const uint64_t session=c.KernelContext().M0FullGpuExtentOwnerEpochV1(),run=c.KernelContext().M0FullGpuExtentRunIdV2();M0FullGpuAllocationIdentity pair;
   ORT_RETURN_IF_NOT(session&&run&&c.M0FullGpuDescribePairV2(*e,*y,pair)&&pair.session==session&&pair.run==run&&pair.producer_role==75&&pair.producer_instance==1076,"RW07 PCM3 terminal actual pair");
-  auto* p=c.Output(0,TensorShape{18});ORT_RETURN_IF_NOT(Gpu(p)&&p->IsDataType<uint32_t>()&&p->DataRaw()!=e->DataRaw()&&p->DataRaw()!=y->DataRaw(),"RW07 PCM3 terminal distinct output");ORT_RETURN_IF_ERROR(Binding(c,p));
+  auto* p=c.Output(0,TensorShape{18});ORT_RETURN_IF_NOT(Gpu(p)&&p->IsDataType<uint32_t>()&&p->DataRaw()!=e->DataRaw()&&p->DataRaw()!=y->DataRaw(),"RW07 PCM3 terminal distinct output");
+  ORT_RETURN_IF_ERROR(StorageBudget(c,{e,p}));
   const m0_extent_abi2::OpaqueOwnership owner{session,run,pair.generation,pair.data_generation,75,1076};ORT_RETURN_IF_NOT(owner.Valid(),"RW07 PCM3 terminal identity");const auto words=owner.UniformWords();
   const uint32_t cap=uint32_t(y->Shape()[0]);PacketProgram program;
   program.AddInput({e,ProgramTensorMetadataDependency::None}).AddOutput({p,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(1).SetDispatchGroupSize(1)

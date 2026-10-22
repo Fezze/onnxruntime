@@ -18,6 +18,12 @@ ORT_EXPORT int ORT_API_CALL OrtM0FullGpuExtentRunIdV2(
     noexcept
 #endif
     ;
+ORT_EXPORT int ORT_API_CALL OrtM0FullGpuReadCancellationV1(
+    const OrtKernelContext* context, uint32_t version, uint32_t* cancelled)
+#ifdef __cplusplus
+    noexcept
+#endif
+    ;
 #ifdef __cplusplus
 }
 #endif

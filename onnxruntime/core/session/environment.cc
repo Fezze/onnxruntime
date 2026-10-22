@@ -33,7 +33,7 @@
 #if !defined(ORT_MINIMAL_BUILD)
 #include "onnx/defs/operator_sets.h"
 #include "onnx/defs/operator_sets_ml.h"
-#if defined(USE_WEBGPU)
+#if defined(USE_WEBGPU) || defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
 #include "core/graph/m0_fullgpu_extent_schemas.h"
 #endif
 #include "core/graph/contrib_ops/internal_nhwc_onnx_schemas.h"
@@ -312,7 +312,7 @@ Status Environment::Initialize(std::unique_ptr<logging::LoggingManager> logging_
       domainToVersionRangeInstance.AddDomainToVersion(onnxruntime::kMSInternalNHWCDomain, 1, onnx_version);
 
       domainToVersionRangeInstance.AddDomainToVersion(onnxruntime::kPytorchAtenDomain, 1, 1);
-#if defined(USE_WEBGPU)
+#if defined(USE_WEBGPU) || defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
       RegisterM0FullGpuExtentSchemasV1();
 #endif
 #ifdef USE_DML

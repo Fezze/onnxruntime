@@ -5,9 +5,13 @@
 #include "core/providers/webgpu/webgpu_kernel.h"
 #include "core/providers/webgpu/shader_helper.h"
 #include "core/providers/webgpu/m0_fullgpu_extent_abi2.h"
+#include "core/providers/webgpu/tensor/m0_fullgpu_residual_stages_v1.h"
 
 namespace onnxruntime::webgpu {
 namespace {
+using m0_residual_stages::PhysicalBuffer;
+using m0_residual_stages::StorageBudget;
+using m0_residual_stages::StorageBudgetWithWindows;
 bool Gpu(const Tensor* t) { return t && t->Location().device.Type() == OrtDevice::GPU; }
 void ValidOutput(ShaderHelper& s, const ShaderVariableHelper& e) {
   auto& f = s.AdditionalImplementation();
@@ -66,10 +70,14 @@ class Guard final : public Program<Guard> {
 };
 class Polar final : public Program<Polar> {
  public:
-  Polar() : Program{"RW07Original1575Through1597PolarV1"} {}
+  Polar() : Program{"RW07Original1575Through1597PolarTimeWindowV2"} {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"input_capacity", ProgramUniformVariableDataType::Uint32},
       {"output_capacity", ProgramUniformVariableDataType::Uint32},
+      {"frame_begin", ProgramUniformVariableDataType::Uint32},
+      {"frame_count", ProgramUniformVariableDataType::Uint32},
+      {"input_begin", ProgramUniformVariableDataType::Uint32},
+      {"channel", ProgramUniformVariableDataType::Uint32},
       {"identity", ProgramUniformVariableDataType::Uint32});
   Status GenerateShaderCode(ShaderHelper& s) const override {
     const auto& x = s.AddInput("spectrum", ShaderUsage::UseValueTypeAlias);
@@ -100,13 +108,12 @@ fn original_atan(x:f32)->f32 {
 }
 )WGSL";
     auto& f = s.MainFunctionBody();
-    f << "if(global_idx>=11u*uniforms.output_capacity){return;}"
-      << "let bin=global_idx/uniforms.output_capacity;let frame=global_idx%uniforms.output_capacity;"
-      << "let phase_offset=(bin+11u)*uniforms.output_capacity+frame;"
-      << y.SetByOffset("global_idx", "0.0") << y.SetByOffset("phase_offset", "0.0")
+    f << "if(global_idx>=uniforms.frame_count){return;}"
+      << "let bin=uniforms.channel%11u;let frame=uniforms.frame_begin+global_idx;"
+      << y.SetByOffset("global_idx", "0.0")
       << "if(!valid_output()||frame>=" << e.GetByOffset("6u") << "){return;}"
-      << "let re=" << x.GetByOffset("22u*frame+2u*bin") << ";"
-      << "let im=" << x.GetByOffset("22u*frame+2u*bin+1u") << ";"
+      << "let re=" << x.GetByOffset("22u*(frame-uniforms.input_begin)+2u*bin") << ";"
+      << "let im=" << x.GetByOffset("22u*(frame-uniforms.input_begin)+2u*bin+1u") << ";"
       << "let re2=square(re);let im2=square(im);let total:f32=re2+im2;"
       << "let magnitude=sqrt(total);let ratio=original_div(im,re);let angle=original_atan(ratio);"
       << "let pi=bitcast<f32>(0x40490fdbu);let positive:f32=angle+pi;let negative:f32=angle-pi;"
@@ -114,7 +121,7 @@ fn original_atan(x:f32)->f32 {
       << "let imag_positive=(ib&0x80000000u)==0u&&(ib&0x7fffffffu)>0u&&(ib&0x7fffffffu)<=0x7f800000u;"
       << "let real_negative=(rb&0x80000000u)!=0u&&(rb&0x7fffffffu)>0u&&(rb&0x7fffffffu)<=0x7f800000u;"
       << "let quadrant=select(negative,positive,imag_positive);let phase=select(angle,quadrant,real_negative);"
-      << y.SetByOffset("global_idx", "magnitude") << y.SetByOffset("phase_offset", "phase");
+      << y.SetByOffset("global_idx", "select(magnitude,phase,uniforms.channel>=11u)");
     return Status::OK();
   }
 };
@@ -131,21 +138,22 @@ class PolarExtent final : public WebGpuKernel {
                           capacity_ > 0 && capacity_ <= 12288001,
                       "RW07 polar after1573 exact physical descriptors");
     const auto& limits = c.DeviceLimits();
-    const uint64_t bytes = 22 * uint64_t(capacity_) * 4, groups = (11 * uint64_t(capacity_) + 63) / 64;
+    const uint64_t bytes = 22 * uint64_t(capacity_) * 4;
     const uint64_t limit = limits.maxComputeWorkgroupsPerDimension;
     ORT_RETURN_IF_NOT(limits.maxStorageBuffersPerShaderStage >= 3 && limits.maxComputeWorkgroupSizeX >= 64 &&
-                          limits.maxComputeInvocationsPerWorkgroup >= 64 && limit > 0 && groups <= limit * limit &&
-                          bytes <= limits.maxBufferSize && bytes <= limits.maxStorageBufferBindingSize,
+                          limits.maxComputeInvocationsPerWorkgroup >= 64 && limit > 0 &&
+                          bytes <= limits.maxBufferSize,
                       "RW07 polar after1573 resource capacity");
-    auto binding = [&](const Tensor* t) -> Status {
-      ORT_RETURN_IF_NOT(t->DataRaw() && t->SizeInBytes() > 0 && t->SizeInBytes() <= limits.maxBufferSize &&
-                            t->SizeInBytes() <= limits.maxStorageBufferBindingSize,
-                        "RW07 polar after1573 binding descriptor");
-      const uint64_t actual = wgpuBufferGetSize(static_cast<WGPUBuffer>(const_cast<void*>(t->DataRaw())));
-      ORT_RETURN_IF_NOT(actual >= t->SizeInBytes() && actual <= limits.maxBufferSize && actual <= limits.maxStorageBufferBindingSize,
-                        "RW07 polar after1573 actual binding backing");
-      return Status::OK();
-    };
+    const uint64_t alignment=limits.minStorageBufferOffsetAlignment;
+    ORT_RETURN_IF_NOT(alignment>0&&alignment%4==0,"RW07 polar after1573 window alignment");
+    const uint64_t prefix=alignment-4;
+    ORT_RETURN_IF_NOT(limits.maxStorageBufferBindingSize>=prefix+88,"RW07 polar after1573 minimum frame window");
+    const uint64_t budget=std::min<uint64_t>(limits.maxStorageBufferBindingSize,
+        std::max<uint64_t>(8ull*1024*1024,prefix+88));
+    const uint64_t dispatch_capacity=std::min<uint64_t>(UINT32_MAX/64,limit*limit)*64;
+    const uint32_t frames_per_window=uint32_t(std::min({uint64_t(capacity_),(budget-prefix)/88,dispatch_capacity}));
+    ORT_RETURN_IF_NOT(frames_per_window>0,"RW07 polar after1573 positive frame window");
+    auto binding = [&](const Tensor* t) -> Status { return PhysicalBuffer(c,t); };
     ORT_RETURN_IF_ERROR(binding(x)); ORT_RETURN_IF_ERROR(binding(e));
     const uint64_t session = c.KernelContext().M0FullGpuExtentOwnerEpochV1(), run = c.KernelContext().M0FullGpuExtentRunIdV2();
     M0FullGpuAllocationIdentity source, carrier, pair, output;
@@ -161,25 +169,49 @@ class PolarExtent final : public WebGpuKernel {
     ORT_RETURN_IF_NOT(y->DataRaw() != out->DataRaw() && y->DataRaw() != x->DataRaw() && y->DataRaw() != e->DataRaw() &&
                           out->DataRaw() != x->DataRaw() && out->DataRaw() != e->DataRaw(),
                       "RW07 polar after1573 distinct outputs/input allocations");
+    ORT_RETURN_IF_ERROR(StorageBudget(c, {e, out}));
+    const uint32_t pc=uint32_t(x->Shape()[1]),oc=uint32_t(capacity_);
+    const auto input_begin=[&](uint32_t first){return std::min(first,pc-1);};
+    const auto input_view=[&](uint32_t first,uint32_t size){
+      const uint32_t begin=input_begin(first),source_frames=std::min(size,pc-begin);
+      return ProgramInput::FloatBufferWindow(x,ProgramTensorMetadataDependency::None,TensorShape{source_frames,11,2},
+          22u*begin,uint32_t(alignment));
+    };
+    const auto output_view=[&](uint32_t channel,uint32_t first,uint32_t size){
+      return ProgramOutput::FloatBufferWindow(y,ProgramTensorMetadataDependency::None,TensorShape{size},
+          channel*oc+first,uint32_t(alignment));
+    };
+    for(uint32_t channel=0;channel<22;++channel){
+      for(uint32_t first=0;first<oc;first+=frames_per_window){
+        const uint32_t size=std::min(frames_per_window,oc-first);
+        ORT_RETURN_IF_ERROR(StorageBudgetWithWindows(c,input_view(first,size),output_view(channel,first,size),{out}));
+      }
+    }
     ORT_RETURN_IF_NOT(c.M0FullGpuClaimExtentV2(*out, *y, 15, 1016, output), "RW07 polar after1573 output claim");
     const m0_extent_abi2::OpaqueOwnership src{session, run, source.generation, carrier.generation, 14, 1015};
     const m0_extent_abi2::OpaqueOwnership dst{session, run, output.generation, output.data_generation, 15, 1016};
     ORT_RETURN_IF_NOT(src.Valid() && dst.Valid(), "RW07 polar after1573 opaque ownership");
     const auto sw = src.UniformWords(), ow = dst.UniformWords();
     const auto source_identity = gsl::span<const uint32_t>{sw.data(), sw.size()}, identity = gsl::span<const uint32_t>{ow.data(), ow.size()};
-    const uint32_t pc = uint32_t(x->Shape()[1]), oc = uint32_t(capacity_);
     Guard guard;
     guard.AddInput({e, ProgramTensorMetadataDependency::None}).AddOutput({out, ProgramTensorMetadataDependency::None})
         .SetWorkgroupSize(1).SetDispatchGroupSize(1).AddUniformVariables({pc, oc, uint32_t(paired), source_identity, identity});
     ORT_RETURN_IF_ERROR(c.RunProgram(guard));
-    const uint64_t dx = std::min(groups, limit), dy = (groups + dx - 1) / dx;
-    Polar polar;
-    polar.AddInputs({{x, ProgramTensorMetadataDependency::None}, {out, ProgramTensorMetadataDependency::None}})
-        .AddOutput({y, ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64)
-        .SetDispatchGroupSize(uint32_t(dx), uint32_t(dy)).AddUniformVariables({pc, oc, identity});
-    ORT_RETURN_IF_ERROR(c.RunProgram(polar));
+    for(uint32_t channel=0;channel<22;++channel){
+      for(uint32_t first=0;first<oc;first+=frames_per_window){
+        const uint32_t size=std::min(frames_per_window,oc-first);
+        const uint64_t groups=(uint64_t(size)+63)/64,dx=std::min(groups,limit),dy=(groups+dx-1)/dx;
+        Polar polar;
+        polar.AddInput(input_view(first,size)).AddInput({out,ProgramTensorMetadataDependency::None})
+            .AddOutput(output_view(channel,first,size)).SetWorkgroupSize(64)
+            .SetDispatchGroupSize(uint32_t(dx),uint32_t(dy))
+            .AddUniformVariables({pc,oc,first,size,input_begin(first),channel,identity});
+        ORT_RETURN_IF_ERROR(c.RunProgram(polar));
+      }
+    }
     LOGS(c.Logger(), INFO) << "M0_RW07_POLAR_AFTER1573_V1 session=" << session << " run=" << run
-                          << " source_pair_valid=" << paired << " role=15 instance=1016 GPU_dispatches=2 host_payload_reads=0";
+                          << " source_pair_valid=" << paired << " role=15 instance=1016 GPU_dispatches="
+                          <<1+22*((uint64_t(oc)+frames_per_window-1)/frames_per_window)<<" host_payload_reads=0";
     return Status::OK();
   }
  private:
@@ -229,19 +261,11 @@ class Packet final : public WebGpuKernel {
     ORT_RETURN_IF_NOT(limits.maxStorageBuffersPerShaderStage >= 2 && limits.maxComputeWorkgroupsPerDimension >= 1 &&
                           limits.maxComputeWorkgroupSizeX >= 1 && limits.maxComputeInvocationsPerWorkgroup >= 1,
                       "RW07 polar after1573 packet resources");
-    auto binding = [&](const Tensor* t) -> Status {
-      ORT_RETURN_IF_NOT(t->DataRaw() && t->SizeInBytes() <= limits.maxBufferSize && t->SizeInBytes() <= limits.maxStorageBufferBindingSize,
-                        "RW07 polar after1573 packet binding descriptor");
-      const uint64_t bytes = wgpuBufferGetSize(static_cast<WGPUBuffer>(const_cast<void*>(t->DataRaw())));
-      ORT_RETURN_IF_NOT(bytes >= t->SizeInBytes() && bytes <= limits.maxBufferSize && bytes <= limits.maxStorageBufferBindingSize,
-                        "RW07 polar after1573 packet actual backing");
-      return Status::OK();
-    };
-    ORT_RETURN_IF_ERROR(binding(e)); ORT_RETURN_IF_ERROR(binding(y));
+    ORT_RETURN_IF_ERROR(PhysicalBuffer(c,e)); ORT_RETURN_IF_ERROR(PhysicalBuffer(c,y));
     auto* p = c.Output(0, TensorShape{18});
     ORT_RETURN_IF_NOT(Gpu(p) && p->IsDataType<uint32_t>() && p->DataRaw() != e->DataRaw() && p->DataRaw() != y->DataRaw(),
                       "RW07 polar after1573 distinct packet output");
-    ORT_RETURN_IF_ERROR(binding(p));
+    ORT_RETURN_IF_ERROR(StorageBudget(c, {e, p}));
     const m0_extent_abi2::OpaqueOwnership owner{session, run, pair.generation, pair.data_generation, 15, 1016};
     ORT_RETURN_IF_NOT(owner.Valid(), "RW07 polar after1573 packet opaque ownership");
     const auto words = owner.UniformWords();

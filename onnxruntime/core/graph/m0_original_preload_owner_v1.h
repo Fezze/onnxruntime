@@ -116,7 +116,7 @@ class M0OriginalPreloadOwnerV1 final {
   static std::unique_ptr<Model> MakeWholeUnresolved(std::string_view bytes, const logging::Logger& logger);
   static void ValidateNativeLoweringSource(const Model& source);
   static std::unique_ptr<M0FullGpuNativeLoweringOwnerV1> PrepareNativeLowering(
-      const Model& source,const InferenceSession& session,uint32_t physical_capacity);
+      const Model& source,const InferenceSession& session,uint32_t physical_capacity,bool device_capacity=false);
 #if !defined(ORT_MINIMAL_BUILD)
   std::unique_ptr<WholeModel> whole_;
 #endif

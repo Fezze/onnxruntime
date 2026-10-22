@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <limits>
 #include "core/providers/webgpu/buffer_manager.h"
 #include "core/providers/webgpu/webgpu_context.h"
 #include <gsl/gsl>
@@ -9,6 +10,8 @@ namespace onnxruntime {
 namespace webgpu {
 
 namespace {
+
+constexpr size_t kM0TransferChunkBytes = 8 * 1024 * 1024;
 
 constexpr size_t NormalizeBufferSize(size_t size) {
   return (size + 15) / 16 * 16;
@@ -504,8 +507,18 @@ M0FullGpuResourceOwnership& BufferManager::M0OwnershipV2() const {
   return context_.M0OwnershipV2();
 }
 
+bool BufferManager::M0NonRetainingCachesV1() const {
+  std::lock_guard<std::mutex> lock{mutex_};
+  return !storage_cache_->SupportsBufferReuse() && !uniform_cache_->SupportsBufferReuse() &&
+         !query_resolve_cache_->SupportsBufferReuse() && !default_cache_->SupportsBufferReuse();
+}
+
 void BufferManager::Upload(CommandRecordingState& recording, void* src, WGPUBuffer dst, size_t size) const {
   LOGS_DEFAULT(INFO) << "M0_RW02_UPLOAD timeline=" << &recording << " bytes=" << size << " dst=" << dst;
+  if(size==0)return;
+  ORT_ENFORCE(src&&dst&&size<=std::numeric_limits<size_t>::max()-3,"Invalid GPU upload size or pointer.");
+  const uint64_t dst_bytes=wgpuBufferGetSize(dst);
+  ORT_ENFORCE(NormalizeCopySize(size)<=dst_bytes,"GPU upload exceeds destination backing.");
   // If the buffer is mapped, we can directly write to it.
   void* mapped_data = wgpuBufferGetMappedRange(dst, 0, WGPU_WHOLE_MAP_SIZE);  // ensure the buffer is mapped
   if (mapped_data) {
@@ -514,47 +527,69 @@ void BufferManager::Upload(CommandRecordingState& recording, void* src, WGPUBuff
     return;
   }
 
-  // Otherwise, we need to use a staging buffer to upload data.
-  auto copy_size = NormalizeCopySize(size);
-
-  wgpu::BufferDescriptor desc{};
-  desc.size = copy_size;
-  desc.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::MapWrite;
-  desc.mappedAtCreation = true;
-
-  auto staging_buffer = context_.Device().CreateBuffer(&desc);
-  mapped_data = staging_buffer.GetMappedRange();
-  memcpy(mapped_data, src, size);
-  // NOTE: When copy_size != size (due to 4-byte alignment requirement of CopyBufferToBuffer),
-  // the trailing bytes [size, copy_size) in the staging buffer contain uninitialized data.
-  // This dirty data gets copied into the destination buffer and may cause problems.
-  // A possible solution is to use CopyBufferToBuffer for the aligned portion and a compute
-  // shader to write the non-aligned remainder.
-  staging_buffer.Unmap();
-
-  ORT_THROW_IF_ERROR(context_.EncodeDeferredDispatches(recording));
-  auto& command_encoder = context_.GetCommandEncoder(recording);
-  context_.EndComputePass(recording);
-  command_encoder.CopyBufferToBuffer(staging_buffer, 0, dst, 0, copy_size);
-  ORT_THROW_IF_ERROR(context_.Flush(*this, recording));
+  const bool chunked=recording.m0_submission_budget_bytes&&size>kM0TransferChunkBytes;
+  const size_t chunk_limit=chunked?kM0TransferChunkBytes:size;
+  for(size_t offset=0;offset<size;){
+    const size_t payload=std::min(chunk_limit,size-offset),copy_size=NormalizeCopySize(payload);
+    ORT_ENFORCE(offset%4==0&&offset<=dst_bytes&&copy_size<=dst_bytes-offset,
+                "GPU upload range exceeds destination backing.");
+    if(recording.m0_submission_budget_bytes){
+      ORT_ENFORCE(dst_bytes<=std::numeric_limits<uint64_t>::max()-copy_size,"RW07 upload reference size overflow");
+      ORT_THROW_IF_ERROR(context_.M0BeforeEnqueueV1(*this,recording,dst_bytes+copy_size));
+    }
+    wgpu::BufferDescriptor desc{};
+    desc.size=copy_size;
+    desc.usage=wgpu::BufferUsage::CopySrc|wgpu::BufferUsage::MapWrite;
+    desc.mappedAtCreation=true;
+    auto staging_buffer=context_.Device().CreateBuffer(&desc);
+    mapped_data=staging_buffer.GetMappedRange();
+    ORT_ENFORCE(mapped_data,"Failed to map GPU upload staging buffer.");
+    memcpy(mapped_data,static_cast<const uint8_t*>(src)+offset,payload);
+    if(copy_size>payload)memset(static_cast<uint8_t*>(mapped_data)+payload,0,copy_size-payload);
+    staging_buffer.Unmap();
+    ORT_THROW_IF_ERROR(context_.EncodeDeferredDispatches(recording));
+    auto& command_encoder=context_.GetCommandEncoder(recording);
+    context_.EndComputePass(recording);
+    command_encoder.CopyBufferToBuffer(staging_buffer,0,dst,offset,copy_size);
+    // Wait before allocating another staging chunk, not merely at the queue budget.
+    if(chunked){
+      ORT_THROW_IF_ERROR(context_.FlushAndWaitChecked(*this,recording));
+    }else{
+      ORT_THROW_IF_ERROR(context_.Flush(*this,recording));
+      ORT_THROW_IF_ERROR(context_.M0FlushIfBudgetReachedV1(*this,recording));
+    }
+    offset+=payload;
+  }
 }
 
 void BufferManager::MemCpy(CommandRecordingState& recording, WGPUBuffer src, WGPUBuffer dst, size_t size) const {
+  ORT_ENFORCE(size<=std::numeric_limits<size_t>::max()-3,"GPU copy size alignment overflow.");
+  MemCpyRange(recording,src,0,dst,0,NormalizeCopySize(size));
+}
+
+void BufferManager::MemCpyRange(CommandRecordingState& recording,WGPUBuffer src,uint64_t source_offset,
+                                WGPUBuffer dst,uint64_t destination_offset,uint64_t size) const {
+  ORT_ENFORCE(src&&dst,"Source and destination GPU buffers must exist.");
   ORT_ENFORCE(src != dst, "Source and destination buffers must be different.");
+  ORT_ENFORCE(source_offset%4==0&&destination_offset%4==0&&size%4==0,"GPU copy range must be 4-byte aligned.");
+  const uint64_t src_size=wgpuBufferGetSize(src),dst_size=wgpuBufferGetSize(dst);
+  ORT_ENFORCE(source_offset<=src_size&&size<=src_size-source_offset&&
+              destination_offset<=dst_size&&size<=dst_size-destination_offset,
+              "Source and destination GPU ranges exceed their physical backing.");
+  if(size==0)return;
   EnforceBufferUnmapped(context_, src);
   EnforceBufferUnmapped(context_, dst);
 
-  auto copy_size = NormalizeCopySize(size);
-  auto src_size = static_cast<size_t>(wgpuBufferGetSize(src));
-  auto dst_size = static_cast<size_t>(wgpuBufferGetSize(dst));
-  ORT_ENFORCE(copy_size <= src_size && copy_size <= dst_size,
-              "Source and destination buffers must have enough space for the copy operation. src_size=",
-              src_size, ", dst_size=", dst_size, ", copy_size=", copy_size, ".");
-
+  if(recording.m0_submission_budget_bytes){
+    ORT_ENFORCE(dst_size<=std::numeric_limits<uint64_t>::max()-src_size,
+                "RW07 copy reference size overflow");
+    ORT_THROW_IF_ERROR(context_.M0BeforeEnqueueV1(*this,recording,src_size+dst_size));
+  }
   ORT_THROW_IF_ERROR(context_.EncodeDeferredDispatches(recording));
   auto& command_encoder = context_.GetCommandEncoder(recording);
   context_.EndComputePass(recording);
-  command_encoder.CopyBufferToBuffer(src, 0, dst, 0, copy_size);
+  command_encoder.CopyBufferToBuffer(src,source_offset,dst,destination_offset,size);
+  ORT_THROW_IF_ERROR(context_.M0FlushIfBudgetReachedV1(*this,recording));
 }
 
 WGPUBuffer BufferManager::Create(CommandRecordingState& recording, size_t size, wgpu::BufferUsage usage,
@@ -619,6 +654,18 @@ WGPUBuffer BufferManager::Create(CommandRecordingState& recording, size_t size, 
   return buffer_guard.MoveToCHandle();
 }
 
+size_t BufferManager::M0AllocationBackingSizeV1(size_t size, bool uniform) const {
+  if (size == 0) return 0;
+  // All current caches normalize to 16 bytes on their non-bucket path.
+  // Reject before invoking the exact cache calculation, not after wraparound.
+  ORT_ENFORCE(size <= std::numeric_limits<size_t>::max() - 15, "RW07_NATIVE_DEVICE_LIMITS_SIZE_OVERFLOW");
+  std::lock_guard<std::mutex> lock{mutex_};
+  auto& cache = GetCacheManager(uniform ? wgpu::BufferUsage::Uniform : wgpu::BufferUsage::Storage);
+  const size_t backing = cache.CalculateBufferSize(size);
+  ORT_ENFORCE(backing >= size, "RW07_NATIVE_DEVICE_LIMITS_BACKING_OVERFLOW");
+  return backing;
+}
+
 bool BufferManager::SupportsUMA() const {
 #if !defined(__wasm__)
   // Check if the device supports the BufferMapExtendedUsages feature
@@ -656,12 +703,38 @@ void BufferManager::Release(WGPUBuffer buffer, const CommandRecordingState* reco
 
 void BufferManager::Download(CommandRecordingState& recording, WGPUBuffer src, void* dst, size_t size) const {
   LOGS_DEFAULT(INFO) << "M0_RW02_DOWNLOAD_BEGIN timeline=" << &recording << " bytes=" << size << " src=" << src;
+  if(size>0){
+    ORT_ENFORCE(src&&dst&&size<=std::numeric_limits<size_t>::max()-15,"Invalid GPU download size or pointer.");
+    ORT_ENFORCE(NormalizeBufferSize(size)<=wgpuBufferGetSize(src),"GPU download exceeds source backing.");
+    const bool chunked=recording.m0_submission_budget_bytes&&size>kM0TransferChunkBytes;
+    const size_t chunk_limit=chunked?kM0TransferChunkBytes:size;
+    for(size_t offset=0;offset<size;){
+      const size_t payload=std::min(chunk_limit,size-offset);
+      DownloadRange(recording,src,offset,static_cast<uint8_t*>(dst)+offset,payload);
+      if(chunked)ORT_THROW_IF_ERROR(context_.FlushAndWaitChecked(*this,recording));
+      offset+=payload;
+    }
+  }
+  LOGS_DEFAULT(INFO) << "M0_RW02_DOWNLOAD_COMPLETE timeline=" << &recording << " src=" << src << " status=success";
+}
+
+void BufferManager::DownloadRange(CommandRecordingState& recording,WGPUBuffer src,size_t source_offset,
+                                  void* dst,size_t size) const {
+  ORT_ENFORCE(size>0&&size<=std::numeric_limits<size_t>::max()-15&&source_offset%4==0,
+              "Invalid GPU download range.");
+  const size_t buffer_size=NormalizeBufferSize(size);
+  const uint64_t source_bytes=wgpuBufferGetSize(src);
+  ORT_ENFORCE(source_offset<=source_bytes&&buffer_size<=source_bytes-source_offset,
+              "GPU download range exceeds source backing.");
+  if(recording.m0_submission_budget_bytes){
+    ORT_ENFORCE(source_bytes<=std::numeric_limits<uint64_t>::max()-buffer_size,"RW07 download reference size overflow");
+    ORT_THROW_IF_ERROR(context_.M0BeforeEnqueueV1(*this,recording,source_bytes+buffer_size));
+  }
   // Encode pending deferred dispatches before recording the readback; the flush below submits both
   // in order.
   ORT_THROW_IF_ERROR(context_.EncodeDeferredDispatches(recording));
 
   EnforceBufferUnmapped(context_, src);
-  auto buffer_size = NormalizeBufferSize(size);
 
   wgpu::BufferDescriptor desc{};
   desc.size = buffer_size;
@@ -670,8 +743,9 @@ void BufferManager::Download(CommandRecordingState& recording, WGPUBuffer src, v
   auto staging_buffer = context_.Device().CreateBuffer(&desc);
   auto& command_encoder = context_.GetCommandEncoder(recording);
   context_.EndComputePass(recording);
-  command_encoder.CopyBufferToBuffer(src, 0, staging_buffer, 0, buffer_size);
+  command_encoder.CopyBufferToBuffer(src, source_offset, staging_buffer, 0, buffer_size);
   ORT_THROW_IF_ERROR(context_.Flush(*this, recording));
+  ORT_THROW_IF_ERROR(context_.M0FlushIfBudgetReachedV1(*this,recording));
 
   // TODO: revise wait in whole project
 
@@ -751,8 +825,8 @@ void BufferManager::Download(CommandRecordingState& recording, WGPUBuffer src, v
               "Failed to download data from buffer. wgpu::MapAsyncStatus value: ",
               static_cast<int>(map_async_result->status), ", message: ", map_async_result->message);
 
-  LOGS_DEFAULT(INFO) << "M0_RW02_DOWNLOAD_COMPLETE timeline=" << &recording << " src=" << src << " status=success";
   auto mapped_data = staging_buffer.GetConstMappedRange();
+  ORT_ENFORCE(mapped_data,"Failed to access GPU download staging buffer.");
   memcpy(dst, mapped_data, size);
   staging_buffer.Unmap();
 }

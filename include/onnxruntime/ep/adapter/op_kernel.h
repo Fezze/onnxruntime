@@ -244,6 +244,30 @@ struct OpKernelContext {
 #endif
   }
 
+  bool M0ReadCancellationV1(uint32_t& cancelled) const noexcept {
+#if defined(__linux__)
+    if(CurrentOrtApiVersion()<28)return false;
+    const auto api_function=Ort::GetApi().KernelContext_GetSyncStream;
+    Dl_info api_info{};
+    if(!api_function||!dladdr(reinterpret_cast<void*>(api_function),&api_info)||!api_info.dli_fname)return false;
+    void* core=dlopen(api_info.dli_fname,RTLD_NOW|RTLD_LOCAL|RTLD_NOLOAD);
+    if(!core)return false;
+    using Query=int (ORT_API_CALL*)(const OrtKernelContext*,uint32_t,uint32_t*) noexcept;
+    auto query=reinterpret_cast<Query>(dlsym(core,"OrtM0FullGpuReadCancellationV1"));
+    Dl_info query_info{};uint32_t pending=0;
+    const bool available=query&&dladdr(reinterpret_cast<void*>(query),&query_info)&&
+        query_info.dli_fbase==api_info.dli_fbase&&
+        query(context_.GetOrtKernelContext(),1,&pending)==1&&pending<=1;
+    dlclose(core);
+    if(!available)return false;
+    cancelled=pending;
+    return true;
+#else
+    (void)cancelled;
+    return false;
+#endif
+  }
+
  private:
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(OpKernelContext);
   Ort::KernelContext context_;

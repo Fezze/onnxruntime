@@ -28,6 +28,7 @@ bool SameAllocation(const M0NativeResourceBindingV3& a,const M0NativeResourceBin
 }  // namespace
 void M0FullGpuNativeLoweringOwnerV1::BeginInitialization(SessionState& state){
  auto& p=*execution_plan_;
+ LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=initialization_admission_begin epoch="<<p.epoch;
  ORT_ENFORCE(phase_==Phase::Resolved&&p.intent==ExecutionIntent::Initialize&&p.stage==ExecutionPlan::Stage::Planned&&
   p.state.get()==&state&&p.provider&&p.provider==&p.module->Provider()&&
   state.m0_native_plan_owner_v1_==this&&p.plan==&*state.p_seq_exec_plan_&&
@@ -38,7 +39,9 @@ void M0FullGpuNativeLoweringOwnerV1::BeginInitialization(SessionState& state){
  // qualification plans cannot be upgraded, replayed or substituted here.
  ORT_THROW_IF_ERROR(session_->M0ValidateOriginalSelectionOptionsV1());
  M0OriginalPreloadOwnerV1::ValidateNativeLoweringSource(*source_);ValidateExecutionModel();
+ LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=initialization_plan_check_begin";
  ValidateInitializerPlan(state);ValidateResourcePlan(state);
+ LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=initialization_plan_check_done";
  ORT_ENFORCE(ExecutionPlanFingerprint(state)==p.plan_sha256,"RW07_NATIVE_INITIALIZATION_CHANGED_PLAN");
  p.initialization_thread=M0NativeInitializationThreadV1();
  p.initialization_attempted=true;p.stage=ExecutionPlan::Stage::Initializing;
@@ -48,12 +51,15 @@ void M0FullGpuNativeLoweringOwnerV1::BeginInitialization(SessionState& state){
   ORT_THROW_IF_ERROR(p.initialization_options.config_options.AddConfigEntry(name,value.c_str()));
  };
  configure("m0.fullgpu.extent_ownership_v2","1");
+ configure("m0.fullgpu.bounded_submissions_v1","1");
  configure("m0.fullgpu.actual_session_v2",std::to_string(p.epoch));
  configure("m0.fullgpu.actual_run_v2",std::to_string(p.initialization_scope->Id()));
  configure("m0.fullgpu.fault_authorized_v2","0");configure("m0.fullgpu.diagnostic_fault_mode_v2","0");
  // This scope fences immutable initializer transfers on the retained queue.
  // It never calls Session.Run, ExecuteGraph, Compute or a payload fetch.
+ LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=provider_start_begin";
  ORT_THROW_IF_ERROR(p.module->Provider().OnRunStart(p.initialization_options));
+ LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=provider_start_done";
  p.provider_started=true;
  const auto device=p.module->Provider().GetOrtDeviceByMemType(OrtMemTypeDefault);
  auto allocators=p.module->Provider().CreatePreferredAllocators();
@@ -77,14 +83,22 @@ void M0FullGpuNativeLoweringOwnerV1::BeginInitialization(SessionState& state){
  ORT_ENFORCE(transfer,"RW07_NATIVE_INITIALIZATION_ACTUAL_TRANSFER");
  ORT_THROW_IF_ERROR(p.transfers.RegisterDataTransfer(std::move(transfer)));
  p.module->ValidateCurrent();
+ LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=initialization_admission_done initializers="<<derived_.graph().initializer_size();
 }
 common::Status M0FullGpuNativeLoweringOwnerV1::BeforeInitializerUpload(
  const SessionState& state,const std::string& name,int index,const ONNX_NAMESPACE::TensorProto& proto,
  M0NativeInitializerVisitV1 visit){
  try{
   ORT_ENFORCE(execution_plan_&&phase_==Phase::Resolved,"RW07_NATIVE_UPLOAD_SOURCE_OWNER");auto& p=*execution_plan_;
+  if(visit==M0NativeInitializerVisitV1::Copy){
+   LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=initializer_copy_begin completed="<<p.uploaded.size()
+    <<" total="<<derived_.graph().initializer_size()<<" value_index="<<index;
+  }else if(p.planned_sources.size()%32==0){
+   LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=initializer_plan_progress completed="<<p.planned_sources.size()
+    <<" total="<<derived_.graph().initializer_size();
+  }
   ORT_ENFORCE(p.state.get()==&state&&p.stage==ExecutionPlan::Stage::Initializing&&p.initialization_attempted&&
-   p.initialization_thread==M0NativeInitializationThreadV1()&&
+   p.initialization_thread==M0NativeCurrentInitializationThreadV1()&&
    p.provider_started&&!p.provider_end_attempted&&p.initialization_scope&&
    state.M0FullGpuExtentOwnerEpochV1()==p.epoch&&state.M0FullGpuExtentRunIdV2()==p.initialization_scope->Id()&&
    state.m0_native_plan_owner_v1_==this&&&state.graph_==&execution_model_->MainGraph()&&
@@ -115,6 +129,7 @@ common::Status M0FullGpuNativeLoweringOwnerV1::BeforeInitializerUpload(
     p.planned_sources.at(index)==&proto&&!p.pending_source&&p.pending_upload==-1&&!p.uploaded.count(index),
     "RW07_NATIVE_UPLOAD_SOURCE_COPY_REPLAY");
    p.pending_upload=index;p.pending_source=&proto;
+   LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=initializer_copy_admitted value_index="<<index;
   }
   return common::Status::OK();
  }catch(...){if(execution_plan_)execution_plan_->stage=ExecutionPlan::Stage::Poisoned;phase_=Phase::Poisoned;throw;}
@@ -123,13 +138,13 @@ common::Status M0FullGpuNativeLoweringOwnerV1::AfterInitializerUpload(
  SessionState& state,int index,const OrtValue& value,bool constant,bool sparse){
  try{
   ORT_ENFORCE(execution_plan_&&phase_==Phase::Resolved,"RW07_NATIVE_UPLOAD_ENDPOINT_OWNER");auto& p=*execution_plan_;
-  ORT_ENFORCE(p.initialization_thread==M0NativeInitializationThreadV1()&&
-  p.state.get()==&state&&p.stage==ExecutionPlan::Stage::Initializing&&p.initialization_scope&&
-   p.initialization_thread==M0NativeInitializationThreadV1()&&
+  ORT_ENFORCE(p.initialization_thread==M0NativeCurrentInitializationThreadV1()&&
+   p.state.get()==&state&&p.stage==ExecutionPlan::Stage::Initializing&&p.initialization_scope&&
    p.provider_started&&!p.provider_end_attempted&&state.M0FullGpuExtentRunIdV2()==p.initialization_scope->Id()&&
    index==p.pending_upload&&p.pending_source&&p.planned_sources.at(index)==p.pending_source&&constant&&!sparse&&
    value.IsAllocated()&&value.IsTensor()&&!p.uploaded.count(index)&&!state.initialized_tensors_.count(index),
    "RW07_NATIVE_UPLOAD_ENDPOINT_PHASE");
+  LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=initializer_resource_check_begin value_index="<<index;
   const auto& tensor=value.Get<Tensor>();
   TensorDescriptor(tensor,*p.pending_source,p.module->Provider().GetOrtDeviceByMemType(OrtMemTypeDefault));
   const auto resource=p.module->Resource(reinterpret_cast<uintptr_t>(tensor.DataRaw()),tensor.SizeInBytes());
@@ -140,28 +155,39 @@ common::Status M0FullGpuNativeLoweringOwnerV1::AfterInitializerUpload(
   ExecutionPlan::Uploaded held{value,p.pending_source,resource};
   ORT_ENFORCE(p.uploaded.emplace(index,std::move(held)).second,"RW07_NATIVE_UPLOAD_DUPLICATE_PARAMETER");
   p.pending_upload=-1;p.pending_source=nullptr;
+  LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=initializer_copy_done completed="<<p.uploaded.size()
+   <<" total="<<derived_.graph().initializer_size()<<" value_index="<<index;
   return common::Status::OK();
  }catch(...){if(execution_plan_)execution_plan_->stage=ExecutionPlan::Stage::Poisoned;phase_=Phase::Poisoned;throw;}
 }
 void M0FullGpuNativeLoweringOwnerV1::ValidateInitializedExecution(uint64_t active_run){
  ORT_ENFORCE(execution_plan_&&phase_==Phase::Resolved,"RW07_NATIVE_INITIALIZED_OWNER");auto& p=*execution_plan_;
+ LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=completion_check_begin uploaded="<<p.uploaded.size()
+  <<" total="<<derived_.graph().initializer_size();
  ORT_ENFORCE((p.stage==ExecutionPlan::Stage::Initializing||p.stage==ExecutionPlan::Stage::Initialized)&&
   p.state&&p.provider&&p.provider==&p.module->Provider()&&p.initialization_attempted&&p.provider_started&&p.pending_upload==-1&&!p.pending_source&&
   p.uploaded.size()==size_t(derived_.graph().initializer_size())&&p.planned_sources.size()==p.uploaded.size(),
   "RW07_NATIVE_INITIALIZED_COMPLETE_UPLOADS");
  ORT_ENFORCE(p.stage!=ExecutionPlan::Stage::Initializing||
-  p.initialization_thread==M0NativeInitializationThreadV1(),"RW07_NATIVE_INITIALIZATION_THREAD");
+  p.initialization_thread==M0NativeCurrentInitializationThreadV1(),"RW07_NATIVE_INITIALIZATION_THREAD");
  auto& state=*p.state;
  ORT_ENFORCE(state.m0_native_plan_owner_v1_==this&&&state.graph_==&execution_model_->MainGraph()&&
   p.epoch==state.M0FullGpuExtentOwnerEpochV1()&&p.plan==&*state.p_seq_exec_plan_&&
   state.initialized_tensors_.size()==p.uploaded.size()&&state.constant_initialized_tensors_.size()==p.uploaded.size(),
   "RW07_NATIVE_INITIALIZED_ACTUAL_STATE");
  ORT_THROW_IF_ERROR(session_->M0ValidateOriginalSelectionOptionsV1());
+ LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=completion_source_check_begin";
  M0OriginalPreloadOwnerV1::ValidateNativeLoweringSource(*source_);ValidateExecutionModel();
  ValidateInitializerPlan(state);ValidateResourcePlan(state);
+ LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=completion_source_check_done";
  ORT_ENFORCE(ExecutionPlanFingerprint(state)==p.plan_sha256,"RW07_NATIVE_INITIALIZED_CHANGED_PLAN");
  const auto device=p.module->Provider().GetOrtDeviceByMemType(OrtMemTypeDefault);
+ size_t checked_resources=0;
  for(const auto& item:p.uploaded){
+  if(checked_resources%32==0){
+   LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=completion_resource_progress completed="<<checked_resources
+    <<" total="<<p.uploaded.size();
+  }
   const auto actual=state.initialized_tensors_.find(item.first),immutable=state.constant_initialized_tensors_.find(item.first);
   ORT_ENFORCE(actual!=state.initialized_tensors_.end()&&immutable!=state.constant_initialized_tensors_.end()&&
    actual->second.IsTensor()&&immutable->second.IsTensor()&&
@@ -170,12 +196,17 @@ void M0FullGpuNativeLoweringOwnerV1::ValidateInitializedExecution(uint64_t activ
   const auto& tensor=actual->second.Get<Tensor>();TensorDescriptor(tensor,*item.second.source,device);
   ORT_ENFORCE(SameAllocation(item.second.resource,p.module->Resource(reinterpret_cast<uintptr_t>(tensor.DataRaw()),tensor.SizeInBytes())),
    "RW07_NATIVE_INITIALIZED_PARAMETER_GENERATION");
+  ++checked_resources;
  }
+ LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=completion_resource_done completed="<<checked_resources;
+ // Provider identity was revalidated above and the whole module is checked
+ // again below. Comparing retained core metadata does not require querying
+ // all42 registrations and rehashing the DLL once for every graph node.
  size_t actual_kernels=0;
  for(const auto& node:state.graph_.Nodes()){
   const auto* kernel=state.GetKernel(node.Index());const auto selected=state.kernel_create_info_map_.find(node.Index());
   ORT_ENFORCE(kernel&&selected!=state.kernel_create_info_map_.end()&&&kernel->Node()==&node&&
-   &kernel->KernelDef()==selected->second->kernel_def.get()&&kernel->Info().GetExecutionProvider()==&p.module->Provider(),
+   &kernel->KernelDef()==selected->second->kernel_def.get()&&kernel->Info().GetExecutionProvider()==p.provider,
    "RW07_NATIVE_INITIALIZED_CONSTRUCTED_KERNEL_IDENTITY");
   ++actual_kernels;
  }
@@ -185,29 +216,36 @@ void M0FullGpuNativeLoweringOwnerV1::ValidateInitializedExecution(uint64_t activ
  if(p.stage==ExecutionPlan::Stage::Initialized)
   ORT_ENFORCE(p.provider_end_attempted&&!p.initialization_scope&&state.M0FullGpuExtentRunIdV2()==active_run&&
    !state.M0FullGpuRunOwnerV2().Poisoned(),"RW07_NATIVE_INITIALIZED_CHECKED_COMPLETION");
+ LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=completion_check_done kernels="<<actual_kernels;
 }
 void M0FullGpuNativeLoweringOwnerV1::FinishInitialization(SessionState& state){
  auto& p=*execution_plan_;
- ORT_ENFORCE(p.state.get()==&state&&p.stage==ExecutionPlan::Stage::Initializing&&p.initialization_scope&&
+ ORT_ENFORCE(p.initialization_thread==M0NativeCurrentInitializationThreadV1()&&p.state.get()==&state&&p.stage==ExecutionPlan::Stage::Initializing&&p.initialization_scope&&
   state.M0FullGpuExtentRunIdV2()==p.initialization_scope->Id()&&!p.provider_end_attempted,
   "RW07_NATIVE_INITIALIZATION_COMPLETION_PHASE");
  ValidateInitializedExecution();
  p.provider_end_attempted=true;
  // Plugin uploads/allocator clears use local recordings. Checked completion
  // fences all earlier submissions on this same exclusively retained device queue.
+ LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=provider_drain_begin";
  ORT_THROW_IF_ERROR(p.provider->OnRunEnd(true,p.initialization_options));
+ LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=provider_drain_done";
  ValidateInitializedExecution();
  ORT_ENFORCE(state.M0FullGpuRunOwnerV2().End(p.initialization_scope->Id()),"RW07_NATIVE_INITIALIZATION_SCOPE_RETIREMENT");
  p.initialization_scope.reset();p.stage=ExecutionPlan::Stage::Initialized;
  ValidateInitializedExecution();
+ LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=initialized epoch="<<p.epoch;
 }
 void M0FullGpuNativeLoweringOwnerV1::AbortInitialization()noexcept{
- if(!execution_plan_)return;auto& p=*execution_plan_;
+ if(!execution_plan_) {
+  return;
+ }
+ auto& p=*execution_plan_;
  if(!p.initialization_attempted||p.stage==ExecutionPlan::Stage::Initialized)return;
  if(p.state)p.state->M0FullGpuRunOwnerV2().Poison();
  // Provider recording is thread-bound. A foreign-thread teardown can retire
  // ownership, but must never end another thread's provider recording.
- if(p.initialization_thread==M0NativeInitializationThreadV1()&&p.provider&&p.provider_started&&!p.provider_end_attempted){
+ if(p.initialization_thread==M0NativeCurrentInitializationThreadV1()&&p.provider&&p.provider_started&&!p.provider_end_attempted){
   p.provider_end_attempted=true;
   try{const auto status=p.provider->OnRunEnd(true,p.initialization_options);
    if(!status.IsOK()&&p.state)p.state->M0FullGpuRunOwnerV2().Poison();

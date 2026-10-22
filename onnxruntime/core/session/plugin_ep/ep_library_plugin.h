@@ -9,6 +9,7 @@
 #include "core/session/plugin_ep/m0_kernel_creator_binding_v1.h"
 #include "core/session/plugin_ep/m0_native_kernel_binding_v2.h"
 #include "core/session/plugin_ep/m0_native_resource_binding_v3.h"
+#include "core/session/plugin_ep/m0_native_device_limits_v1.h"
 
 #include "core/session/plugin_ep/ep_library.h"
 #include "core/session/plugin_ep/ep_library_plugin_utils.h"
@@ -45,6 +46,8 @@ class EpLibraryPlugin : public EpLibrary {
   Status M0LoadOriginalLstmV1();
   Status M0QueryOriginalLstmV1(M0PluginKernelCreatorBindingV1& binding);
   Status M0QueryNativeKernelV2(uint32_t record,M0NativeProviderKernelBindingV2& binding);
+  Status M0QueryNativeDeviceLimitsV1(const OrtEp* ep,uint64_t storage_bytes,uint64_t initializer_bytes,
+                                     uint64_t uniform_bytes,M0NativeDeviceLimitsV1& limits);
   Status M0QueryNativeResourceV3(const OrtEp* ep,uintptr_t handle,uint64_t required_bytes,M0NativeResourceBindingV3& binding);
   void* m0_query_v1_ = nullptr;
   std::string m0_module_lease_key_;

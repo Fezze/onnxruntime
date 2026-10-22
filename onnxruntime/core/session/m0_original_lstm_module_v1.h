@@ -5,6 +5,7 @@
 #include <array>
 #include "core/session/plugin_ep/m0_native_kernel_binding_v2.h"
 #include "core/session/plugin_ep/m0_native_resource_binding_v3.h"
+#include "core/session/plugin_ep/m0_native_device_limits_v1.h"
 #include "core/common/common.h"
 #include "core/session/plugin_ep/m0_kernel_creator_binding_v1.h"
 namespace onnxruntime {
@@ -28,7 +29,17 @@ class M0OriginalLstmModuleV1 final {
   std::shared_ptr<KernelRegistry> Registry() const;
   const ExecutionProviders& Providers() const;
   const M0PluginKernelCreatorBindingV1& Binding() const;
+  struct NativeSnapshotV1 {
+    std::shared_ptr<KernelRegistry> registry;
+    PluginExecutionProvider* provider = nullptr;
+    const ExecutionProviders* providers = nullptr;
+    std::array<M0NativeProviderKernelBindingV2,42> bindings;
+    M0NativeResourceBindingV3 context;
+    M0NativeResourceBindingV3 resource;
+  };
+  NativeSnapshotV1 ReadNativeSnapshot(uintptr_t handle=0,uint64_t required_bytes=0) const;
   std::array<M0NativeProviderKernelBindingV2,42> NativeBindingsV2() const;
+  M0NativeDeviceLimitsV1 NativeDeviceLimitsV1(uint64_t storage_bytes,uint64_t initializer_bytes,uint64_t uniform_bytes) const;
   M0NativeResourceBindingV3 NativeResourceV3(uintptr_t handle,uint64_t required_bytes) const;
   std::unique_ptr<Impl> impl_;
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(M0OriginalLstmModuleV1);

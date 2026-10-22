@@ -313,7 +313,19 @@ Status SessionState::CreateKernels(const KernelRegistryManager& kernel_registry_
     }
     session_kernels_.clear();
     session_kernels_.resize(max_nodeid + 1);
+#if !defined(ORT_MINIMAL_BUILD)
+    size_t m0_constructed_kernels = 0;
+    if (m0_native_plan_owner_v1_) {
+      LOGS(logger_, INFO) << "M0_NATIVE_INIT phase=kernel_construction_begin total=" << graph_viewer_->NumberOfNodes();
+    }
+#endif
     for (const auto& node : nodes) {
+#if !defined(ORT_MINIMAL_BUILD)
+      if (m0_native_plan_owner_v1_ && m0_constructed_kernels % 32 == 0) {
+        LOGS(logger_, INFO) << "M0_NATIVE_INIT phase=kernel_construction_progress completed=" << m0_constructed_kernels
+                           << " total=" << graph_viewer_->NumberOfNodes() << " node_index=" << node.Index();
+      }
+#endif
       // construct and save the kernels
       const KernelCreateInfo& kci = GetNodeKernelCreateInfo(node.Index());
 
@@ -323,7 +335,15 @@ Status SessionState::CreateKernels(const KernelRegistryManager& kernel_registry_
 
       // assumes vector is already resize()'ed to the number of nodes in the graph
       ORT_RETURN_IF_ERROR(kernel_registry_manager.CreateKernel(node, exec_provider, *this, kci, session_kernels_[node.Index()]));
+#if !defined(ORT_MINIMAL_BUILD)
+      ++m0_constructed_kernels;
+#endif
     }
+#if !defined(ORT_MINIMAL_BUILD)
+    if (m0_native_plan_owner_v1_) {
+      LOGS(logger_, INFO) << "M0_NATIVE_INIT phase=kernel_construction_done completed=" << m0_constructed_kernels;
+    }
+#endif
   }
   node_index_info_.emplace(*graph_viewer_, ort_value_name_idx_map_);
   return Status::OK();
@@ -2135,16 +2155,21 @@ Status SessionState::FinalizeSessionStateImpl(const std::basic_string<PATH_CHAR_
       observed->release_actions.emplace_back(action.value_index, action.ref_count);
     observed->node_release_list = p_seq_exec_plan_->node_release_list;
     m0_fullgpu_preinit_snapshot_v1_ = std::move(observed);
-    LOGS(Logger(), INFO) << "M0_RW07_PREINIT_DENIED session=" << M0FullGpuExtentOwnerEpochV1()
+    LOGS(Logger(), INFO) << "M0_RW07_PREINIT_PLAN session=" << M0FullGpuExtentOwnerEpochV1()
         << " nodes=" << m0_fullgpu_preinit_snapshot_v1_->nodes.size()
         << " resources=" << m0_fullgpu_preinit_snapshot_v1_->resources.size()
         << " before_final_initializer_allocation=1 before_kernel_construction=1 before_prepack=1";
 #if !defined(ORT_MINIMAL_BUILD)
-    if (m0_native_plan_owner_v1_) return m0_native_plan_owner_v1_->CaptureExecutionPlan(*this);
+    if (m0_native_plan_owner_v1_) {
+      // Only the owner's initialization lease admits the tensor and kernel
+      // finalization below. Observe-only plans still return their refusal.
+      ORT_RETURN_IF_ERROR(m0_native_plan_owner_v1_->CaptureExecutionPlan(*this));
+    } else
 #endif
-    // No complete-model source/input/resource certificate is built into this
-    // revision. Observing a plan or naming an implementation cannot admit it.
-    return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07_PREINIT_DENY_UNREVIEWED_CONTRACT");
+    {
+      // An unowned preinit plan cannot admit allocation or kernel construction.
+      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07_PREINIT_DENY_UNREVIEWED_CONTRACT");
+    }
   }
 
   if (session_options.IsLoadCancellationFlagSet()) {

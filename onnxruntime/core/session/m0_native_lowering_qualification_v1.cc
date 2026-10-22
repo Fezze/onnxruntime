@@ -233,10 +233,24 @@ M0NativeRunReceiptV1 M0NativeLoweringQualificationV1::RunSequence(InferenceSessi
     receipt.same_private_state = receipt.same_private_state && native.execution_plan_.get() == holder &&
         holder->state.get() == state && holder->plan == plan && state->GetExecutionPlan() == plan;
   };
-  const auto valid_run = [&](bool short_input) {
+  const auto valid_run = [&](bool short_input, bool pointer_api = false) {
     const auto feeds = inputs(short_input, false);
     std::vector<OrtValue> result;
-    ORT_THROW_IF_ERROR(session.Run(options, names, feeds, outputs, &result));
+    if (pointer_api) {
+      // This is the pointer/ownership adapter used by the actual public C API.
+      const std::array<const char*, 3> input_names{"tokens", "style", "speed"};
+      const std::array<const OrtValue*, 3> input_values{&feeds[0], &feeds[1], &feeds[2]};
+      const std::array<const char*, 1> output_names{outputs[0].c_str()};
+      std::array<OrtValue*, 1> output_values{nullptr};
+      const auto status = session.Run(options, input_names, input_values, output_names, output_values);
+      std::unique_ptr<OrtValue> published(output_values[0]);
+      ORT_THROW_IF_ERROR(status);
+      ORT_ENFORCE(published && published->IsTensor(), "RW07_NATIVE_POINTER_OUTPUT_MISSING");
+      result.push_back(*published);
+      receipt.pointer_output_allocated = true;
+    } else {
+      ORT_THROW_IF_ERROR(session.Run(options, names, feeds, outputs, &result));
+    }
     ORT_ENFORCE(result.size() == 1 && result[0].IsTensor(), "RW07_NATIVE_RUN_QUALIFICATION_PCM_RESULT");
     const auto& tensor = result[0].Get<Tensor>();
     ORT_ENFORCE(tensor.Location().device == OrtDevice() && tensor.IsDataType<float>() &&
@@ -310,7 +324,73 @@ M0NativeRunReceiptV1 M0NativeLoweringQualificationV1::RunSequence(InferenceSessi
       refused[0].Get<Tensor>().DataRaw() == sentinel && refused[0].Get<Tensor>().Data<float>()[0] == 777.0f;
   idle();
 #endif
-  const OrtValue third = valid_run(false);
+#ifdef ENABLE_STRIDED_TENSORS
+  // Genuine CPU views with interleaved storage. The logical token sequence is
+  // valid, so this refusal exercises the byte-copy boundary rather than a GPU
+  // token/status failure. Both borrowed backing arrays outlive the calls.
+  std::array<int64_t, 6> token_storage{0, 999999, 43, 999999, 0, 999999};
+  const auto original_token_storage = token_storage;
+  const std::array<int64_t, 2> token_strides{6, 2};
+  auto strided_inputs = inputs(true, false);
+  Tensor::InitOrtValue(DataTypeImpl::GetType<int64_t>(), TensorShape({1, 3}), token_storage.data(),
+                       allocator->Info(), strided_inputs[0], 0, token_strides);
+  ORT_ENFORCE(!strided_inputs[0].Get<Tensor>().IsContiguous(), "RW07_NATIVE_STRIDED_INPUT_FIXTURE");
+  const auto bad_strided_input = session.Run(options, names, strided_inputs, outputs, &refused);
+  receipt.strided_input_denied = !bad_strided_input.IsOK() &&
+      bad_strided_input.ErrorMessage().find("RW07_NATIVE_RUN_STRIDED_INPUT") != std::string::npos;
+  std::array<float, 4> output_storage{777.0f, 888.0f, 777.0f, 888.0f};
+  const auto original_output_storage = output_storage;
+  const std::array<int64_t, 1> output_strides{2};
+  std::vector<OrtValue> strided_outputs(1);
+  Tensor::InitOrtValue(DataTypeImpl::GetType<float>(), TensorShape{2}, output_storage.data(),
+                       allocator->Info(), strided_outputs[0], 0, output_strides);
+  ORT_ENFORCE(!strided_outputs[0].Get<Tensor>().IsContiguous(), "RW07_NATIVE_STRIDED_OUTPUT_FIXTURE");
+  const auto bad_strided_output = session.Run(options, names, valid_inputs, outputs, &strided_outputs);
+  receipt.strided_output_denied = !bad_strided_output.IsOK() &&
+      bad_strided_output.ErrorMessage().find("RW07_NATIVE_RUN_STRIDED_OUTPUT") != std::string::npos;
+  receipt.strided_descriptors_checked = true;
+  receipt.strided_refusal_values_retained = token_storage == original_token_storage &&
+      output_storage == original_output_storage &&
+      strided_inputs[0].Get<Tensor>().DataRaw() == token_storage.data() &&
+      strided_outputs.size() == 1 && strided_outputs[0].IsTensor() &&
+      strided_outputs[0].Get<Tensor>().DataRaw() == output_storage.data() &&
+      refused[0].Get<Tensor>().DataRaw() == sentinel && refused[0].Get<Tensor>().Data<float>()[0] == 777.0f;
+  idle();
+#endif
+  const std::array<const char*, 3> pointer_names{"tokens", "style", "speed"};
+  const std::array<const char*, 1> pointer_outputs{outputs[0].c_str()};
+  const std::array<const OrtValue*, 3> pointer_invalid{&invalid[0], &invalid[1], &invalid[2]};
+  std::array<OrtValue*, 1> refused_pointer{nullptr};
+  const auto pointer_failure = session.Run(options, pointer_names, pointer_invalid, pointer_outputs, refused_pointer);
+  // Even unexpected publication is owned and released by this qualification
+  // caller; failed Run must leave the caller's null output pointer unchanged.
+  std::unique_ptr<OrtValue> unexpected_output(refused_pointer[0]);
+  receipt.pointer_refusal_unpublished = !pointer_failure.IsOK() && !refused_pointer[0] &&
+      pointer_failure.ErrorMessage() == "RW07_NATIVE_GPU_STATUS_103";
+  idle();
+  std::vector<float> pcm_storage(receipt.short_samples + 2, 777.0f);
+  OrtValue preallocated;
+  Tensor::InitOrtValue(DataTypeImpl::GetType<float>(), TensorShape{int64_t(receipt.short_samples)},
+                       pcm_storage.data() + 1, allocator->Info(), preallocated);
+  const std::array<const OrtValue*, 3> pointer_valid{&valid_inputs[0], &valid_inputs[1], &valid_inputs[2]};
+  std::array<OrtValue*, 1> pointer_preallocated{&preallocated};
+  ORT_THROW_IF_ERROR(session.Run(options, pointer_names, pointer_valid, pointer_outputs, pointer_preallocated));
+  receipt.pointer_preallocated_retained = pointer_preallocated[0] == &preallocated &&
+      preallocated.Get<Tensor>().DataRaw() == pcm_storage.data() + 1;
+  receipt.pointer_preallocated_pcm_equal = preallocated.Get<Tensor>().SizeInBytes() == second.Get<Tensor>().SizeInBytes() &&
+      std::memcmp(preallocated.Get<Tensor>().DataRaw(), second.Get<Tensor>().DataRaw(), second.Get<Tensor>().SizeInBytes()) == 0;
+  receipt.pointer_preallocated_canaries_retained = pcm_storage.front() == 777.0f && pcm_storage.back() == 777.0f;
+  idle();
+  OrtValue empty_wrapper;
+  std::array<OrtValue*, 1> pointer_empty{&empty_wrapper};
+  ORT_THROW_IF_ERROR(session.Run(options, pointer_names, pointer_valid, pointer_outputs, pointer_empty));
+  receipt.pointer_empty_wrapper_retained = pointer_empty[0] == &empty_wrapper && empty_wrapper.IsTensor();
+  receipt.pointer_empty_wrapper_pcm_equal = empty_wrapper.IsTensor() &&
+      empty_wrapper.Get<Tensor>().Shape() == second.Get<Tensor>().Shape() &&
+      empty_wrapper.Get<Tensor>().SizeInBytes() == second.Get<Tensor>().SizeInBytes() &&
+      std::memcmp(empty_wrapper.Get<Tensor>().DataRaw(), second.Get<Tensor>().DataRaw(), second.Get<Tensor>().SizeInBytes()) == 0;
+  idle();
+  const OrtValue third = valid_run(false, true);
   const auto& repeated = third.Get<Tensor>();
   receipt.repeated_samples = size_t(repeated.Shape()[0]);
   receipt.valid_logical_pcm = true;

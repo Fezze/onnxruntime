@@ -822,6 +822,8 @@ class InferenceSession {
   [[nodiscard]] common::Status HasInvalidCombinationOfExecutionProviders() const;
   friend class M0FullGpuNativeLoweringOwnerV1;
   common::Status M0PrepareOriginalLoweringV1(uint32_t physical_capacity);
+  common::Status M0PrepareOriginalDeviceLoweringV1();
+  common::Status M0PrepareOriginalLoweringImplV1(uint32_t physical_capacity,bool device_capacity);
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && !defined(ORT_MINIMAL_BUILD)
   friend class M0NativeLoweringQualificationV1;
 #endif

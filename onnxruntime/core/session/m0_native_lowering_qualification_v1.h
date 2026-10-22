@@ -68,6 +68,12 @@ struct M0NativeRunReceiptV1 {
   bool sparse_descriptors_checked = false, sparse_input_denied = false, sparse_output_denied = false;
   bool sparse_refusal_values_retained = false;
   bool preallocated_length_denied = false, preallocated_refusal_output_unchanged = false;
+  bool strided_descriptors_checked = false, strided_input_denied = false, strided_output_denied = false;
+  bool strided_refusal_values_retained = false;
+  bool pointer_output_allocated = false, pointer_refusal_unpublished = false;
+  bool pointer_empty_wrapper_retained = false, pointer_empty_wrapper_pcm_equal = false;
+  bool pointer_preallocated_retained = false, pointer_preallocated_pcm_equal = false;
+  bool pointer_preallocated_canaries_retained = false;
 };
 struct M0NativePlanReceiptV1 {
   size_t nodes = 0, selected = 0, resources = 0, initializers = 0, kernels = 0, allocators = 0;

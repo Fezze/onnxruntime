@@ -224,6 +224,8 @@ class OpKernelContext {
   // Appended after existing virtuals to retain their slots.
   virtual uint64_t M0FullGpuExtentOwnerEpochV1() const { return 0; }
   virtual uint64_t M0FullGpuExtentRunIdV2() const { return 0; }
+  // Denial-only control snapshot. Unknown contexts leave the output untouched.
+  virtual bool M0ReadCancellationV1(uint32_t&) const noexcept { return false; }
 
  private:
   ORT_DISALLOW_COPY_AND_ASSIGNMENT(OpKernelContext);

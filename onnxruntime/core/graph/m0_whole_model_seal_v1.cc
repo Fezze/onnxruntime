@@ -33,17 +33,17 @@ std::unique_ptr<M0WholeModelSealV1> M0WholeModelSealV1::ValidateAndParse(std::st
   constexpr std::string_view kOriginalSha = "7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5";
   ORT_ENFORCE(bytes.size() == kOriginalBytes && bytes.data(), "RW07_ORIGINAL_BYTE_SIZE");
   // Hash and parse the owned copy, never the caller's potentially mutable buffer.
-  auto owned = std::make_shared<const std::string>(bytes);
-  ORT_ENFORCE(model_package::Sha256::HashStringHex(*owned) == kOriginalSha, "RW07_ORIGINAL_BYTE_IDENTITY");
+  const std::string owned(bytes);
+  ORT_ENFORCE(model_package::Sha256::HashStringHex(owned) == kOriginalSha, "RW07_ORIGINAL_BYTE_IDENTITY");
   ORT_ENFORCE(std::string_view(m0_internal::kRw07KnownWireMessages[5].name) == "onnx.ModelProto",
               "RW07_ORIGINAL_WIRE_TABLE");
   {
     // Release scanner copies before protobuf and live Model construction.
-    const auto canonical = m0_internal::FixedCanonicalWire(*owned, 5);
+    const auto canonical = m0_internal::FixedCanonicalWire(owned, 5);
     ORT_ENFORCE(canonical.size() <= kOriginalBytes, "RW07_ORIGINAL_WIRE_BOUND");
   }
   ONNX_NAMESPACE::ModelProto proto;
-  ORT_ENFORCE(proto.ParseFromArray(owned->data(), static_cast<int>(owned->size())), "RW07_ORIGINAL_PROTO_PARSE");
+  ORT_ENFORCE(proto.ParseFromArray(owned.data(), static_cast<int>(owned.size())), "RW07_ORIGINAL_PROTO_PARSE");
   ORT_ENFORCE(proto.ir_version() == 9 && proto.has_graph() && proto.opset_import_size() == 1 &&
                   proto.opset_import(0).domain().empty() && proto.opset_import(0).version() == 20 &&
                   proto.metadata_props_size() == 0 && proto.training_info_size() == 0 &&
@@ -83,7 +83,9 @@ std::unique_ptr<M0WholeModelSealV1> M0WholeModelSealV1::ValidateAndParse(std::st
     }
   }
   ORT_ENFORCE(operators.size() == 49 && attribute_tensors == 6, "RW07_ORIGINAL_SURFACE_INVENTORY");
-  return std::unique_ptr<M0WholeModelSealV1>(new M0WholeModelSealV1(std::move(owned), std::move(proto)));
+  // Protobuf owns its parsed fields; the authenticated serialized copy is no
+  // longer needed when the caller constructs the separate live Model.
+  return std::unique_ptr<M0WholeModelSealV1>(new M0WholeModelSealV1(std::move(proto)));
 }
 }  // namespace onnxruntime
 #endif

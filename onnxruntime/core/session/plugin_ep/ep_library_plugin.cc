@@ -313,4 +313,47 @@ Status EpLibraryPlugin::M0QueryNativeResourceV3(const OrtEp* ep,uintptr_t handle
  return ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_RESOURCE_UNSUPPORTED");
 #endif
 }
+Status EpLibraryPlugin::M0QueryNativeDeviceLimitsV1(const OrtEp* ep,uint64_t storage_bytes,uint64_t initializer_bytes,
+                                                  uint64_t uniform_bytes,M0NativeDeviceLimitsV1& binding){
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && defined(__ANDROID__) && defined(USE_WEBGPU) && !defined(ORT_MINIMAL_BUILD) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
+ auto status=Status::OK();
+ ORT_TRY {
+  std::lock_guard<std::mutex> lock{mutex_};
+  status=[&]()->Status{
+   ORT_RETURN_IF_NOT(handle_&&m0_query_v1_&&!m0_module_lease_key_.empty()&&factories_.size()==1&&ep,
+     "RW07_NATIVE_DEVICE_LIMITS_QUERY_STATE");
+   const auto canonical=std::filesystem::canonical(library_path_);void* base=nullptr;
+   ORT_RETURN_IF_NOT(M0SymbolPathV1(m0_query_v1_,&base)==canonical&&M0MappedKeyV1(m0_query_v1_)==m0_module_lease_key_&&
+     M0FileKeyV1(canonical)==m0_module_lease_key_,"RW07_NATIVE_DEVICE_LIMITS_MODULE_ORIGIN_CHANGED");
+   M0WebGpuNativeDeviceLimitsQueryV1 query=nullptr;
+   ORT_RETURN_IF_ERROR(Env::Default().GetSymbolFromLibrary(handle_,"OrtM0WebGpuNativeDeviceLimitsV1",reinterpret_cast<void**>(&query)));
+   void* query_base=nullptr;
+   ORT_RETURN_IF_NOT(query&&M0SymbolPathV1(reinterpret_cast<void*>(query),&query_base)==canonical&&query_base==base&&
+     M0MappedKeyV1(reinterpret_cast<void*>(query))==m0_module_lease_key_,"RW07_NATIVE_DEVICE_LIMITS_QUERY_ORIGIN");
+   // This Ep was created and retained by M0OriginalLstmModuleV1's own authenticated
+   // factory. Its concrete dispatch entry points must belong to the same mapping.
+   for(void* symbol:{reinterpret_cast<void*>(ep->GetName),reinterpret_cast<void*>(ep->GetKernelRegistry),
+                    reinterpret_cast<void*>(ep->OnRunStart),reinterpret_cast<void*>(ep->OnRunEnd)}){
+    void* symbol_base=nullptr;
+    ORT_RETURN_IF_NOT(symbol&&M0SymbolPathV1(symbol,&symbol_base)==canonical&&symbol_base==base&&
+      M0MappedKeyV1(symbol)==m0_module_lease_key_,"RW07_NATIVE_DEVICE_LIMITS_EP_ORIGIN");
+   }
+   M0NativeDeviceLimitsV1 pending;
+   ORT_RETURN_IF_NOT(query(1,ep,storage_bytes,initializer_bytes,uniform_bytes,&pending)==1&&pending.abi==1&&pending.structure_bytes==sizeof(pending)&&
+     pending.ep==reinterpret_cast<uintptr_t>(ep)&&pending.context&&pending.device&&pending.queue&&pending.storage_requested_bytes==storage_bytes&&
+     pending.initializer_requested_bytes==initializer_bytes&&pending.uniform_requested_bytes==uniform_bytes,
+     "RW07_NATIVE_DEVICE_LIMITS_BINDING");
+   ORT_RETURN_IF_NOT(M0FileKeyV1(canonical)==m0_module_lease_key_,"RW07_NATIVE_DEVICE_LIMITS_INODE_CHANGED");
+   binding=pending;return Status::OK();
+  }();
+ }
+ ORT_CATCH(const std::exception& error){
+  ORT_HANDLE_EXCEPTION([&](){status=ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_DEVICE_LIMITS_QUERY: ",error.what());});
+ }
+ return status;
+#else
+ ORT_UNUSED_PARAMETER(ep);ORT_UNUSED_PARAMETER(storage_bytes);ORT_UNUSED_PARAMETER(initializer_bytes);ORT_UNUSED_PARAMETER(uniform_bytes);ORT_UNUSED_PARAMETER(binding);
+ return ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_DEVICE_LIMITS_UNSUPPORTED");
+#endif
+}
 }  // namespace onnxruntime

@@ -1052,6 +1052,28 @@ std::unique_ptr<profiling::EpProfiler> WebGpuExecutionProvider::GetProfiler() {
 
 Status WebGpuExecutionProvider::OnRunStart(const onnxruntime::RunOptions& run_options) {
   const bool strict_ownership = run_options.config_options.GetConfigOrDefault("m0.fullgpu.extent_ownership_v2", "0") == "1";
+  const auto bounded=run_options.config_options.GetConfigOrDefault("m0.fullgpu.bounded_submissions_v1","0");
+  ORT_RETURN_IF_NOT(bounded=="0"||bounded=="1","RW07 invalid native submission profile");
+  uint64_t submission_budget=0;
+  if(bounded=="1"){
+    ORT_RETURN_IF_NOT(strict_ownership&&!IsGraphCaptureEnabled()&&
+        !(session_profiler_&&session_profiler_->Enabled())&&!run_options.enable_profiling&&
+        !context_.M0ProfilingActiveV2()&&context_.ValidationMode()>=webgpu::ValidationMode::Basic&&
+        run_options.config_options.GetConfigOrDefault("m0.fullgpu.fault_authorized_v2","0")=="0",
+        "RW07 native submission profile requires unprofiled strict execution");
+    ORT_RETURN_IF_NOT(BufferManager().M0NonRetainingCachesV1()&&
+        context_.InitializerBufferManager().M0NonRetainingCachesV1(),"RW07 native submission cache profile");
+    ORT_RETURN_IF_NOT(!recording_->command_encoder&&!recording_->compute_pass_encoder&&
+        !recording_->has_unsubmitted_work.load(std::memory_order_relaxed)&&
+        !recording_->num_pending_dispatches&&recording_->deferred_dispatches.empty()&&
+        !recording_->m0_submission_budget_bytes&&!recording_->m0_queued_reference_bytes,
+        "RW07 native submission recording not idle");
+    submission_budget=context_.DeviceLimits().maxBufferSize;
+    ORT_RETURN_IF_NOT(submission_budget,"RW07 native submission zero budget");
+  }else{
+    ORT_RETURN_IF_NOT(!recording_->m0_submission_budget_bytes&&!recording_->m0_queued_reference_bytes,
+        "RW07 native submission profile cannot be abandoned");
+  }
   if (strict_ownership) {
     ORT_RETURN_IF_NOT(!IsGraphCaptureEnabled(), "RW07 strict ownership graph capture uncertified");
     ORT_RETURN_IF_NOT(!context_.M0OwnershipV2().Poisoned(), "RW07 strict GPU context completion poisoned");
@@ -1060,6 +1082,7 @@ Status WebGpuExecutionProvider::OnRunStart(const onnxruntime::RunOptions& run_op
   m0_fault_session_v2_ = m0_fault_run_v2_ = 0;
   bool m0_scope_pushed = false, m0_profiling_attempted = false, m0_start_committed = false;
   bool m0_fault_registered = false;
+  bool m0_bounded_scope_acquired=false;
   auto m0_start_rollback = gsl::finally([&]() noexcept {
     if (!strict_ownership || m0_start_committed) return;
     bool profiling_collected = false, scope_popped = false;
@@ -1086,9 +1109,21 @@ Status WebGpuExecutionProvider::OnRunStart(const onnxruntime::RunOptions& run_op
       m0_fault_run_v2_ = 0;
     }
     run_active_.store(false);
+    if(m0_bounded_scope_acquired&&!context_.M0OwnershipV2().Poisoned()&&
+        (!m0_scope_pushed||scope_popped)&&(!m0_profiling_attempted||profiling_collected)&&
+        !recording_->command_encoder&&!recording_->compute_pass_encoder&&
+        !recording_->has_unsubmitted_work.load(std::memory_order_relaxed)&&
+        !recording_->num_pending_dispatches&&recording_->deferred_dispatches.empty()&&
+        !recording_->m0_queued_reference_bytes){
+      if(!context_.M0EndBoundedSubmissionsV1())context_.M0OwnershipV2().Poison();
+    }
     try { LOGS_DEFAULT(INFO) << "M0_RW07_RUN_START_ROLLBACK context_poisoned=" << context_.M0OwnershipV2().Poisoned(); }
     catch (...) { context_.M0OwnershipV2().Poison(); }
   });
+  if(submission_budget){
+    ORT_RETURN_IF_NOT(context_.M0BeginBoundedSubmissionsV1(),"RW07 native submission scope already active");
+    m0_bounded_scope_acquired=true;
+  }
   const bool fault_authorized = strict_ownership && run_options.config_options.GetConfigOrDefault(
       "m0.fullgpu.fault_authorized_v2", "0") == "1";
   webgpu::M0FullGpuFaultModeV2 fault_mode;
@@ -1163,6 +1198,16 @@ Status WebGpuExecutionProvider::OnRunStart(const onnxruntime::RunOptions& run_op
     }
   }
 
+  if (strict_ownership) {
+    const auto stats = context_.M0OwnershipV2().Statistics();
+    LOGS_DEFAULT(INFO) << "M0_RW07_RESOURCE_REQUESTS phase=begin session="
+      << run_options.config_options.GetConfigOrDefault("m0.fullgpu.actual_session_v2", "")
+      << " run=" << run_options.config_options.GetConfigOrDefault("m0.fullgpu.actual_run_v2", "")
+      << " live_allocations=" << stats.live_allocations << " live_requested_bytes=" << stats.live_requested_bytes
+      << " peak_live_requested_bytes=" << stats.peak_live_requested_bytes << " acquisitions=" << stats.acquisitions
+      << " retirements=" << stats.retirements << " includes_cache=0 includes_driver=0";
+  }
+  recording_->m0_submission_budget_bytes=submission_budget;
   run_active_.store(true);
   m0_start_committed = true;
   return Status::OK();
@@ -1230,6 +1275,13 @@ Status WebGpuExecutionProvider::OnRunEnd(bool sync_stream, const onnxruntime::Ru
       : context_.Flush(BufferManager(), *recording_);
   if (strict_ownership && flush_status.IsOK()) {
     LOGS_DEFAULT(INFO) << "M0_RW07_RUN_QUEUE_COMPLETE timeline=" << recording_.get();
+    const auto stats = context_.M0OwnershipV2().Statistics();
+    LOGS_DEFAULT(INFO) << "M0_RW07_RESOURCE_REQUESTS phase=checked_end session="
+      << run_options.config_options.GetConfigOrDefault("m0.fullgpu.actual_session_v2", "")
+      << " run=" << run_options.config_options.GetConfigOrDefault("m0.fullgpu.actual_run_v2", "")
+      << " live_allocations=" << stats.live_allocations << " live_requested_bytes=" << stats.live_requested_bytes
+      << " peak_live_requested_bytes=" << stats.peak_live_requested_bytes << " acquisitions=" << stats.acquisitions
+      << " retirements=" << stats.retirements << " includes_cache=0 includes_driver=0";
     if (m0_fault_mode_v2_ == 12) { LOGS_DEFAULT(INFO) << "M0_RW07_LIFECYCLE_CHECKPOINT session="
       << m0_fault_session_v2_ << " run=" << m0_fault_run_v2_ << " checkpoint=12 injected=1 checked_queue_complete=1"; }
     if (m0_fault_run_v2_) context_.M0FaultHooksV2().ThrowIfRequested(m0_fault_session_v2_, m0_fault_run_v2_,
@@ -1287,8 +1339,17 @@ Status WebGpuExecutionProvider::OnRunEnd(bool sync_stream, const onnxruntime::Ru
     m0_end_scope_pending = false;
     const auto scope_status = context_.PopErrorScope();
     m0_end_committed = scope_status.IsOK();
+    if(m0_end_committed&&recording_->m0_submission_budget_bytes){
+      m0_end_committed=context_.M0EndBoundedSubmissionsV1();
+      ORT_RETURN_IF_NOT(m0_end_committed,"RW07 native submission scope lost");
+      recording_->m0_submission_budget_bytes=0;
+    }
     return scope_status;
   } else {
+    if(recording_->m0_submission_budget_bytes){
+      ORT_RETURN_IF_NOT(context_.M0EndBoundedSubmissionsV1(),"RW07 native submission scope lost");
+      recording_->m0_submission_budget_bytes=0;
+    }
     m0_end_committed = true;
     return Status::OK();
   }

@@ -59,6 +59,23 @@ Status NormalizeDispatchGroupSize(uint32_t& x, uint32_t& y, uint32_t& z, uint32_
   return Status::OK();
 }
 
+template <typename View>
+Status ValidateFloatWindow(const View& view, uint64_t alignment, uint64_t max_binding_bytes) {
+  const uint64_t offset = view.buffer_binding_offset_bytes, bytes = view.buffer_binding_size_bytes;
+  const uint64_t prefix = view.buffer_offset_in_elements;
+  ORT_RETURN_IF_NOT(view.tensor && view.tensor->template IsDataType<float>() &&
+                        view.var_type == ProgramVariableDataType::Float32 && view.is_buffer_view &&
+                        view.use_override_shape && view.override_shape.Size() > 0 &&
+                        alignment > 0 && alignment % sizeof(float) == 0 && offset % alignment == 0 &&
+                        prefix < alignment / sizeof(float), "Invalid float storage window metadata.");
+  const uint64_t count = static_cast<uint64_t>(view.override_shape.Size());
+  const uint64_t backing_bytes = view.tensor->SizeInBytes();
+  ORT_RETURN_IF_NOT(count <= UINT32_MAX - prefix && bytes > 0 && bytes == (prefix + count) * sizeof(float) &&
+                        bytes <= max_binding_bytes && offset <= backing_bytes &&
+                        bytes <= backing_bytes - offset, "Float storage window exceeds binding or tensor limits.");
+  return Status::OK();
+}
+
 }  // namespace detail
 
 ProgramArtifact::ProgramArtifact(std::string program_name,
@@ -86,32 +103,69 @@ Status ProgramManager::CalculateSegmentsForInputsAndOutputs(const ProgramBase& p
   inputs_segments.resize(program.Inputs().size(), 0);
   outputs_segments.resize(program.Outputs().size(), 0);
 
-  const uint64_t maxStorageBufferBindingSize = webgpu_context_.DeviceLimits().maxStorageBufferBindingSize;
+  const auto& limits = webgpu_context_.DeviceLimits();
+  const uint64_t maxStorageBufferBindingSize = limits.maxStorageBufferBindingSize;
+  ORT_RETURN_IF_NOT(maxStorageBufferBindingSize > 0, "WebGPU storage binding limit must be positive.");
 
   // Inputs
   for (size_t i = 0; i < program.Inputs().size(); ++i) {
+    const auto& input = program.Inputs()[i];
+    ORT_RETURN_IF_NOT(input.buffer_binding_size_bytes || input.buffer_binding_offset_bytes == 0,
+                      "Storage binding offset without a window.");
     if (program.InputBufferOwner(i) != i) {
       continue;
     }
-    const auto& input = program.Inputs()[i];
     inputs_segments[i] = 1;
+    if (input.buffer_binding_size_bytes) {
+      ORT_RETURN_IF_ERROR(detail::ValidateFloatWindow(input, limits.minStorageBufferOffsetAlignment,
+                                                       maxStorageBufferBindingSize));
+      continue;
+    }
     if (input.tensor && input.tensor->SizeInBytes() > maxStorageBufferBindingSize) {
-      uint32_t segments = static_cast<uint32_t>((input.tensor->SizeInBytes() + maxStorageBufferBindingSize - 1) / maxStorageBufferBindingSize);
-      inputs_segments[i] = segments;
+      const uint64_t segments = 1 + (input.tensor->SizeInBytes() - 1) / maxStorageBufferBindingSize;
+      ORT_RETURN_IF_NOT(segments <= limits.maxStorageBuffersPerShaderStage,
+                        "WebGPU input storage segments exceed the device shader-stage limit.");
+      inputs_segments[i] = static_cast<uint32_t>(segments);
     }
   }
   // Outputs
   for (size_t i = 0; i < program.Outputs().size(); ++i) {
+    const auto& output = program.Outputs()[i];
+    ORT_RETURN_IF_NOT(output.buffer_binding_size_bytes || output.buffer_binding_offset_bytes == 0,
+                      "Storage binding offset without a window.");
+    for (const auto& input : program.Inputs()) {
+      ORT_RETURN_IF_NOT(!(output.buffer_binding_size_bytes || input.buffer_binding_size_bytes) ||
+                            !output.tensor || !input.tensor || output.tensor->DataRaw() != input.tensor->DataRaw(),
+                        "A storage window cannot share an input/output backing.");
+    }
+    for (size_t j = 0; j < i; ++j) {
+      const auto& prior = program.Outputs()[j];
+      ORT_RETURN_IF_NOT(!(output.buffer_binding_size_bytes || prior.buffer_binding_size_bytes) ||
+                            !output.tensor || !prior.tensor || output.tensor->DataRaw() != prior.tensor->DataRaw(),
+                        "A storage window cannot share another output backing.");
+    }
     if (program.OutputBufferOwner(i) != i) {
       continue;
     }
-    const auto& output = program.Outputs()[i];
     outputs_segments[i] = 1;
+    if (output.buffer_binding_size_bytes) {
+      ORT_RETURN_IF_NOT(!output.is_atomic, "A float storage window cannot use atomic access.");
+      ORT_RETURN_IF_ERROR(detail::ValidateFloatWindow(output, limits.minStorageBufferOffsetAlignment,
+                                                       maxStorageBufferBindingSize));
+      continue;
+    }
     if (output.tensor && output.tensor->SizeInBytes() > maxStorageBufferBindingSize) {
-      uint32_t segments = static_cast<uint32_t>((output.tensor->SizeInBytes() + maxStorageBufferBindingSize - 1) / maxStorageBufferBindingSize);
-      outputs_segments[i] = segments;
+      const uint64_t segments = 1 + (output.tensor->SizeInBytes() - 1) / maxStorageBufferBindingSize;
+      ORT_RETURN_IF_NOT(segments <= limits.maxStorageBuffersPerShaderStage,
+                        "WebGPU output storage segments exceed the device shader-stage limit.");
+      outputs_segments[i] = static_cast<uint32_t>(segments);
     }
   }
+  uint64_t storage_bindings = 0;
+  for (const auto segments : inputs_segments) storage_bindings += segments;
+  for (const auto segments : outputs_segments) storage_bindings += segments;
+  ORT_RETURN_IF_NOT(storage_bindings <= limits.maxStorageBuffersPerShaderStage,
+                    "WebGPU segmented storage bindings exceed the device shader-stage limit.");
   return Status::OK();
 }
 

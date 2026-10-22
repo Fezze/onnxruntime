@@ -2891,7 +2891,7 @@ common::Status InferenceSession::Initialize() {
     // the original public Model and does not issue an initialization permit.
     Status prepared=Status::OK();
     ORT_TRY {
-      prepared=M0PrepareOriginalLoweringV1(1024);
+      prepared=M0PrepareOriginalDeviceLoweringV1();
     }
     ORT_CATCH(const std::exception& error) {
       ORT_HANDLE_EXCEPTION([&](){prepared=ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_LOWERING_FAILED: ",error.what());});
@@ -3544,8 +3544,17 @@ const SessionOptions& InferenceSession::GetSessionOptions() const {
 }
 
 common::Status InferenceSession::M0PrepareOriginalLoweringV1(uint32_t capacity) {
+  return M0PrepareOriginalLoweringImplV1(capacity,false);
+}
+common::Status InferenceSession::M0PrepareOriginalDeviceLoweringV1() {
+  return M0PrepareOriginalLoweringImplV1(102400,true);
+}
+common::Status InferenceSession::M0PrepareOriginalLoweringImplV1(uint32_t capacity,bool device_capacity) {
 #if !defined(ORT_MINIMAL_BUILD)
   std::lock_guard<std::mutex> lock(session_mutex_);
+  // An existing explicit qualification receipt keeps its exact capacity;
+  // neither this path nor repeated Initialize replaces a prepared owner/module.
+  if(device_capacity&&m0_native_lowering_v1_)capacity=m0_native_lowering_v1_->capacity_;
   if(m0_native_lowering_v1_&&m0_native_lowering_v1_->capacity_!=capacity)
     return ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_LOWERING_RECEIPT_SUBSTITUTION");
   bool validated=false;
@@ -3580,11 +3589,13 @@ common::Status InferenceSession::M0PrepareOriginalLoweringV1(uint32_t capacity) 
                           m0_native_lowering_v1_->capacity_==capacity,"RW07_NATIVE_LOWERING_RECEIPT_SUBSTITUTION");
     M0OriginalPreloadOwnerV1::ValidateNativeLoweringSource(*model_);
     m0_native_lowering_v1_->ValidateExecutionModel();
+    if(m0_native_lowering_v1_->prepared_module_)
+      m0_native_lowering_v1_->ValidatePhysicalCapacity(*m0_native_lowering_v1_->prepared_module_);
     ORT_RETURN_IF_ERROR(validate());
     validated=true;
     return Status::OK();
   }
-  auto pending=M0OriginalPreloadOwnerV1::PrepareNativeLowering(*model_,*this,capacity);
+  auto pending=M0OriginalPreloadOwnerV1::PrepareNativeLowering(*model_,*this,capacity,device_capacity);
   ORT_RETURN_IF_NOT(pending&&pending->source_==model_.get()&&pending->session_==this,
                     "RW07_NATIVE_LOWERING_ACTUAL_OWNER");
   M0OriginalPreloadOwnerV1::ValidateNativeLoweringSource(*model_);
@@ -3592,13 +3603,15 @@ common::Status InferenceSession::M0PrepareOriginalLoweringV1(uint32_t capacity) 
   // Original model_/input_def_map_/output_def_map_ remain alive and untouched.
   m0_native_lowering_v1_=std::move(pending);
   LOGS(*session_logger_,INFO)<<"M0_RW07_NATIVE_LOWERING_PREPARED original_nodes=2464 source_model_retained=1"
+      <<" physical_capacity="<<m0_native_lowering_v1_->capacity_
+      <<" device_capacity="<<m0_native_lowering_v1_->device_capacity_
       <<" derived_sha256="<<m0_native_lowering_v1_->derived_sha256_
       <<" ledger_sha256="<<m0_native_lowering_v1_->ledger_sha256_
       <<" initialization_permission=0 run_permission=0";
   validated=true;
   return Status::OK();
 #else
-  ORT_UNUSED_PARAMETER(capacity);
+  ORT_UNUSED_PARAMETER(capacity);ORT_UNUSED_PARAMETER(device_capacity);
   return ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_LOWERING_REQUIRES_FULL_BUILD");
 #endif
 }
@@ -4490,6 +4503,11 @@ Status InferenceSession::Run(const RunOptions& run_options,
     if (fetches[i] == nullptr) {
       ORT_ENFORCE(fetch_unique_ptrs[i] != nullptr);
       fetches[i] = fetch_unique_ptrs[i].release();
+    } else if (m0_fullgpu_strict_requested_v1_ && !fetches[i]->IsAllocated()) {
+      // The strict native Run publishes a new logical CPU value rather than
+      // mutating an empty placeholder copied into fetch_vec. Retain the
+      // caller's wrapper identity while transferring that successful result.
+      *fetches[i] = fetch_vec[i];
     }
   }
   return Status::OK();

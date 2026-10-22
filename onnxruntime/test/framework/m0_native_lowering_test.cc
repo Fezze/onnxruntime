@@ -42,6 +42,12 @@ std::string Failure(const std::function<Status()>& action) {
   }
 }
 
+class InitializationObservedSession final : public InferenceSession {
+ public:
+  using InferenceSession::InferenceSession;
+  using InferenceSession::IsInitialized;
+};
+
 class M0NativeLowering : public testing::Test {
  protected:
   static void SetUpTestSuite() {
@@ -81,8 +87,8 @@ TEST_F(M0NativeLowering, RejectsUnloadedAndOrdinarySessionsWithoutConstructingAR
 }
 
 TEST_F(M0NativeLowering, ActualSourceRemainsAliveAndUnchangedAndPreparationDoesNotInitializeSession) {
-  InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-  Load(session);
+  InitializationObservedSession session(NativeLoweringOptions(), GetEnvironment());
+  ASSERT_NO_FATAL_FAILURE(Load(session));
   const auto* model = &session.GetModel();
   const auto& graph = model->MainGraph();
   const auto* token = graph.GetInputs()[0];
@@ -135,7 +141,7 @@ TEST_F(M0NativeLowering, ActualSourceRemainsAliveAndUnchangedAndPreparationDoesN
 
 TEST_F(M0NativeLowering, RefusesCachedReceiptCapacitySubstitution) {
   InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-  Load(session);
+  ASSERT_NO_FATAL_FAILURE(Load(session));
   ASSERT_STATUS_OK(M0NativeLoweringQualificationV1::Prepare(session, M0NativeLoweringCapacityV1::k1024));
   EXPECT_NE(Failure([&]() { return M0NativeLoweringQualificationV1::Prepare(session, M0NativeLoweringCapacityV1::k2048); }).find(
                 "RW07_NATIVE_LOWERING_RECEIPT_SUBSTITUTION"), std::string::npos);
@@ -145,7 +151,7 @@ TEST_F(M0NativeLowering, RefusesCachedReceiptCapacitySubstitution) {
 TEST_F(M0NativeLowering, RevalidatesActualOriginalBeforePreparationAndOnCacheHits) {
   for (const bool cached : {false, true}) {
     InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-    Load(session);
+    ASSERT_NO_FATAL_FAILURE(Load(session));
     if (cached) ASSERT_STATUS_OK(M0NativeLoweringQualificationV1::Prepare(session, M0NativeLoweringCapacityV1::k1024));
     // A fault against the live source preserves its address and node inventory.
     // Checking only source_/session_ pointers cannot detect this substitution.
@@ -167,7 +173,7 @@ TEST_F(M0NativeLowering, RechecksCancellationAndClosedOptionsBeforePreparationAn
     // missing options check.
     for (int fault = 0; fault < 4; ++fault) {
       InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-      Load(session);
+      ASSERT_NO_FATAL_FAILURE(Load(session));
       if (cached) ASSERT_STATUS_OK(M0NativeLoweringQualificationV1::Prepare(session, M0NativeLoweringCapacityV1::k1024));
       auto& options = session.GetMutableSessionOptions();
       if (fault == 0) options.load_cancellation_flag->store(true);
@@ -186,7 +192,7 @@ TEST_F(M0NativeLowering, RechecksCancellationAndClosedOptionsBeforePreparationAn
 TEST_F(M0NativeLowering, FailedBoundedConstructionRetiresOriginalOwner) {
   for (const auto capacity : {M0NativeLoweringCapacityV1::kZero, M0NativeLoweringCapacityV1::kAboveMaximum}) {
     InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-    Load(session);
+    ASSERT_NO_FATAL_FAILURE(Load(session));
     EXPECT_FALSE(Failure([&]() { return M0NativeLoweringQualificationV1::Prepare(session, capacity); }).empty());
     EXPECT_NE(Failure([&]() { return M0NativeLoweringQualificationV1::Prepare(session, M0NativeLoweringCapacityV1::k1024); }).find(
                   "RW07_NATIVE_LOWERING_REQUIRES_OWNED_ORIGINAL"), std::string::npos);
@@ -199,7 +205,7 @@ TEST_F(M0NativeLowering, FailedBoundedConstructionRetiresOriginalOwner) {
 namespace onnxruntime::test {
 TEST_F(M0NativeLowering, ActualSeparateExecutionGraphCompletesDescriptorCallbacksWithoutShapeValues) {
   InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-  Load(session);
+  ASSERT_NO_FATAL_FAILURE(Load(session));
   const auto receipt = M0NativeLoweringQualificationV1::Descriptors(session, M0NativeDescriptorFaultV1::None);
   EXPECT_GT(receipt.nodes, 0u);
   EXPECT_TRUE(receipt.separate_model);
@@ -218,7 +224,7 @@ TEST_F(M0NativeLowering, ForbiddenDataAndLateResolveRetireActualDescriptorOwner)
   for (const auto fault : {M0NativeDescriptorFaultV1::InputData, M0NativeDescriptorFaultV1::LateResolve,
                            M0NativeDescriptorFaultV1::CopiedDefaultLateCallback}) {
     InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-    Load(session);
+    ASSERT_NO_FATAL_FAILURE(Load(session));
     const auto receipt = M0NativeLoweringQualificationV1::Descriptors(session, fault);
     EXPECT_TRUE(receipt.fault_denied) << "fault=" << int(fault);
     EXPECT_TRUE(receipt.retired) << "fault=" << int(fault);
@@ -233,7 +239,7 @@ TEST_F(M0NativeLowering, UnconsumedOutputsDefaultsAndSourceTypesDenyAndCannotBeR
                            M0NativeDescriptorFaultV1::LiveDefaultValue,
                            M0NativeDescriptorFaultV1::OriginalTokenType}) {
     InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-    Load(session);
+    ASSERT_NO_FATAL_FAILURE(Load(session));
     const auto receipt = M0NativeLoweringQualificationV1::Descriptors(session, fault);
     EXPECT_TRUE(receipt.fault_denied) << "fault=" << int(fault);
     EXPECT_TRUE(receipt.retired) << "fault=" << int(fault);
@@ -247,7 +253,7 @@ TEST_F(M0NativeLowering, UnconsumedOutputsDefaultsAndSourceTypesDenyAndCannotBeR
 namespace onnxruntime::test {
 TEST_F(M0NativeLowering, AuthenticatedNativeModuleQueriesAllActualCompiledBindingsWithoutInitializingSession) {
   InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-  Load(session);
+  ASSERT_NO_FATAL_FAILURE(Load(session));
   const auto receipt = M0NativeLoweringQualificationV1::ModuleMetadata(session, M0NativeModuleFaultV2::None);
   EXPECT_EQ(receipt.queried_records, 42u);
   EXPECT_EQ(receipt.selected_records, 42u);
@@ -263,7 +269,7 @@ TEST_F(M0NativeLowering, AuthenticatedNativeModuleRejectsRetainedStateDefinition
                            M0NativeModuleFaultV2::SelectedInfoSwap,
                            M0NativeModuleFaultV2::SelectedDefinitionSwap}) {
     InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-    Load(session);
+    ASSERT_NO_FATAL_FAILURE(Load(session));
     const auto receipt = M0NativeLoweringQualificationV1::ModuleMetadata(session, fault);
     EXPECT_TRUE(receipt.fault_denied) << "fault=" << int(fault);
     EXPECT_TRUE(receipt.original_session_uninitialized);
@@ -272,7 +278,7 @@ TEST_F(M0NativeLowering, AuthenticatedNativeModuleRejectsRetainedStateDefinition
 
 TEST_F(M0NativeLowering, AuthenticatedNativeModuleRejectsCoherentMutationOfAllThreeActualDefinitions) {
   InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-  Load(session);
+  ASSERT_NO_FATAL_FAILURE(Load(session));
   const auto receipt = M0NativeLoweringQualificationV1::ModuleMetadata(session, M0NativeModuleFaultV2::JointDefinitionMemory);
   EXPECT_EQ(receipt.queried_records, 42u);
   EXPECT_EQ(receipt.separate_definition_clones, 42u);
@@ -290,7 +296,7 @@ TEST_F(M0NativeLowering, AuthenticatedNativeModuleRejectsCoherentMutationOfAllTh
 namespace onnxruntime::test {
 TEST_F(M0NativeLowering, ExplicitObservePlanRetainsAuthenticatedPlanAndRefusesBeforeModelAllocationOrKernelConstruction) {
   InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-  Load(session);
+  ASSERT_NO_FATAL_FAILURE(Load(session));
   const auto receipt = M0NativeLoweringQualificationV1::Plan(session);
   EXPECT_GT(receipt.nodes, 0u);
   EXPECT_EQ(receipt.selected, receipt.nodes);
@@ -314,7 +320,7 @@ TEST_F(M0NativeLowering, ExplicitObservePlanRetainsAuthenticatedPlanAndRefusesBe
 TEST_F(M0NativeLowering, OwnedPlanDoesNotReopenLateResolveOrInputDataChannels) {
   for (const auto fault : {M0NativeDescriptorFaultV1::LateResolve, M0NativeDescriptorFaultV1::InputData}) {
     InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-    Load(session);
+    ASSERT_NO_FATAL_FAILURE(Load(session));
     ASSERT_TRUE(M0NativeLoweringQualificationV1::Plan(session).resource_denied);
     const auto receipt = M0NativeLoweringQualificationV1::Descriptors(session, fault);
     EXPECT_TRUE(receipt.fault_denied);
@@ -325,7 +331,7 @@ TEST_F(M0NativeLowering, OwnedPlanDoesNotReopenLateResolveOrInputDataChannels) {
 
 TEST_F(M0NativeLowering, ActualInitializerBytesAndSelectedGpuConsumersRemainBehindResourceDenial) {
   InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-  Load(session);
+  ASSERT_NO_FATAL_FAILURE(Load(session));
   const auto receipt = M0NativeLoweringQualificationV1::InitializerPlan(session, M0NativeInitializerFaultV1::None);
   EXPECT_GT(receipt.initializers, 0u);
   EXPECT_TRUE(receipt.resource_denied);
@@ -340,7 +346,7 @@ TEST_F(M0NativeLowering, ActualInitializerAndLifetimeMutationRetiresOwnerEvenAft
                            M0NativeInitializerFaultV1::InitializerOrder,
                            M0NativeInitializerFaultV1::Lifetime}) {
     InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-    Load(session);
+    ASSERT_NO_FATAL_FAILURE(Load(session));
     const auto receipt = M0NativeLoweringQualificationV1::InitializerPlan(session, fault);
     EXPECT_GT(receipt.initializers, 0u);
     EXPECT_TRUE(receipt.fault_denied) << "fault=" << int(fault);
@@ -352,7 +358,7 @@ TEST_F(M0NativeLowering, ActualInitializerAndLifetimeMutationRetiresOwnerEvenAft
 
 TEST_F(M0NativeLowering, ActualSingleGpuResourcePlanKeepsResourceAdmissionClosed) {
   InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-  Load(session);
+  ASSERT_NO_FATAL_FAILURE(Load(session));
   const auto receipt = M0NativeLoweringQualificationV1::ResourcePlan(session, M0NativeResourceFaultV1::None);
   EXPECT_GT(receipt.resources, 0u);
   EXPECT_GT(receipt.releases, 0u);
@@ -367,7 +373,7 @@ TEST_F(M0NativeLowering, ActualReuseForeignRowPrematureReleaseAndStreamMutationP
                            M0NativeResourceFaultV1::ReleaseBeforeLastUse,
                            M0NativeResourceFaultV1::StreamBinding}) {
     InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-    Load(session);
+    ASSERT_NO_FATAL_FAILURE(Load(session));
     const auto receipt = M0NativeLoweringQualificationV1::ResourcePlan(session, fault);
     EXPECT_GT(receipt.resources, 0u);
     EXPECT_GT(receipt.releases, 0u);
@@ -380,7 +386,7 @@ TEST_F(M0NativeLowering, ActualReuseForeignRowPrematureReleaseAndStreamMutationP
 
 TEST_F(M0NativeLowering, AuthenticatedResourceMetadataRequeriesActualContextAndRejectsInvalidRequestsWithoutAllocation) {
   InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-  Load(session);
+  ASSERT_NO_FATAL_FAILURE(Load(session));
   const auto receipt = M0NativeLoweringQualificationV1::ResourceMetadata(session, M0NativeResourceMetadataFaultV3::None);
   EXPECT_TRUE(receipt.context_present);
   EXPECT_TRUE(receipt.limits_present);
@@ -396,7 +402,7 @@ TEST_F(M0NativeLowering, AuthenticatedResourceMetadataRequeriesActualContextAndR
 TEST_F(M0NativeLowering, AuthenticatedResourceMetadataRejectsRetainedContextAndQueueSubstitution) {
   for (const auto fault : {M0NativeResourceMetadataFaultV3::ContextSwap, M0NativeResourceMetadataFaultV3::QueueSwap}) {
     InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-    Load(session);
+    ASSERT_NO_FATAL_FAILURE(Load(session));
     const auto receipt = M0NativeLoweringQualificationV1::ResourceMetadata(session, fault);
     EXPECT_TRUE(receipt.context_present);
     EXPECT_TRUE(receipt.stable_requery);
@@ -409,7 +415,7 @@ TEST_F(M0NativeLowering, AuthenticatedResourceMetadataRejectsRetainedContextAndQ
 TEST_F(M0NativeLowering, ActualInitializerPlanCopyAndEndpointHooksRejectOutsidePrivateInitializationBeforeMapInsert) {
   for (const auto hook : {M0NativeInitializerHookV1::Plan, M0NativeInitializerHookV1::Copy, M0NativeInitializerHookV1::Endpoint}) {
     InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-    Load(session);
+    ASSERT_NO_FATAL_FAILURE(Load(session));
     const auto receipt = M0NativeLoweringQualificationV1::InitializerHookOutsidePhase(session, hook);
     EXPECT_TRUE(receipt.denied) << "hook=" << int(hook);
     EXPECT_TRUE(receipt.replay_denied) << "hook=" << int(hook);
@@ -421,7 +427,7 @@ TEST_F(M0NativeLowering, ActualInitializerPlanCopyAndEndpointHooksRejectOutsideP
 
 TEST_F(M0NativeLowering, PrivateInitializationUploadsActualParametersConstructsAllKernelsAndRetainsCheckedStateOnReplay) {
   InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-  Load(session);
+  ASSERT_NO_FATAL_FAILURE(Load(session));
   const auto receipt = M0NativeLoweringQualificationV1::InitializedExecution(session, M0NativeInitializedFaultV1::None);
   ASSERT_GT(receipt.expected_initializers, 0u);
   EXPECT_EQ(receipt.initializers, receipt.expected_initializers);
@@ -449,7 +455,7 @@ TEST_F(M0NativeLowering, PrivateInitializedStateRejectsActualParameterPlanAndLat
                            M0NativeInitializedFaultV1::AllocationReuse,
                            M0NativeInitializedFaultV1::LateCopy}) {
     InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-    Load(session);
+    ASSERT_NO_FATAL_FAILURE(Load(session));
     const auto receipt = M0NativeLoweringQualificationV1::InitializedExecution(session, fault);
     EXPECT_TRUE(receipt.initialized);
     EXPECT_TRUE(receipt.checked_completion);
@@ -465,17 +471,19 @@ TEST_F(M0NativeLowering, PrivateInitializedStateRejectsActualParameterPlanAndLat
 
 TEST_F(M0NativeLowering, ObservedPlanCannotBeUpgradedIntoPrivateInitialization) {
   InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-  Load(session);
+  ASSERT_NO_FATAL_FAILURE(Load(session));
   ASSERT_TRUE(M0NativeLoweringQualificationV1::Plan(session).resource_denied);
   EXPECT_ANY_THROW(M0NativeLoweringQualificationV1::InitializedExecution(session, M0NativeInitializedFaultV1::None));
 }
 
 TEST_F(M0NativeLowering, ActualNativeRunsRetainLogicalPcmAcrossLongShortFailureLongSequence) {
   InferenceSession session(NativeLoweringOptions(), GetEnvironment());
-  Load(session);
+  ASSERT_NO_FATAL_FAILURE(Load(session));
   const auto receipt = M0NativeLoweringQualificationV1::RunSequence(session);
   EXPECT_GT(receipt.long_samples, 0u);
   EXPECT_GT(receipt.short_samples, 0u);
+  // Distinct token counts alone do not establish that actual GPU D changed.
+  EXPECT_NE(receipt.long_samples, receipt.short_samples);
   EXPECT_EQ(receipt.long_samples, receipt.repeated_samples);
   EXPECT_TRUE(receipt.valid_logical_pcm);
   EXPECT_TRUE(receipt.checked_idle_after_each_run);
@@ -496,6 +504,21 @@ TEST_F(M0NativeLowering, ActualNativeRunsRetainLogicalPcmAcrossLongShortFailureL
 #else
   EXPECT_FALSE(receipt.sparse_descriptors_checked);
 #endif
+#ifdef ENABLE_STRIDED_TENSORS
+  EXPECT_TRUE(receipt.strided_descriptors_checked);
+  EXPECT_TRUE(receipt.strided_input_denied);
+  EXPECT_TRUE(receipt.strided_output_denied);
+  EXPECT_TRUE(receipt.strided_refusal_values_retained);
+#else
+  EXPECT_FALSE(receipt.strided_descriptors_checked);
+#endif
+  EXPECT_TRUE(receipt.pointer_output_allocated);
+  EXPECT_TRUE(receipt.pointer_empty_wrapper_retained);
+  EXPECT_TRUE(receipt.pointer_empty_wrapper_pcm_equal);
+  EXPECT_TRUE(receipt.pointer_refusal_unpublished);
+  EXPECT_TRUE(receipt.pointer_preallocated_retained);
+  EXPECT_TRUE(receipt.pointer_preallocated_pcm_equal);
+  EXPECT_TRUE(receipt.pointer_preallocated_canaries_retained);
   EXPECT_TRUE(receipt.first_pcm_retained);
   EXPECT_TRUE(receipt.repeated_pcm_equal);
   EXPECT_TRUE(receipt.original_session_retained);

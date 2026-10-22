@@ -125,6 +125,7 @@ std::string CalculateProgramCacheKey(const ProgramBase& program,
                      inputs_segments[i],
                      input.is_buffer_view,
                      program.InputBufferOwner(i));
+    if (input.buffer_binding_size_bytes) ss << 'W';
   }
 
   ss << ":" D("Outputs=");
@@ -139,6 +140,7 @@ std::string CalculateProgramCacheKey(const ProgramBase& program,
                      outputs_segments[i],
                      output.is_buffer_view,
                      program.OutputBufferOwner(i));
+    if (output.buffer_binding_size_bytes) ss << 'W';
   }
 
   if (!program.Indices().empty()) {

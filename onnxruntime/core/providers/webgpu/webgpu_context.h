@@ -131,6 +131,10 @@ struct CommandRecordingState {
   // Concurrent allocator frees inspect only this flag, never the encoders or deferred dispatches.
   // BufferManager clears it under its cache lock after submission or abandonment.
   std::atomic<bool> has_unsubmitted_work{false};
+  // Conservative queued buffer references, including repeats. This bounds the
+  // native original-model submission window, not free or resident GPU memory.
+  uint64_t m0_submission_budget_bytes=0;
+  uint64_t m0_queued_reference_bytes=0;
 #if defined(_WIN32) && defined(ENABLE_D3D12_FILE_LOADING)
   std::mutex pending_release_callbacks_mutex;
   std::vector<std::function<void()>> pending_release_callbacks;
@@ -274,6 +278,10 @@ class WebGpuContext final {
   const wgpu::Device& Device() const { return device_; }
   // Payload-free admission metadata; never flushes or submits GPU work.
   Status M0NativeResourceStatusV3() const;
+  // Caller retains the allocation throughout this payload-free query. Refusal
+  // leaves output unchanged; foreign handles never reach a Dawn buffer query.
+  bool M0DescribeStorageAllocationV1(uintptr_t handle, uint64_t required_bytes,
+                                     webgpu::M0FullGpuStorageAllocationV1& output) const;
   const wgpu::Queue& M0NativeResourceQueueV3() const { return device_queue_; }
 
   const wgpu::AdapterInfo& AdapterInfo() const { return adapter_info_; }
@@ -331,12 +339,24 @@ class WebGpuContext final {
   // Serialize with other operations on this recording. Scopes cover flushing, not earlier encoding.
   Status FlushAndWaitChecked(const webgpu::BufferManager& buffer_mgr, CommandRecordingState& recording,
                             bool diagnostic_zero_deadline = false);
+  Status M0BeforeEnqueueV1(const webgpu::BufferManager& buffer_mgr, CommandRecordingState& recording,
+                         uint64_t reference_bytes);
+  Status M0FlushIfBudgetReachedV1(const webgpu::BufferManager& buffer_mgr, CommandRecordingState& recording);
 
   // Context-level managers are shared by sessions and synchronize their buffer caches internally.
   webgpu::BufferManager& BufferManager() const { return *buffer_mgr_; }
   webgpu::M0FullGpuResourceOwnership& M0OwnershipV2() const { return m0_ownership_v2_; }
   webgpu::M0FullGpuFaultHooksV2& M0FaultHooksV2() const { return m0_fault_hooks_v2_; }
   bool M0ProfilingActiveV2() const { return is_profiling_; }
+  bool M0BoundedSubmissionsActiveV1() const { return m0_bounded_submissions_active_.load(std::memory_order_acquire); }
+  bool M0BeginBoundedSubmissionsV1(){
+    bool expected=false;
+    return m0_bounded_submissions_active_.compare_exchange_strong(expected,true,std::memory_order_acq_rel);
+  }
+  bool M0EndBoundedSubmissionsV1(){
+    bool expected=true;
+    return m0_bounded_submissions_active_.compare_exchange_strong(expected,false,std::memory_order_acq_rel);
+  }
   webgpu::BufferManager& InitializerBufferManager() const { return *initializer_buffer_mgr_; }
 
   inline webgpu::ValidationMode ValidationMode() const {
@@ -442,6 +462,9 @@ class WebGpuContext final {
 
   wgpu::BindGroup CreateBindGroup(const std::vector<WGPUBuffer>& bind_buffers,
                                   const std::vector<uint32_t>& bind_buffers_segments,
+                                  const std::vector<uint64_t>& bind_buffer_offsets,
+                                  const std::vector<uint64_t>& bind_buffer_sizes,
+                                  uint64_t uniform_buffer_bytes,
                                   const wgpu::BindGroupLayout& bind_group_layout,
                                   std::string_view label) const;
   void DispatchCommand(const webgpu::CapturedCommandInfo& command, CommandRecordingState& recording);
@@ -499,6 +522,7 @@ class WebGpuContext final {
   wgpu::AdapterPropertiesSubgroupMatrixConfigs subgroup_matrix_configs_;
 
   mutable webgpu::M0FullGpuResourceOwnership m0_ownership_v2_;
+  std::atomic<bool> m0_bounded_submissions_active_{false};
   mutable webgpu::M0FullGpuFaultHooksV2 m0_fault_hooks_v2_;
   std::unique_ptr<webgpu::BufferManager> buffer_mgr_;
   std::unique_ptr<webgpu::BufferManager> initializer_buffer_mgr_;

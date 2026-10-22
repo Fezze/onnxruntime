@@ -32,6 +32,15 @@ ComputeContext::ComputeContext(WebGpuContext& webgpu_context,
       kernel_context_{kernel_context} {
 }
 
+Status ComputeContext::M0CheckCancellationV1() const {
+  if(!ep_.Recording().m0_submission_budget_bytes)return Status::OK();
+  uint32_t cancelled=0;
+  ORT_RETURN_IF_NOT(kernel_context_.M0ReadCancellationV1(cancelled)&&cancelled<=1,
+                    "RW07_NATIVE_RUN_CANCELLATION_BRIDGE_UNAVAILABLE");
+  ORT_RETURN_IF(cancelled,"RW07_NATIVE_RUN_CANCELLED_BEFORE_DISPATCH");
+  return Status::OK();
+}
+
 // Native test targets also include compute_context.h but do not use the EP adapter types.
 Tensor ComputeContext::CreateGPUTensor(MLDataType data_type, const TensorShape& shape) {
   AllocatorPtr allocator;

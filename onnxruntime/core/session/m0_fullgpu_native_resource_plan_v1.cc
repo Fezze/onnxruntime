@@ -8,6 +8,7 @@
 #include "core/framework/session_state.h"
 #include "core/framework/sequential_execution_plan.h"
 #include "core/graph/model.h"
+#include "core/session/m0_fullgpu_native_execution_state_v1.h"
 
 namespace onnxruntime {
 void M0FullGpuNativeLoweringOwnerV1::ValidateResourcePlan(const SessionState& state) const {
@@ -15,6 +16,8 @@ void M0FullGpuNativeLoweringOwnerV1::ValidateResourcePlan(const SessionState& st
                   state.m0_native_plan_owner_v1_ == this && state.p_seq_exec_plan_ && state.graph_viewer_ &&
                   !state.sess_options_.enable_mem_reuse && !state.sess_options_.enable_mem_pattern,
               "RW07_NATIVE_RESOURCE_ACTUAL_STATE");
+  ORT_ENFORCE(execution_plan_ && execution_plan_->module,"RW07_NATIVE_RESOURCE_MODULE");
+  ValidatePhysicalCapacity(*execution_plan_->module);
   const auto& graph = state.graph_;
   const auto& plan = *state.p_seq_exec_plan_;
   const auto& names = state.ort_value_name_idx_map_;
@@ -27,7 +30,7 @@ void M0FullGpuNativeLoweringOwnerV1::ValidateResourcePlan(const SessionState& st
               "RW07_NATIVE_RESOURCE_SINGLE_STREAM_PROFILE");
   const auto& stream = *plan.execution_plan[0];
   const auto& order = state.graph_viewer_->GetNodesInTopologicalOrder(state.sess_options_.execution_order);
-  ORT_ENFORCE(stream.steps_.size() == order.size() && order.size() == graph.NumberOfNodes() &&
+  ORT_ENFORCE(stream.steps_.size() == order.size() && order.size() == static_cast<size_t>(graph.NumberOfNodes()) &&
                   plan.node_stream_map_.size() == size_t(state.graph_viewer_->MaxNodeIndex()) + 1,
               "RW07_NATIVE_RESOURCE_NODE_ORDER_INVENTORY");
   std::map<NodeIndex, size_t> positions;

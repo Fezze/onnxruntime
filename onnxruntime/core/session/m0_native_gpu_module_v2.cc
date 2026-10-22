@@ -20,8 +20,9 @@ M0NativeGpuModuleV2::M0NativeGpuModuleV2(std::unique_ptr<M0OriginalLstmModuleV1>
 M0NativeGpuModuleV2::~M0NativeGpuModuleV2(){registry_.reset();module_.reset();}
 std::unique_ptr<M0NativeGpuModuleV2> M0NativeGpuModuleV2::Open(const logging::Logger& logger){
  auto pending=std::unique_ptr<M0NativeGpuModuleV2>(new M0NativeGpuModuleV2(M0OriginalLstmModuleV1::Open(logger)));
- pending->queried_=pending->module_->NativeBindingsV2();
- pending->registry_=pending->module_->Registry();
+ const auto initial=pending->module_->ReadNativeSnapshot();
+ pending->queried_=initial.bindings;
+ pending->registry_=initial.registry;
  ORT_ENFORCE(pending->registry_,"RW07_NATIVE_MODULE_REGISTRY");
  for(const auto& record:kM0NativeKernelRecordsV2){
   const auto& query=pending->queried_[record.id-1];
@@ -34,15 +35,18 @@ std::unique_ptr<M0NativeGpuModuleV2> M0NativeGpuModuleV2::Open(const logging::Lo
   ORT_ENFORCE(found,"RW07_NATIVE_MODULE_MISSING_COMPILED_CREATOR: ",record.op);
   pending->frozen_definitions_[record.id-1]=std::make_unique<const KernelDef>(*pending->selected_[record.id-1].selected_definition);
  }
- pending->context_=pending->module_->NativeResourceV3(0,0);
+ pending->context_=initial.context;
  ORT_ENFORCE(ContextOnly(pending->context_),"RW07_NATIVE_RESOURCE_CONTEXT_METADATA");
  pending->ValidateCurrent();return pending;
 }
-void M0NativeGpuModuleV2::ValidateCurrent()const{
- ORT_ENFORCE(module_&&registry_&&module_->Registry().get()==registry_.get(),"RW07_NATIVE_MODULE_CURRENT_REGISTRY");
- const auto actual_context=module_->NativeResourceV3(0,0);
+M0OriginalLstmModuleV1::NativeSnapshotV1 M0NativeGpuModuleV2::ValidateCurrent(
+ uintptr_t handle,uint64_t required_bytes)const{
+ ORT_ENFORCE(module_&&registry_,"RW07_NATIVE_MODULE_CURRENT_REGISTRY");
+ auto snapshot=module_->ReadNativeSnapshot(handle,required_bytes);
+ ORT_ENFORCE(snapshot.registry.get()==registry_.get(),"RW07_NATIVE_MODULE_CURRENT_REGISTRY");
+ const auto& actual_context=snapshot.context;
  ORT_ENFORCE(ContextOnly(actual_context)&&SameContext(context_,actual_context),"RW07_NATIVE_RESOURCE_CONTEXT_CHANGED");
- const auto current=module_->NativeBindingsV2();
+ const auto& current=snapshot.bindings;
  for(const auto& record:kM0NativeKernelRecordsV2){
   const size_t i=record.id-1;const auto& a=queried_[i];const auto& b=current[i];
   ORT_ENFORCE(a.abi==b.abi&&a.record_id==b.record_id&&a.type==b.type&&a.registry==b.registry&&
@@ -60,21 +64,41 @@ void M0NativeGpuModuleV2::ValidateCurrent()const{
     M0SameNativeKernelDefinitionV2(*frozen,*reinterpret_cast<const KernelDef*>(b.registration_definition)),
     "RW07_NATIVE_MODULE_CHANGED_FROZEN_DEFINITION");
  }
+ return snapshot;
 }
 M0NativeResourceBindingV3 M0NativeGpuModuleV2::Resource(uintptr_t handle,uint64_t required_bytes)const{
- ValidateCurrent();
- const auto actual=module_->NativeResourceV3(handle,required_bytes);
+ const auto snapshot=ValidateCurrent(handle,required_bytes);
+ const auto& actual=snapshot.resource;
  ORT_ENFORCE(SameContext(context_,actual),"RW07_NATIVE_RESOURCE_FOREIGN_CONTEXT");
  if(!handle)ORT_ENFORCE(!required_bytes&&ContextOnly(actual),"RW07_NATIVE_RESOURCE_CONTEXT_QUERY");
  else ORT_ENFORCE(required_bytes&&actual.handle==handle&&actual.generation&&actual.requested_bytes>=required_bytes&&
   actual.backing_bytes>=actual.requested_bytes&&actual.backing_bytes<=actual.max_buffer_bytes&&
-  actual.backing_bytes<=actual.max_binding_bytes&&actual.storage==1&&actual.copy_source<=1&&actual.copy_destination<=1,
+  actual.storage==1&&actual.copy_source<=1&&actual.copy_destination<=1,
   "RW07_NATIVE_RESOURCE_ACTUAL_ALLOCATION");
  return actual;
 }
-const ExecutionProviders& M0NativeGpuModuleV2::Providers()const{ValidateCurrent();return module_->Providers();}
-PluginExecutionProvider& M0NativeGpuModuleV2::Provider()const{ValidateCurrent();return module_->Provider();}
-std::shared_ptr<KernelRegistry> M0NativeGpuModuleV2::Registry()const{ValidateCurrent();return registry_;}
+M0NativeDeviceLimitsV1 M0NativeGpuModuleV2::DeviceLimits(
+ uint64_t storage_bytes,uint64_t initializer_bytes,uint64_t uniform_bytes)const{
+ ValidateCurrent();
+ const auto actual=module_->NativeDeviceLimitsV1(storage_bytes,initializer_bytes,uniform_bytes);
+ ORT_ENFORCE(actual.abi==1&&actual.structure_bytes==sizeof(actual)&&
+  actual.ep==context_.ep&&actual.context==context_.context&&actual.device==context_.device&&actual.queue==context_.queue&&
+  actual.max_buffer_bytes==context_.max_buffer_bytes&&actual.max_binding_bytes==context_.max_binding_bytes,
+  "RW07_NATIVE_DEVICE_LIMITS_CONTEXT_IDENTITY");
+ ORT_ENFORCE(actual.max_buffer_bytes&&actual.max_binding_bytes&&actual.max_uniform_binding_bytes&&
+  actual.max_storage_buffers&&actual.max_bindings&&actual.max_workgroup_x&&actual.max_workgroup_y&&actual.max_workgroup_z&&
+  actual.max_invocations&&actual.max_workgroup_storage&&actual.max_workgroups,
+  "RW07_NATIVE_DEVICE_LIMITS_POSITIVE_PROFILE");
+ ORT_ENFORCE(actual.storage_requested_bytes==storage_bytes&&actual.initializer_requested_bytes==initializer_bytes&&
+  actual.uniform_requested_bytes==uniform_bytes&&actual.storage_backing_bytes>=storage_bytes&&
+  actual.initializer_backing_bytes>=initializer_bytes&&actual.uniform_backing_bytes>=uniform_bytes&&
+  (storage_bytes||!actual.storage_backing_bytes)&&(initializer_bytes||!actual.initializer_backing_bytes)&&
+  (uniform_bytes||!actual.uniform_backing_bytes),"RW07_NATIVE_DEVICE_LIMITS_BACKING_ECHO");
+ ValidateCurrent();return actual;
+}
+const ExecutionProviders& M0NativeGpuModuleV2::Providers()const{return *ValidateCurrent().providers;}
+PluginExecutionProvider& M0NativeGpuModuleV2::Provider()const{return *ValidateCurrent().provider;}
+std::shared_ptr<KernelRegistry> M0NativeGpuModuleV2::Registry()const{return ValidateCurrent().registry;}
 const M0NativeSelectedKernelBindingV2& M0NativeGpuModuleV2::Binding(uint32_t record)const{
  ORT_ENFORCE(M0NativeKernelRecordByIdV2(record),"RW07_NATIVE_MODULE_RECORD");ValidateCurrent();return selected_[record-1];
 }

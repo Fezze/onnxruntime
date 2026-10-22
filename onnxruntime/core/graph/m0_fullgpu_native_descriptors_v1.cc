@@ -172,7 +172,10 @@ void M0FullGpuNativeLoweringOwnerV1::Defaulted(const Node& node,const ONNX_NAMES
  auto& d=descriptors_.at(node.Name());const auto expected=d.schema->attributes().find(attr.name());
  ORT_ENFORCE(expected!=d.schema->attributes().end()&& &attr==&expected->second.default_value,"RW07 native actual schema default identity");
  ORT_ENFORCE(d.selected&&!d.inferred&&d.defaults.insert(attr.name()).second,"RW07 native default state");
- for(const auto& original:d.wire.attribute())ORT_ENFORCE(original.name()!=attr.name(),"RW07 native default replaced original");CheckNode(node);
+ for(const auto& original:d.wire.attribute()) {
+  ORT_ENFORCE(original.name()!=attr.name(),"RW07 native default replaced original");
+ }
+ CheckNode(node);
 }
 void M0FullGpuNativeLoweringOwnerV1::Infer(Node& node,const void* context,std::vector<ONNX_NAMESPACE::TypeProto>& outputs){
  RequireResolveLease();
@@ -183,20 +186,31 @@ void M0FullGpuNativeLoweringOwnerV1::Infer(Node& node,const void* context,std::v
 void M0FullGpuNativeLoweringOwnerV1::Propagation(Node& node,const void* context,std::vector<ONNX_NAMESPACE::TypeProto>& outputs){
  RequireResolveLease();
  CheckNode(node);auto& d=descriptors_.at(node.Name());ORT_ENFORCE(d.inferred&&!d.propagated&&context&&context!=d.inference&&outputs.size()==node.OutputDefs().size(),"RW07 native no-work propagation context");
- for(const auto& type:outputs)ORT_ENFORCE(type.SerializeAsString().empty(),"RW07 native propagation must not carry values");d.propagated=true;d.propagation=context;
+ for(const auto& type:outputs) {
+  ORT_ENFORCE(type.SerializeAsString().empty(),"RW07 native propagation must not carry values");
+ }
+ d.propagated=true;d.propagation=context;
 }
 void M0FullGpuNativeLoweringOwnerV1::Saver(const Node& node,const NodeArg& output,size_t index,const std::vector<ONNX_NAMESPACE::TypeProto>& values){
  RequireResolveLease();
  CheckNode(node);auto& d=descriptors_.at(node.Name());ORT_ENFORCE(d.propagated&&index<node.OutputDefs().size()&&node.OutputDefs()[index]==&output&&values.size()==node.OutputDefs().size()&&
   d.saved.size()==values.size()&&!d.saved[index],"RW07 native no-work saver binding");
- for(const auto& value:values)ORT_ENFORCE(value.SerializeAsString().empty(),"RW07 native saver contains propagated values");d.saved[index]=true;
+ for(const auto& value:values) {
+  ORT_ENFORCE(value.SerializeAsString().empty(),"RW07 native saver contains propagated values");
+ }
+ d.saved[index]=true;
 }
 void M0FullGpuNativeLoweringOwnerV1::Published(const Node& node){
  RequireResolveLease();
  CheckNode(node);auto& d=descriptors_.at(node.Name());ORT_ENFORCE(d.inferred&&d.propagated&&!d.published,"RW07 native publication state");
  for(size_t i=0;i<node.OutputDefs().size();++i)ORT_ENFORCE(d.saved[i]==node.OutputDefs()[i]->Exists(),"RW07 native full saver output coverage");
- for(const auto* arg:node.OutputDefs())if(arg->Exists())ORT_ENFORCE(arg->TypeAsProto()&&arg->TypeAsProto()->SerializeAsString()==value_types_.at(arg->Name()).SerializeAsString()&&
-   !arg->GetInferredShapeValues().has_value()&&!arg->GetInferredShapeScalarValue().has_value(),"RW07 native exact published descriptor");d.published=true;
+ for(const auto* arg:node.OutputDefs()) {
+  if(arg->Exists()) {
+   ORT_ENFORCE(arg->TypeAsProto()&&arg->TypeAsProto()->SerializeAsString()==value_types_.at(arg->Name()).SerializeAsString()&&
+    !arg->GetInferredShapeValues().has_value()&&!arg->GetInferredShapeScalarValue().has_value(),"RW07 native exact published descriptor");
+  }
+ }
+ d.published=true;
 }
 std::string M0FullGpuNativeLoweringOwnerV1::ExecutionFingerprint()const{
  // Hash the actual resolved descriptor graph, including compiler-supplied
@@ -222,6 +236,7 @@ std::string M0FullGpuNativeLoweringOwnerV1::ExecutionFingerprint()const{
 }
 void M0FullGpuNativeLoweringOwnerV1::ValidateExecutionModel(){
  try{
+ ORT_ENFORCE(descriptor_inference_started_,"RW07 native descriptor inference entry missing");
  ORT_ENFORCE((phase_==Phase::Resolving||phase_==Phase::Resolved)&&execution_model_&&execution_model_.get()==constructing_model_&&execution_model_.get()!=source_,"RW07 native retained separate execution model");
  const auto& graph=execution_model_->MainGraph();ORT_ENFORCE(size_t(graph.NumberOfNodes())==descriptors_.size()&&graph.GetInputs().size()==3&&graph.GetOutputs().size()==4,"RW07 native actual execution inventory");
  for(const auto& node:graph.Nodes())CheckNode(node);

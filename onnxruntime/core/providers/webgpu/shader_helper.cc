@@ -311,7 +311,10 @@ Status ValidateVariableDependency(ProgramTensorMetadataDependency dependency, Sh
 
 Status ShaderHelper::ValidateVariable(const ProgramInput& input, const ShaderVariableHelper& var) const {
   ORT_RETURN_IF_ERROR(ValidateVariableDataType(input.tensor->GetElementType(), var.type_));
-  ORT_RETURN_IF_ERROR(ValidateVariableShape(input.tensor->Shape(),
+  const TensorShape origin = input.buffer_binding_size_bytes
+                                 ? TensorShape{static_cast<int64_t>(input.buffer_binding_size_bytes / sizeof(float))}
+                                 : input.tensor->Shape();
+  ORT_RETURN_IF_ERROR(ValidateVariableShape(origin,
                                             input.use_override_shape,
                                             input.use_override_shape ? input.override_shape : input.tensor->Shape(),
                                             var.num_components_,
@@ -323,7 +326,10 @@ Status ShaderHelper::ValidateVariable(const ProgramInput& input, const ShaderVar
 }
 Status ShaderHelper::ValidateVariable(const ProgramOutput& output, const ShaderVariableHelper& var) const {
   ORT_RETURN_IF_ERROR(ValidateVariableDataType(output.tensor->GetElementType(), var.type_, output.is_atomic));
-  ORT_RETURN_IF_ERROR(ValidateVariableShape(output.tensor->Shape(),
+  const TensorShape origin = output.buffer_binding_size_bytes
+                                 ? TensorShape{static_cast<int64_t>(output.buffer_binding_size_bytes / sizeof(float))}
+                                 : output.tensor->Shape();
+  ORT_RETURN_IF_ERROR(ValidateVariableShape(origin,
                                             output.use_override_shape,
                                             output.use_override_shape ? output.override_shape : output.tensor->Shape(),
                                             var.num_components_,

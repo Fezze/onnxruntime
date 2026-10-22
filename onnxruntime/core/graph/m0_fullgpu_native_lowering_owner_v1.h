@@ -5,18 +5,21 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include "gsl/span"
 #include "core/graph/m0_fullgpu_native_lowering_v1.h"
 #include "core/graph/m0_callback_policy_v1.h"
 #include <map>
 #include <set>
 #include "core/framework/run_options.h"
 #include "core/framework/ortdevice.h"
+#include "core/session/plugin_ep/m0_native_device_limits_v1.h"
 struct OrtValue;
 namespace ONNX_NAMESPACE { class OpSchema; }
 namespace onnxruntime {
 class Model;
 class InferenceSession;
 class SessionState;
+class M0NativeGpuModuleV2;
 
 enum class M0NativeInitializerVisitV1;
 class M0OriginalPreloadOwnerV1;
@@ -44,9 +47,9 @@ class M0FullGpuNativeLoweringOwnerV1 final {
   friend struct std::default_delete<M0FullGpuNativeLoweringOwnerV1>;
   static std::unique_ptr<M0FullGpuNativeLoweringOwnerV1> Prepare(
       const Model& source,const InferenceSession& session,
-      const ONNX_NAMESPACE::ModelProto& sealed_original,uint32_t capacity);
+      const ONNX_NAMESPACE::ModelProto& sealed_original,uint32_t capacity,bool device_capacity=false);
   M0FullGpuNativeLoweringOwnerV1(const Model& source,const InferenceSession& session,
-                                uint32_t capacity):source_(&source),session_(&session),capacity_(capacity){}
+                                uint32_t capacity,bool device_capacity=false);
   ~M0FullGpuNativeLoweringOwnerV1();
   void ResolveExecutionModel(const logging::Logger& logger);
   common::Status Callback(M0CallbackPolicyV1::Channel channel,const Model* model);
@@ -97,6 +100,7 @@ class M0FullGpuNativeLoweringOwnerV1 final {
   Phase phase_=Phase::Dormant;
   const Model* constructing_model_=nullptr;
   size_t construction_calls_=0;
+  bool descriptor_inference_started_=false;
   struct Descriptor {
     ONNX_NAMESPACE::NodeProto wire;
     const ONNX_NAMESPACE::OpSchema* schema=nullptr;
@@ -114,9 +118,17 @@ class M0FullGpuNativeLoweringOwnerV1 final {
   std::map<std::string,const NodeArg*> value_arguments_;
   M0FullGpuNativeLoweringOwnerV1(const M0FullGpuNativeLoweringOwnerV1&)=delete;
   M0FullGpuNativeLoweringOwnerV1& operator=(const M0FullGpuNativeLoweringOwnerV1&)=delete;
+  struct PreparedModuleDeleter { void operator()(M0NativeGpuModuleV2* module)const; };
+  std::unique_ptr<M0NativeGpuModuleV2,PreparedModuleDeleter> prepared_module_;
+  static uint32_t SelectPhysicalCapacity(M0NativeGpuModuleV2& module,const ONNX_NAMESPACE::ModelProto& original,
+      M0NativeDeviceLimitsV1& limits,uint64_t& initializer_bytes);
+  void ValidatePhysicalCapacity(M0NativeGpuModuleV2& module)const;
   const Model* const source_;
   const InferenceSession* const session_;
   const uint32_t capacity_;
+  const bool device_capacity_;
+  M0NativeDeviceLimitsV1 device_limits_;
+  uint64_t initializer_capacity_bytes_=0;
   ONNX_NAMESPACE::ModelProto derived_;
   std::array<M0FullGpuNativeCoverageV1,2464> coverage_;
   M0FullGpuNativeOutputV1 outputs_;

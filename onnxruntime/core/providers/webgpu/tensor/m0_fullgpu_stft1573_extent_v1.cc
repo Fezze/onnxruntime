@@ -5,8 +5,12 @@
 #include "core/providers/webgpu/webgpu_kernel.h"
 #include "core/providers/webgpu/shader_helper.h"
 #include "core/providers/webgpu/m0_fullgpu_extent_abi2.h"
+#include "core/providers/webgpu/tensor/m0_fullgpu_residual_stages_v1.h"
 namespace onnxruntime::webgpu {
 namespace {
+using m0_residual_stages::PhysicalBuffer;
+using m0_residual_stages::StorageBudget;
+using m0_residual_stages::StorageBudgetWithWindows;
 ProgramInput Words(const Tensor* t) {
   ProgramInput p(t, ProgramTensorMetadataDependency::None, TensorShape{32}, 1);
   p.var_type = ProgramVariableDataType::Uint32;
@@ -105,10 +109,13 @@ void ValidSpectrum(ShaderHelper& s, const ShaderVariableHelper& e) {
 }
 class OwnedStftData final : public Program<OwnedStftData> {
  public:
-  OwnedStftData() : Program{"RW07STFT1573OwnedDataV1"} {}
+  OwnedStftData() : Program{"RW07STFT1573OwnedTimeWindowDataV2"} {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"signal_capacity", ProgramUniformVariableDataType::Uint32},
       {"frame_capacity", ProgramUniformVariableDataType::Uint32},
+      {"first_frame", ProgramUniformVariableDataType::Uint32},
+      {"frame_count", ProgramUniformVariableDataType::Uint32},
+      {"signal_begin", ProgramUniformVariableDataType::Uint32},
       {"identity", ProgramUniformVariableDataType::Uint32});
   Status GenerateShaderCode(ShaderHelper& s) const override {
     const auto& x = s.AddInput("signal", ShaderUsage::UseValueTypeAlias);
@@ -118,27 +125,18 @@ class OwnedStftData final : public Program<OwnedStftData> {
     Roots(s);
     ValidSpectrum(s, e);
     auto& f = s.MainFunctionBody();
-    f << "if(global_idx>=11u*uniforms.frame_capacity){return;}let at=2u*global_idx;"
+    f << "if(global_idx>=11u*uniforms.frame_count){return;}let at=2u*global_idx;"
       << y.SetByOffset("at", "0.0") << y.SetByOffset("at+1u", "0.0")
-      << "if(!valid_spectrum()){return;}let frame=global_idx/11u;let bin=global_idx%11u;"
+      << "if(!valid_spectrum()){return;}let frame=uniforms.first_frame+global_idx/11u;let bin=global_idx%11u;"
       << "if(frame>=" << e.GetByOffset("4u") << "){return;}"
       << "if(5u*frame+19u>=uniforms.signal_capacity){return;}var re:f32=0.0;var im:f32=0.0;"
-      << "for(var n=0u;n<20u;n++){let sample:f32=" << x.GetByOffset("5u*frame+n") << "*"
+      << "for(var n=0u;n<20u;n++){let sample:f32=" << x.GetByOffset("5u*frame+n-uniforms.signal_begin") << "*"
       << window.GetByOffset("n") << ";let root=(bin*n)%20u;let rp:f32=sample*cosine[root];"
       << "let ip:f32=sample*(-sine[root]);re=re+rp;im=im+ip;}"
       << y.SetByOffset("at", "re") << y.SetByOffset("at+1u", "im");
     return Status::OK();
   }
 };
-Status Binding(ComputeContext& c, const Tensor* t) {
-  ORT_RETURN_IF_NOT(t && t->Location().device.Type() == OrtDevice::GPU && t->DataRaw() && t->SizeInBytes() > 0,
-                    "RW07 owned STFT missing GPU binding");
-  const auto& limits = c.DeviceLimits();
-  const auto actual = wgpuBufferGetSize(static_cast<WGPUBuffer>(const_cast<void*>(t->DataRaw())));
-  ORT_RETURN_IF_NOT(actual >= t->SizeInBytes() && actual <= limits.maxBufferSize && actual <= limits.maxStorageBufferBindingSize,
-                    "RW07 owned STFT actual whole binding limit");
-  return Status::OK();
-}
 class OwnedStft final : public WebGpuKernel {
  public:
   explicit OwnedStft(const OpKernelInfo& info) : WebGpuKernel{info},
@@ -156,15 +154,25 @@ class OwnedStft final : public WebGpuKernel {
                           frame && frame->IsDataType<int64_t>() && frame->Shape().NumDimensions() == 0 &&
                           window && window->IsDataType<float>() && window->Shape() == TensorShape{20},
                       "RW07 owned STFT original signal/parameter descriptors");
-    for (const auto* input : {x, e, hop, window, frame}) ORT_RETURN_IF_ERROR(Binding(c, input));
+    for (const auto* input : {x, e, hop, window, frame}) ORT_RETURN_IF_ERROR(PhysicalBuffer(c, input));
     const auto& limits = c.DeviceLimits();
-    const uint64_t elements = uint64_t(capacity_) * 22, groups = (uint64_t(capacity_) * 11 + 63) / 64;
+    const uint64_t elements = uint64_t(capacity_) * 22;
     const uint64_t limit = limits.maxComputeWorkgroupsPerDimension;
     ORT_RETURN_IF_NOT(limits.maxStorageBuffersPerShaderStage >= 5 && limits.maxComputeWorkgroupSizeX >= 64 &&
-                          limits.maxComputeInvocationsPerWorkgroup >= 64 && limit > 0 && groups <= limit * limit &&
-                          elements <= UINT32_MAX && elements * sizeof(float) <= limits.maxBufferSize &&
-                          elements * sizeof(float) <= limits.maxStorageBufferBindingSize,
+                          limits.maxComputeInvocationsPerWorkgroup >= 64 && limit > 0 &&
+                          elements <= UINT32_MAX && elements * sizeof(float) <= limits.maxBufferSize,
                       "RW07 owned STFT physical output/dispatch limits");
+    const uint64_t alignment=limits.minStorageBufferOffsetAlignment;
+    ORT_RETURN_IF_NOT(alignment>0&&alignment%sizeof(float)==0,"RW07 STFT window alignment");
+    const uint64_t prefix=alignment-sizeof(float);
+    ORT_RETURN_IF_NOT(prefix+22*sizeof(float)<=limits.maxStorageBufferBindingSize,"RW07 STFT minimum time window binding");
+    const uint64_t budget=std::min<uint64_t>(limits.maxStorageBufferBindingSize,
+        std::max<uint64_t>(8ull*1024*1024,prefix+22*sizeof(float)));
+    const uint32_t frames_per_window=static_cast<uint32_t>(std::min<uint64_t>(uint64_t(capacity_),
+        (budget-prefix)/(22*sizeof(float))));
+    const uint64_t groups=(uint64_t(frames_per_window)*11+63)/64;
+    ORT_RETURN_IF_NOT(frames_per_window>0&&groups<=limit*limit,"RW07 STFT time window dispatch limit");
+    const uint32_t signal_capacity=uint32_t(x->Shape()[1]),frame_capacity=uint32_t(capacity_);
     const uint64_t session = c.KernelContext().M0FullGpuExtentOwnerEpochV1(), run = c.KernelContext().M0FullGpuExtentRunIdV2();
     M0FullGpuAllocationIdentity sid, data, pair;
     ORT_RETURN_IF_NOT(session && run && c.M0FullGpuDescribeResourceV2(*e, sid) && c.M0FullGpuDescribeResourceV2(*x, data),
@@ -174,11 +182,27 @@ class OwnedStft final : public WebGpuKernel {
     auto* y = c.Output(0, TensorShape{1, capacity_, 11, 2});
     auto* out = c.Output(1, TensorShape{32});
     ORT_RETURN_IF_NOT(y && y->IsDataType<float>() && out && out->IsDataType<uint32_t>(), "RW07 owned STFT output types");
-    ORT_RETURN_IF_ERROR(Binding(c, y));
-    ORT_RETURN_IF_ERROR(Binding(c, out));
+    ORT_RETURN_IF_ERROR(PhysicalBuffer(c, y));
+    ORT_RETURN_IF_ERROR(PhysicalBuffer(c, out));
     ORT_RETURN_IF_NOT(y->DataRaw() != out->DataRaw(), "RW07 owned STFT distinct outputs");
     for (const auto* input : {x, e, hop, window, frame}) {
       ORT_RETURN_IF_NOT(input->DataRaw() != y->DataRaw() && input->DataRaw() != out->DataRaw(), "RW07 owned STFT source/output alias");
+    }
+    ORT_RETURN_IF_ERROR(StorageBudget(c, {e, hop, window, frame, out}));
+    const auto signal_begin=[&](uint32_t first){return std::min<uint64_t>(5ull*first,uint64_t(signal_capacity)-1);};
+    const auto signal_view=[&](uint32_t first,uint32_t count){
+      const uint64_t begin=signal_begin(first);
+      const uint64_t samples=std::min<uint64_t>(5ull*(count-1)+20,uint64_t(signal_capacity)-begin);
+      return ProgramInput::FloatBufferWindow(x,ProgramTensorMetadataDependency::None,TensorShape{int64_t(samples)},
+          uint32_t(begin),uint32_t(alignment));
+    };
+    const auto spectrum_view=[&](uint32_t first,uint32_t count){
+      return ProgramOutput::FloatBufferWindow(y,ProgramTensorMetadataDependency::None,TensorShape{count,11,2},
+          22u*first,uint32_t(alignment));
+    };
+    for(uint32_t first=0;first<frame_capacity;first+=frames_per_window){
+      const uint32_t count=std::min(frames_per_window,frame_capacity-first);
+      ORT_RETURN_IF_ERROR(StorageBudgetWithWindows(c,signal_view(first,count),spectrum_view(first,count),{window,out}));
     }
     M0FullGpuAllocationIdentity output;
     ORT_RETURN_IF_NOT(c.M0FullGpuClaimExtentV2(*out, *y, 14, 1015, output), "RW07 owned STFT spectrum pair claim");
@@ -192,22 +216,25 @@ class OwnedStft final : public WebGpuKernel {
       value.var_type = ProgramVariableDataType::Uint32;
       return value;
     };
-    const uint32_t signal_capacity = uint32_t(x->Shape()[1]), frame_capacity = uint32_t(capacity_);
     OwnedStftGuard guard;
     guard.AddInputs({Words(e), scalar_words(hop), {window, ProgramTensorMetadataDependency::None}, scalar_words(frame)})
         .AddOutput(Words(out)).SetWorkgroupSize(1).SetDispatchGroupSize(1)
         .AddUniformVariables({signal_capacity, frame_capacity, uint32_t(valid), span(source_words), span(words)});
     ORT_RETURN_IF_ERROR(c.RunProgram(guard));
-    OwnedStftData data_program;
-    const uint64_t gx = std::min(groups, limit), gy = (groups + gx - 1) / gx;
-    data_program.AddInputs({{x, ProgramTensorMetadataDependency::None}, {window, ProgramTensorMetadataDependency::None},
-                            Words(static_cast<const Tensor*>(out))}).AddOutput({y, ProgramTensorMetadataDependency::None})
-        .SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx), uint32_t(gy))
-        .AddUniformVariables({signal_capacity, frame_capacity, span(words)});
-    ORT_RETURN_IF_ERROR(c.RunProgram(data_program));
+    for(uint32_t first=0;first<frame_capacity;first+=frames_per_window){
+      const uint32_t count=std::min(frames_per_window,frame_capacity-first);
+      const uint64_t current_groups=(uint64_t(count)*11+63)/64;
+      const uint64_t gx=std::min(current_groups,limit),gy=(current_groups+gx-1)/gx;
+      OwnedStftData data_program;
+      data_program.AddInput(signal_view(first,count)).AddInputs({{window,ProgramTensorMetadataDependency::None},Words(static_cast<const Tensor*>(out))})
+          .AddOutput(spectrum_view(first,count)).SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
+          .AddUniformVariables({signal_capacity,frame_capacity,first,count,uint32_t(signal_begin(first)),span(words)});
+      ORT_RETURN_IF_ERROR(c.RunProgram(data_program));
+    }
     LOGS(c.Logger(), INFO) << "M0_RW07_STFT1573_EXTENT_V1 session=" << session << " run=" << run
         << " source_pair_valid=" << valid << " role=14 instance=1015 source_capacity=" << signal_capacity
-        << " output_capacity=" << frame_capacity << " GPU_dispatches=2 host_payload_reads=0";
+        << " output_capacity=" << frame_capacity << " GPU_dispatches="<<(1+(frame_capacity+frames_per_window-1)/frames_per_window)
+        << " frames_per_window="<<frames_per_window<<" host_payload_reads=0";
     return Status::OK();
   }
  private:
@@ -248,8 +275,8 @@ class OwnedStftPacket final : public WebGpuKernel {
                           y->Shape().NumDimensions() == 4 && y->Shape()[0] == 1 && y->Shape()[1] > 0 &&
                           y->Shape()[1] <= 12288001 && y->Shape()[2] == 11 && y->Shape()[3] == 2,
                       "RW07 owned STFT terminal original descriptors");
-    ORT_RETURN_IF_ERROR(Binding(c, e));
-    ORT_RETURN_IF_ERROR(Binding(c, y));
+    ORT_RETURN_IF_ERROR(PhysicalBuffer(c, e));
+    ORT_RETURN_IF_ERROR(PhysicalBuffer(c, y));
     const auto& limits = c.DeviceLimits();
     ORT_RETURN_IF_NOT(limits.maxStorageBuffersPerShaderStage >= 2 && limits.maxComputeWorkgroupsPerDimension >= 1 &&
                           limits.maxComputeWorkgroupSizeX >= 1 && limits.maxComputeInvocationsPerWorkgroup >= 1,
@@ -261,7 +288,7 @@ class OwnedStftPacket final : public WebGpuKernel {
                       "RW07 owned STFT terminal actual spectrum pair");
     auto* packet = c.Output(0, TensorShape{18});
     ORT_RETURN_IF_NOT(packet && packet->IsDataType<uint32_t>(), "RW07 owned STFT terminal packet type");
-    ORT_RETURN_IF_ERROR(Binding(c, packet));
+    ORT_RETURN_IF_ERROR(StorageBudget(c, {e, packet}));
     ORT_RETURN_IF_NOT(packet->DataRaw() != e->DataRaw() && packet->DataRaw() != y->DataRaw(),
                       "RW07 owned STFT terminal distinct packet");
     const m0_extent_abi2::OpaqueOwnership owner{session, run, pair.generation, pair.data_generation, 14, 1015};

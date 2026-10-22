@@ -180,7 +180,9 @@ class SignalExtent final : public WebGpuKernel {
       ORT_RETURN_IF_NOT(t->DataRaw() && t->SizeInBytes() > 0 && t->SizeInBytes() <= limits.maxBufferSize &&
                             t->SizeInBytes() <= limits.maxStorageBufferBindingSize,
                         "RW07 signal after1487 binding descriptor");
-      const uint64_t actual = wgpuBufferGetSize(static_cast<WGPUBuffer>(const_cast<void*>(t->DataRaw())));
+      M0FullGpuStorageAllocationV1 allocation;
+      ORT_RETURN_IF_NOT(c.M0FullGpuDescribeStorageV1(*t,allocation),"RW07 live physical storage allocation");
+      const uint64_t actual=allocation.backing_bytes;
       ORT_RETURN_IF_NOT(actual >= t->SizeInBytes() && actual <= limits.maxBufferSize &&
                             actual <= limits.maxStorageBufferBindingSize,
                         "RW07 signal after1487 actual binding backing");

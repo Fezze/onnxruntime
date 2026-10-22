@@ -7,7 +7,7 @@
 #include <limits>
 #include <string_view>
 #include <type_traits>
-#include "core/session/onnxruntime_ep_c_api.h"
+#include "core/session/onnxruntime_c_api.h"
 #include "core/session/plugin_ep/m0_kernel_creator_binding_v1.h"
 
 namespace onnxruntime {

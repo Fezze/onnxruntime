@@ -5,6 +5,7 @@
 #include <cmath>
 #include <chrono>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -939,6 +940,8 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
   constexpr size_t max_alignment_of_field = 16;
   const size_t uniform_buffer_total_size = (current_offset + max_alignment_of_field - 1) / max_alignment_of_field * max_alignment_of_field;
 
+  ORT_RETURN_IF_NOT(uniform_buffer_total_size <= device_limits_.maxUniformBufferBindingSize,
+                    "WebGPU uniform structure exceeds the device uniform binding limit.");
   WGPUBuffer uniform_buffer = nullptr;
   if (uniform_buffer_total_size > 0) {
     std::vector<uint8_t> uniform_data_buffer(uniform_buffer_total_size);
@@ -959,14 +962,19 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
 
   std::vector<WGPUBuffer> bind_buffers;
   std::vector<uint32_t> bind_buffers_segments;
+  std::vector<uint64_t> bind_buffer_offsets, bind_buffer_sizes;
   bind_buffers.reserve(total_buffer_count);
   bind_buffers_segments.reserve(total_buffer_count);
+  bind_buffer_offsets.reserve(total_buffer_count);
+  bind_buffer_sizes.reserve(total_buffer_count);
   for (size_t i = 0; i < inputs.size(); i++) {
     if (inputs_segments[i] == 0) {
       continue;
     }
     bind_buffers.push_back(reinterpret_cast<WGPUBuffer>(const_cast<void*>(inputs[i].tensor->DataRaw())));
     bind_buffers_segments.push_back(inputs_segments[i]);
+    bind_buffer_offsets.push_back(inputs[i].buffer_binding_offset_bytes);
+    bind_buffer_sizes.push_back(inputs[i].buffer_binding_size_bytes);
   }
   for (size_t i = 0; i < outputs.size(); i++) {
     if (outputs_segments[i] == 0) {
@@ -974,10 +982,14 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
     }
     bind_buffers.push_back(reinterpret_cast<WGPUBuffer>(outputs[i].tensor->MutableDataRaw()));
     bind_buffers_segments.push_back(outputs_segments[i]);
+    bind_buffer_offsets.push_back(outputs[i].buffer_binding_offset_bytes);
+    bind_buffer_sizes.push_back(outputs[i].buffer_binding_size_bytes);
   }
   if (uniform_buffer) {
     bind_buffers.push_back(uniform_buffer);
     bind_buffers_segments.push_back(1);  // uniform buffer defaults to 1 segment
+    bind_buffer_offsets.push_back(0);
+    bind_buffer_sizes.push_back(0);
   }
 
   // Record the ready bind group and return. The deferred drain only needs to wait for the pipeline
@@ -987,7 +999,7 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
   if (program_artifact != nullptr) {
     command.compute_pipeline = program_artifact->compute_pipeline;
   }
-  command.bind_group = CreateBindGroup(bind_buffers, bind_buffers_segments,
+  command.bind_group = CreateBindGroup(bind_buffers, bind_buffers_segments, bind_buffer_offsets, bind_buffer_sizes, uniform_buffer_total_size,
                                        *bind_group_layout, program.Name());
   command.pending_build = std::move(pending_build);
   recording.has_unsubmitted_work.store(true, std::memory_order_relaxed);
@@ -1005,13 +1017,31 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
     command.pending_kernel_info.emplace(context.NodeName(), context.OpType(), program.Name(),
                                         key, inputs, outputs);
   }
+  if(recording.m0_submission_budget_bytes){
+    uint64_t reference_bytes=0;
+    const auto add_reference=[&](WGPUBuffer buffer){
+      const uint64_t bytes=wgpuBufferGetSize(buffer);
+      ORT_ENFORCE(bytes<=std::numeric_limits<uint64_t>::max()-reference_bytes,
+                  "RW07 dispatch reference size overflow");
+      reference_bytes+=bytes;
+    };
+    for(const auto buffer:bind_buffers)add_reference(buffer);
+    if(command.indirect_buffer)add_reference(command.indirect_buffer);
+    // Construct the bind group first: draining earlier pipeline builds may
+    // invalidate pointers into their deferred commands.
+    ORT_RETURN_IF_ERROR(M0BeforeEnqueueV1(buffer_mgr,recording,reference_bytes));
+  }
+  recording.has_unsubmitted_work.store(true,std::memory_order_relaxed);
   recording.deferred_dispatches.push_back(std::move(command));
 
   // Drain and submit a full window to bound both recorded and encoded dispatch state. Partial
   // windows are encoded and submitted by the caller at its execution boundary.
   if (static_cast<size_t>(recording.num_pending_dispatches) + recording.deferred_dispatches.size() >=
       max_num_pending_dispatches_) {
-    ORT_RETURN_IF_ERROR(Flush(buffer_mgr, recording));
+    ORT_RETURN_IF_ERROR(recording.m0_submission_budget_bytes?
+        FlushAndWaitChecked(buffer_mgr,recording):Flush(buffer_mgr,recording));
+  }else{
+    ORT_RETURN_IF_ERROR(M0FlushIfBudgetReachedV1(buffer_mgr,recording));
   }
   return Status::OK();
 }
@@ -1364,6 +1394,31 @@ Status WebGpuContext::M0NativeResourceStatusV3() const {
   return CheckDeviceStatus();
 }
 
+bool WebGpuContext::M0DescribeStorageAllocationV1(uintptr_t handle,uint64_t required_bytes,
+                                                webgpu::M0FullGpuStorageAllocationV1& output) const {
+  if(!handle||!required_bytes||!HasDevice()||m0_ownership_v2_.Poisoned())return false;
+  webgpu::M0FullGpuStorageAllocationV1 pending;
+  auto& allocation=pending.identity;
+  if(!m0_ownership_v2_.Describe(handle,allocation)||!allocation.generation||
+      required_bytes>allocation.requested_bytes||allocation.requested_bytes>device_limits_.maxBufferSize)return false;
+  const auto buffer=reinterpret_cast<WGPUBuffer>(handle);
+  pending.backing_bytes=wgpuBufferGetSize(buffer);
+  const auto usage=wgpuBufferGetUsage(buffer);
+  if(pending.backing_bytes<allocation.requested_bytes||pending.backing_bytes>device_limits_.maxBufferSize||
+      !(usage&WGPUBufferUsage_Storage))return false;
+  pending.storage=1;
+  pending.copy_source=uint32_t(bool(usage&WGPUBufferUsage_CopySrc));
+  pending.copy_destination=uint32_t(bool(usage&WGPUBufferUsage_CopyDst));
+  webgpu::M0FullGpuAllocationIdentity current;
+  if(!m0_ownership_v2_.Describe(handle,current)||current.generation!=allocation.generation||
+      current.requested_bytes!=allocation.requested_bytes||current.session!=allocation.session||
+      current.run!=allocation.run||current.data_handle!=allocation.data_handle||
+      current.data_generation!=allocation.data_generation||current.producer_role!=allocation.producer_role||
+      current.producer_instance!=allocation.producer_instance||m0_ownership_v2_.Poisoned())return false;
+  output=pending;
+  return true;
+}
+
 Status WebGpuContext::CheckDeviceStatus() const {
   // Queue work-done and error-scope callbacks can both succeed on an already-lost device.
   // Poll the existing lost future without replacing externally supplied device callbacks.
@@ -1373,6 +1428,29 @@ Status WebGpuContext::CheckDeviceStatus() const {
                     "Failed to check WebGPU device loss. status=", static_cast<uint32_t>(wait_status));
   std::lock_guard<std::mutex> lock{device_error_state_->mutex};
   return device_error_state_->status;
+}
+
+Status WebGpuContext::M0BeforeEnqueueV1(const webgpu::BufferManager& buffer_mgr,
+                                      CommandRecordingState& recording,uint64_t reference_bytes){
+  const uint64_t budget=recording.m0_submission_budget_bytes;
+  if(!budget)return Status::OK();
+  ORT_RETURN_IF_NOT(!M0OwnershipV2().Poisoned(),"RW07 native submission context poisoned");
+  const uint64_t previous=recording.m0_queued_reference_bytes;
+  if(previous&&(previous>=budget||reference_bytes>budget-previous)){
+    ORT_RETURN_IF_ERROR(FlushAndWaitChecked(buffer_mgr,recording));
+  }
+  ORT_RETURN_IF_NOT(reference_bytes<=std::numeric_limits<uint64_t>::max()-recording.m0_queued_reference_bytes,
+                    "RW07 native queued reference size overflow");
+  recording.m0_queued_reference_bytes+=reference_bytes;
+  return Status::OK();
+}
+
+Status WebGpuContext::M0FlushIfBudgetReachedV1(const webgpu::BufferManager& buffer_mgr,
+                                             CommandRecordingState& recording){
+  if(recording.m0_submission_budget_bytes&&
+      recording.m0_queued_reference_bytes>=recording.m0_submission_budget_bytes)
+    return FlushAndWaitChecked(buffer_mgr,recording);
+  return Status::OK();
 }
 
 Status WebGpuContext::FlushAndWaitChecked(const webgpu::BufferManager& buffer_mgr,
@@ -1434,9 +1512,10 @@ Status WebGpuContext::FlushAndWaitChecked(const webgpu::BufferManager& buffer_mg
     // A deadline refusal does not authorize retirement while work is pending.
     // Drain this same actual future before releasing the recording/resources.
     const auto wait_status = Wait(future);
-    if (diagnostic_zero_deadline)
+    if (diagnostic_zero_deadline) {
       LOGS_DEFAULT(INFO) << "M0_RW07_ACTUAL_QUEUE_DEADLINE_DRAIN checked=" << wait_status.IsOK()
                         << " queue_callback_ok=" << completion_status->IsOK();
+    }
     record_failure(wait_status);
     if (wait_status.IsOK()) {
       record_failure(*completion_status);
@@ -1453,6 +1532,10 @@ Status WebGpuContext::FlushAndWaitChecked(const webgpu::BufferManager& buffer_mg
     record_failure(PopErrorScope());
   }
   record_failure(CheckDeviceStatus());
+  if(recording.m0_submission_budget_bytes&&M0OwnershipV2().Poisoned())
+    record_failure(ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07 native submission context already poisoned"));
+  if(result.IsOK())recording.m0_queued_reference_bytes=0;
+  else if(recording.m0_submission_budget_bytes)M0OwnershipV2().Poison();
   return result;
 }
 
@@ -1539,8 +1622,14 @@ Status WebGpuContext::Flush(const webgpu::BufferManager& buffer_mgr,
 
 wgpu::BindGroup WebGpuContext::CreateBindGroup(const std::vector<WGPUBuffer>& bind_buffers,
                                                const std::vector<uint32_t>& bind_buffers_segments,
+                                               const std::vector<uint64_t>& bind_buffer_offsets,
+                                               const std::vector<uint64_t>& bind_buffer_sizes,
+                                               uint64_t uniform_buffer_bytes,
                                                const wgpu::BindGroupLayout& bind_group_layout,
                                                std::string_view label) const {
+  ORT_ENFORCE(bind_buffers.size() == bind_buffers_segments.size() &&
+                  bind_buffers.size() == bind_buffer_offsets.size() && bind_buffers.size() == bind_buffer_sizes.size() &&
+                  (!uniform_buffer_bytes || !bind_buffers.empty()), "Invalid bind group buffer inventory.");
   uint32_t entry_index = 0;
   std::vector<WGPUBindGroupEntry> bind_group_entries;
 
@@ -1548,20 +1637,44 @@ wgpu::BindGroup WebGpuContext::CreateBindGroup(const std::vector<WGPUBuffer>& bi
   for (size_t buffer_idx = 0; buffer_idx < bind_buffers.size(); ++buffer_idx) {
     WGPUBuffer buffer = bind_buffers[buffer_idx];
     const uint32_t total_segments = bind_buffers_segments[buffer_idx];
+    const uint64_t window_offset = bind_buffer_offsets[buffer_idx], window_bytes = bind_buffer_sizes[buffer_idx];
+    if (window_bytes) {
+      const uint64_t alignment = device_limits_.minStorageBufferOffsetAlignment;
+      const uint64_t physical_bytes = wgpuBufferGetSize(buffer);
+      ORT_ENFORCE(!(uniform_buffer_bytes && buffer_idx + 1 == bind_buffers.size()) && total_segments == 1 &&
+                      alignment > 0 && window_offset % alignment == 0 && window_bytes <= kMaxBufferSize &&
+                      window_bytes % sizeof(float) == 0 && window_offset <= physical_bytes &&
+                      window_bytes <= physical_bytes - window_offset, "Invalid physical storage binding window.");
+      bind_group_entries.push_back({nullptr, entry_index++, buffer, window_offset, window_bytes, nullptr, nullptr});
+      continue;
+    }
+    ORT_ENFORCE(window_offset == 0, "Storage binding offset without a physical window.");
+    if (uniform_buffer_bytes && buffer_idx + 1 == bind_buffers.size()) {
+      ORT_ENFORCE(total_segments == 1 && uniform_buffer_bytes <= device_limits_.maxUniformBufferBindingSize &&
+                      uniform_buffer_bytes <= wgpuBufferGetSize(buffer), "Invalid uniform buffer binding extent.");
+      bind_group_entries.push_back({nullptr, entry_index++, buffer, 0, uniform_buffer_bytes, nullptr, nullptr});
+      continue;
+    }
     // `total_segments` we used is calculated by tensor size, not actual buffer size. Because for bucketed buffer,
     // the actual buffer size may be larger than the tensor size, an extreme case is that tensor size = 127MB, buffer size = 256MB,
     // maxStorageBufferBindingSize = 128MB, in this case we only need to bind 1 segment instead of 2 segments because
     // there is no data for the second segment.
+    ORT_ENFORCE(total_segments > 0 && kMaxBufferSize > 0, "Invalid storage buffer segmentation.");
+    const uint64_t buffer_size = wgpuBufferGetSize(buffer);
     if (total_segments > 1) {
       uint64_t offset = 0;
-      uint64_t buffer_size = wgpuBufferGetSize(buffer);
       for (uint32_t segment = 0; segment < total_segments; ++segment) {
+        ORT_ENFORCE(offset < buffer_size, "Storage buffer segment exceeds its physical backing.");
         uint64_t segment_size = std::min(kMaxBufferSize, buffer_size - offset);
         bind_group_entries.push_back({nullptr, entry_index++, buffer, offset, segment_size, nullptr, nullptr});
         offset += segment_size;
       }
     } else {
-      bind_group_entries.push_back({nullptr, entry_index++, buffer, 0, WGPU_WHOLE_SIZE, nullptr, nullptr});
+      // A bucket may be larger than the tensor and the binding limit. Bind
+      // the admissible prefix rather than exposing its entire backing store.
+      const uint64_t binding_size = std::min(kMaxBufferSize, buffer_size);
+      ORT_ENFORCE(binding_size > 0, "Cannot bind an empty physical buffer.");
+      bind_group_entries.push_back({nullptr, entry_index++, buffer, 0, binding_size, nullptr, nullptr});
     }
   }
 

@@ -3,9 +3,11 @@
 // Original decoder encode/decode residual blocks, including real decode3 upsampling.
 #include <algorithm>
 #include <array>
+#include <optional>
 #include "core/providers/webgpu/webgpu_kernel.h"
 #include "core/providers/webgpu/shader_helper.h"
 #include "core/providers/webgpu/m0_fullgpu_extent_abi2.h"
+#include "core/providers/webgpu/tensor/m0_fullgpu_residual_stages_v1.h"
 
 namespace onnxruntime::webgpu {
 namespace {
@@ -109,13 +111,16 @@ class DecoderGuard final : public Program<DecoderGuard> {
 };
 class DecoderNormStyle final : public Program<DecoderNormStyle> {
  public:
-  DecoderNormStyle() : Program{"RW07DecoderResidualNormStyleV1"} {}
+  DecoderNormStyle() : Program{"RW07DecoderResidualNormStyleChannelTileV2"} {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"input_capacity", ProgramUniformVariableDataType::Uint32},
       {"output_capacity", ProgramUniformVariableDataType::Uint32},
       {"channels", ProgramUniformVariableDataType::Uint32},
       {"features", ProgramUniformVariableDataType::Uint32},
       {"extent_divisor", ProgramUniformVariableDataType::Uint32},
+      {"channel_offset", ProgramUniformVariableDataType::Uint32},
+      {"channel_count", ProgramUniformVariableDataType::Uint32},
+      {"tile_channels", ProgramUniformVariableDataType::Uint32},
       {"final_capacity", ProgramUniformVariableDataType::Uint32},
       {"identity", ProgramUniformVariableDataType::Uint32});
   Status GenerateShaderCode(ShaderHelper& s) const override {
@@ -128,8 +133,11 @@ class DecoderNormStyle final : public Program<DecoderNormStyle> {
     PayloadGuard(s, e);
     OriginalArithmetic(s);
     auto& f = s.MainFunctionBody();
-    f << "if(global_idx>=uniforms.channels){return;}for(var t=0u;t<uniforms.output_capacity;t++){"
+    f << "if(global_idx>=uniforms.tile_channels){return;}for(var t=0u;t<uniforms.output_capacity;t++){"
       << y.SetByOffset("global_idx*uniforms.output_capacity+t", "0.0") << "}if(!valid_output()){return;}"
+      << "if(global_idx>=uniforms.channel_count||uniforms.channel_offset>=uniforms.channels||"
+      << "uniforms.channel_count>uniforms.channels-uniforms.channel_offset){return;}"
+      << "let ch=uniforms.channel_offset+global_idx;"
       << "let d=" << e.GetByOffset("6u") << "/uniforms.extent_divisor;"
       << "if(d>uniforms.input_capacity||d>uniforms.output_capacity){return;}var sum:f32=0.0;"
       << "for(var t=0u;t<d;t++){sum=original_add(sum," << x.GetByOffset("global_idx*uniforms.input_capacity+t") << ");}"
@@ -139,11 +147,11 @@ class DecoderNormStyle final : public Program<DecoderNormStyle> {
       << "let shifted:f32=original_add(variance,bitcast<f32>(0x3727c5acu));let denominator:f32=original_sqrt(shifted);"
       << "var gamma_sum:f32=0.0;var beta_sum:f32=0.0;for(var k=0u;k<uniforms.features;k++){"
       << "let style_value=" << style.GetByOffset("k") << ";let gp:f32=original_mul(style_value,"
-      << w.GetByOffset("global_idx*uniforms.features+k") << ");let bp:f32=original_mul(style_value,"
-      << w.GetByOffset("(global_idx+uniforms.channels)*uniforms.features+k") << ");"
+      << w.GetByOffset("ch*uniforms.features+k") << ");let bp:f32=original_mul(style_value,"
+      << w.GetByOffset("(ch+uniforms.channels)*uniforms.features+k") << ");"
       << "gamma_sum=original_add(gamma_sum,gp);beta_sum=original_add(beta_sum,bp);}let gamma_fc:f32=original_add(gamma_sum,"
-      << b.GetByOffset("global_idx") << ");let gamma:f32=original_add(gamma_fc,1.0);let beta:f32=original_add(beta_sum,"
-      << b.GetByOffset("global_idx+uniforms.channels") << ");for(var t=0u;t<d;t++){"
+      << b.GetByOffset("ch") << ");let gamma:f32=original_add(gamma_fc,1.0);let beta:f32=original_add(beta_sum,"
+      << b.GetByOffset("ch+uniforms.channels") << ");for(var t=0u;t<d;t++){"
       << "let centered:f32=original_sub(" << x.GetByOffset("global_idx*uniforms.input_capacity+t") << ",mean);"
       << "let normalized:f32=original_div(centered,denominator);let product:f32=original_mul(gamma,normalized);let affine:f32=original_add(product,beta);"
       << "let negative:f32=original_mul(affine,bitcast<f32>(0x3e4ccccdu));"
@@ -151,52 +159,16 @@ class DecoderNormStyle final : public Program<DecoderNormStyle> {
     return Status::OK();
   }
 };
-class DecoderConv final : public Program<DecoderConv> {
+constexpr uint32_t kDecoderPoolTileChannels=64;
+class DecoderPoolTile final : public Program<DecoderPoolTile> {
  public:
-  DecoderConv(bool bias, bool nearest) : Program{"RW07DecoderResidualConvV1"}, bias_(bias), nearest_(nearest) {}
-  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
-      {"input_capacity", ProgramUniformVariableDataType::Uint32},
-      {"output_capacity", ProgramUniformVariableDataType::Uint32},
-      {"input_channels", ProgramUniformVariableDataType::Uint32},
-      {"output_channels", ProgramUniformVariableDataType::Uint32},
-      {"width", ProgramUniformVariableDataType::Uint32},
-      {"extent_divisor", ProgramUniformVariableDataType::Uint32},
-      {"final_capacity", ProgramUniformVariableDataType::Uint32},
-      {"identity", ProgramUniformVariableDataType::Uint32});
-  Status GenerateShaderCode(ShaderHelper& s) const override {
-    const auto& x = s.AddInput("x", ShaderUsage::UseValueTypeAlias);
-    const auto& w = s.AddInput("weight", ShaderUsage::UseValueTypeAlias);
-    const ShaderVariableHelper* b = bias_ ? &s.AddInput("bias", ShaderUsage::UseValueTypeAlias) : nullptr;
-    const auto& e = s.AddInput("extent", ShaderUsage::UseValueTypeAlias);
-    const auto& y = s.AddOutput("y", ShaderUsage::UseValueTypeAlias);
-    PayloadGuard(s, e);
-    OriginalArithmetic(s);
-    auto& f = s.MainFunctionBody();
-    f << "if(global_idx>=uniforms.output_channels*uniforms.output_capacity){return;}"
-      << y.SetByOffset("global_idx", "0.0") << "if(!valid_output()){return;}"
-      << "let d=" << e.GetByOffset("6u") << "/uniforms.extent_divisor;let t=global_idx%uniforms.output_capacity;"
-      << "let oc=global_idx/uniforms.output_capacity;if(t>=d){return;}var sum:f32=0.0;"
-      << "for(var ic=0u;ic<uniforms.input_channels;ic++){for(var k=0u;k<uniforms.width;k++){"
-      << "let pos=i32(t)+i32(k)-i32(uniforms.width/2u);var value:f32=0.0;"
-      << "if(pos>=0&&u32(pos)<d){let source_t=" << (nearest_ ? "u32(pos)/2u" : "u32(pos)") << ";"
-      << "if(source_t<uniforms.input_capacity){value=" << x.GetByOffset("ic*uniforms.input_capacity+source_t") << ";}}"
-      << "let product:f32=original_mul(value," << w.GetByOffset("(oc*uniforms.input_channels+ic)*uniforms.width+k")
-      << ");sum=original_add(sum,product);}}";
-    if (bias_) f << "let result:f32=original_add(sum," << b->GetByOffset("oc") << ");";
-    else f << "let result:f32=sum;";
-    f << y.SetByOffset("global_idx", "result");
-    return Status::OK();
-  }
- private:
-  const bool bias_, nearest_;
-};
-class DecoderPool final : public Program<DecoderPool> {
- public:
-  DecoderPool() : Program{"RW07DecoderResidualDepthwisePoolV1"} {}
+  DecoderPoolTile() : Program{"RW07DecoderResidualDepthwisePoolLocalChannelTileV2"} {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"input_capacity", ProgramUniformVariableDataType::Uint32},
       {"output_capacity", ProgramUniformVariableDataType::Uint32},
       {"channels", ProgramUniformVariableDataType::Uint32},
+      {"channel_offset", ProgramUniformVariableDataType::Uint32},
+      {"channel_count", ProgramUniformVariableDataType::Uint32},
       {"final_capacity", ProgramUniformVariableDataType::Uint32},
       {"identity", ProgramUniformVariableDataType::Uint32});
   Status GenerateShaderCode(ShaderHelper& s) const override {
@@ -211,27 +183,78 @@ class DecoderPool final : public Program<DecoderPool> {
     f << "if(global_idx>=uniforms.channels*uniforms.output_capacity){return;}"
       << y.SetByOffset("global_idx", "0.0") << "if(!valid_output()){return;}"
       << "let d=" << e.GetByOffset("6u") << ";let t=global_idx%uniforms.output_capacity;"
-      << "let ch=global_idx/uniforms.output_capacity;if(t>=d){return;}var sum:f32=0.0;"
+      << "let local_ch=global_idx/uniforms.output_capacity;"
+      << "if(t>=d||local_ch>=uniforms.channel_count||uniforms.channel_offset>=1090u||"
+      << "uniforms.channel_count>uniforms.channels||uniforms.channel_count>1090u-uniforms.channel_offset){return;}"
+      << "let ch=uniforms.channel_offset+local_ch;var sum:f32=0.0;"
       // Original CPU Col2im visits kernel taps in ascending order.
       << "for(var k=0u;k<3u;k++){"
       << "let numerator=i32(t)+1-i32(k);if(numerator>=0&&numerator%2==0){"
       << "let source_t=u32(numerator/2);if(source_t<d/2u&&source_t<uniforms.input_capacity){"
-      << "let product:f32=original_mul(" << x.GetByOffset("ch*uniforms.input_capacity+source_t") << ","
+      << "let product:f32=original_mul(" << x.GetByOffset("local_ch*uniforms.input_capacity+source_t") << ","
       << w.GetByOffset("ch*3u+k") << ");sum=original_add(sum,product);}}}let result:f32=original_add(sum,"
       << b.GetByOffset("ch") << ");" << y.SetByOffset("global_idx", "result");
     return Status::OK();
   }
 };
+class DecoderConvTile final : public Program<DecoderConvTile> {
+ public:
+  explicit DecoderConvTile(bool bias) : Program{"RW07DecoderResidualConvOutputWindowV3"}, bias_(bias) {}
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+      {"input_capacity", ProgramUniformVariableDataType::Uint32},
+      {"output_capacity", ProgramUniformVariableDataType::Uint32},
+      {"input_channels", ProgramUniformVariableDataType::Uint32},
+      {"output_channels", ProgramUniformVariableDataType::Uint32},
+      {"width", ProgramUniformVariableDataType::Uint32},
+      {"channel_offset", ProgramUniformVariableDataType::Uint32},
+      {"channel_count", ProgramUniformVariableDataType::Uint32},
+      {"output_offset", ProgramUniformVariableDataType::Uint32},
+      {"output_count", ProgramUniformVariableDataType::Uint32},
+      {"nearest", ProgramUniformVariableDataType::Uint32},
+      {"final_capacity", ProgramUniformVariableDataType::Uint32},
+      {"identity", ProgramUniformVariableDataType::Uint32});
+  Status GenerateShaderCode(ShaderHelper& s) const override {
+    const auto& x=s.AddInput("pool_tile",ShaderUsage::UseValueTypeAlias);
+    const auto& w=s.AddInput("weight",ShaderUsage::UseValueTypeAlias);
+    const ShaderVariableHelper* b=bias_?&s.AddInput("bias",ShaderUsage::UseValueTypeAlias):nullptr;
+    const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
+    const auto& y=s.AddOutput("accumulator",ShaderUsage::UseValueTypeAlias);
+    PayloadGuard(s,e);OriginalArithmetic(s);
+    auto& f=s.MainFunctionBody();
+    f<<"if(global_idx>=uniforms.output_count*uniforms.output_capacity){return;}"
+      <<"if(!valid_output()){ "<<y.SetByOffset("global_idx","0.0")<<"return;}"
+      <<"let d="<<e.GetByOffset("6u")<<";let t=global_idx%uniforms.output_capacity;"
+      <<"let oc=uniforms.output_offset+global_idx/uniforms.output_capacity;"
+      <<"if(t>=d||uniforms.channel_offset>=uniforms.input_channels||uniforms.channel_count==0u||"
+      <<"uniforms.channel_count>64u||uniforms.channel_count>uniforms.input_channels-uniforms.channel_offset){"
+      <<y.SetByOffset("global_idx","0.0")<<"return;}"
+      // Continue the scalar sum; summing independent tile totals would reorder it.
+      <<"var sum:f32=0.0;if(uniforms.channel_offset!=0u){sum="<<y.GetByOffset("global_idx")<<";}"
+      <<"for(var local_ic=0u;local_ic<uniforms.channel_count;local_ic++){"
+      <<"let ic=uniforms.channel_offset+local_ic;for(var k=0u;k<uniforms.width;k++){"
+      <<"let pos=i32(t)+i32(k)-i32(uniforms.width/2u);var value:f32=0.0;"
+      <<"if(pos>=0&&u32(pos)<d){let source_t=select(u32(pos),u32(pos)/2u,uniforms.nearest!=0u);"
+      <<"if(source_t<uniforms.input_capacity){value="
+      <<x.GetByOffset("local_ic*uniforms.input_capacity+source_t")<<";}}"
+      <<"let product:f32=original_mul(value,"<<w.GetByOffset("(oc*uniforms.input_channels+ic)*uniforms.width+k")
+      <<");sum=original_add(sum,product);}}";
+    if(bias_) f<<"if(uniforms.channel_offset+uniforms.channel_count==uniforms.input_channels){sum=original_add(sum,"
+               <<b->GetByOffset("oc")<<");}";
+    f<<y.SetByOffset("global_idx","sum");
+    return Status::OK();
+  }
+ private:
+  const bool bias_;
+};
 class DecoderResidualAdd final : public Program<DecoderResidualAdd> {
  public:
-  DecoderResidualAdd() : Program{"RW07DecoderResidualResidualAddV1"} {}
+  DecoderResidualAdd() : Program{"RW07DecoderResidualInPlaceResidualAddWindowV3"} {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"capacity", ProgramUniformVariableDataType::Uint32},
       {"channels", ProgramUniformVariableDataType::Uint32},
       {"final_capacity", ProgramUniformVariableDataType::Uint32},
       {"identity", ProgramUniformVariableDataType::Uint32});
   Status GenerateShaderCode(ShaderHelper& s) const override {
-    const auto& main = s.AddInput("main", ShaderUsage::UseValueTypeAlias);
     const auto& skip = s.AddInput("skip", ShaderUsage::UseValueTypeAlias);
     const auto& e = s.AddInput("extent", ShaderUsage::UseValueTypeAlias);
     const auto& y = s.AddOutput("y", ShaderUsage::UseValueTypeAlias);
@@ -239,18 +262,19 @@ class DecoderResidualAdd final : public Program<DecoderResidualAdd> {
     OriginalArithmetic(s);
     auto& f = s.MainFunctionBody();
     f << "if(global_idx>=uniforms.channels*uniforms.capacity){return;}"
-      << y.SetByOffset("global_idx", "0.0") << "if(!valid_output()){return;}"
-      << "if(global_idx%uniforms.capacity>=" << e.GetByOffset("6u") << "){return;}"
-      << "let added:f32=original_add(" << main.GetByOffset("global_idx") << "," << skip.GetByOffset("global_idx") << ");"
+      << "if(!valid_output()){ " << y.SetByOffset("global_idx", "0.0") << "return;}"
+      << "if(global_idx%uniforms.capacity>=" << e.GetByOffset("6u") << "){"
+      << y.SetByOffset("global_idx", "0.0") << "return;}"
+      << "let added:f32=original_add(" << y.GetByOffset("global_idx") << "," << skip.GetByOffset("global_idx") << ");"
       << y.SetByOffset("global_idx", "original_div(added,bitcast<f32>(0x3fb504f3u))");
     return Status::OK();
   }
 };
 Status Binding(ComputeContext& c, const Tensor* t) {
-  ORT_RETURN_IF_NOT(t && t->Location().device.Type() == OrtDevice::GPU && t->DataRaw() && t->SizeInBytes() > 0,
-                    "RW07 decoder residual missing GPU binding");
+  M0FullGpuStorageAllocationV1 allocation;
+  ORT_RETURN_IF_NOT(t&&c.M0FullGpuDescribeStorageV1(*t,allocation),"RW07 live physical storage allocation");
   const auto& limits = c.DeviceLimits();
-  const uint64_t bytes = wgpuBufferGetSize(static_cast<WGPUBuffer>(const_cast<void*>(t->DataRaw())));
+  const uint64_t bytes=allocation.backing_bytes;
   ORT_RETURN_IF_NOT(bytes >= t->SizeInBytes() && bytes <= limits.maxBufferSize && bytes <= limits.maxStorageBufferBindingSize,
                     "RW07 decoder residual whole-buffer binding limit");
   return Status::OK();
@@ -285,15 +309,25 @@ class DecoderResidual final : public WebGpuKernel {
                             b && b->IsDataType<float>() && b->Shape() == TensorShape{1090},
                         "RW07 decode3 original depthwise transpose parameters");
     }
-    for (int i = 0; i < inputs; ++i) ORT_RETURN_IF_ERROR(Binding(c, c.Input<Tensor>(i)));
+    ORT_RETURN_IF_ERROR(m0_residual_stages::PhysicalBuffer(c,x));
+    for (int i = 1; i < inputs; ++i) ORT_RETURN_IF_ERROR(Binding(c, c.Input<Tensor>(i)));
     const auto& limits = c.DeviceLimits();
-    const uint64_t max_count = std::max(ci, co) * std::max<uint64_t>(uint64_t(x->Shape()[2]), uint64_t(capacity_));
+    const uint32_t cap=uint32_t(capacity_),in_cap=uint32_t(x->Shape()[2]),norm_cap=std::max(in_cap,cap);
+    const uint64_t full_count=uint64_t(co)*cap;
     const uint64_t limit = limits.maxComputeWorkgroupsPerDimension;
+    const uint64_t alignment = limits.minStorageBufferOffsetAlignment;
+    ORT_RETURN_IF_NOT(alignment > 0 && alignment % sizeof(float) == 0 &&
+                          uint64_t(kDecoderPoolTileChannels)*std::max<uint64_t>(uint64_t(x->Shape()[2]),uint64_t(capacity_))*sizeof(float) + alignment - sizeof(float) <=
+                              limits.maxStorageBufferBindingSize, "RW07 decoder input window binding limit");
     ORT_RETURN_IF_NOT(limits.maxStorageBuffersPerShaderStage >= 6 && limits.maxComputeWorkgroupSizeX >= 64 &&
-                          limits.maxComputeInvocationsPerWorkgroup >= 64 && limit >= 18 && max_count <= UINT32_MAX &&
-                          (max_count + 63) / 64 <= limit * limit && max_count * sizeof(float) <= limits.maxBufferSize &&
-                          max_count * sizeof(float) <= limits.maxStorageBufferBindingSize,
+                          limits.maxComputeInvocationsPerWorkgroup >= 64 && limit >= 18 && full_count <= UINT32_MAX &&
+                          full_count * sizeof(float) <= limits.maxBufferSize,
                       "RW07 decoder scratch and dispatch resource limits");
+    const uint64_t prefix=alignment-sizeof(float),row_bytes=uint64_t(cap)*sizeof(float);
+    ORT_RETURN_IF_NOT(row_bytes+prefix<=limits.maxStorageBufferBindingSize,"RW07 decoder output row binding limit");
+    const uint32_t output_tile=uint32_t(std::min<uint64_t>(co,(limits.maxStorageBufferBindingSize-prefix)/row_bytes));
+    const uint64_t max_count=std::max<uint64_t>(uint64_t(kDecoderPoolTileChannels)*norm_cap,uint64_t(output_tile)*cap);
+    ORT_RETURN_IF_NOT(output_tile>0&&(max_count+63)/64<=limit*limit,"RW07 decoder actual window grid limit");
     const uint64_t session = c.KernelContext().M0FullGpuExtentOwnerEpochV1(), run = c.KernelContext().M0FullGpuExtentRunIdV2();
     M0FullGpuAllocationIdentity sid, data, pair, output;
     ORT_RETURN_IF_NOT(session && run && c.M0FullGpuDescribeResourceV2(*e, sid) &&
@@ -305,11 +339,68 @@ class DecoderResidual final : public WebGpuKernel {
                         pair.producer_role == sr && pair.producer_instance == si;
     auto* y = c.Output(0, TensorShape{1, co, capacity_}); auto* out = c.Output(1, TensorShape{32});
     ORT_RETURN_IF_NOT(y && y->IsDataType<float>() && out && out->IsDataType<uint32_t>(), "RW07 decoder output types");
-    ORT_RETURN_IF_ERROR(Binding(c, y)); ORT_RETURN_IF_ERROR(Binding(c, out));
+    ORT_RETURN_IF_ERROR(m0_residual_stages::PhysicalBuffer(c,y)); ORT_RETURN_IF_ERROR(Binding(c,out));
     ORT_RETURN_IF_NOT(y->DataRaw() != out->DataRaw(), "RW07 decoder distinct outputs");
     for (int i = 0; i < inputs; ++i) {
       const auto* t = c.Input<Tensor>(i);
       ORT_RETURN_IF_NOT(t->DataRaw() != y->DataRaw() && t->DataRaw() != out->DataRaw(), "RW07 decoder input/output alias");
+    }
+    auto main=c.CreateGPUTensor(x->DataType(),TensorShape{1,co,cap});
+    auto normalized=c.CreateGPUTensor(x->DataType(),TensorShape{1,kDecoderPoolTileChannels,norm_cap});
+    std::optional<Tensor> pool;
+    if(block_==4)pool.emplace(c.CreateGPUTensor(x->DataType(),TensorShape{1,kDecoderPoolTileChannels,cap}));
+    const auto distinct=[&](const Tensor& t,gsl::span<const Tensor* const> live)->Status{
+      ORT_RETURN_IF_ERROR(m0_residual_stages::PhysicalBuffer(c,&t));
+      for(int i=0;i<inputs;++i)ORT_RETURN_IF_NOT(t.DataRaw()!=c.Input<Tensor>(i)->DataRaw(),"RW07 decoder scratch/input alias");
+      ORT_RETURN_IF_NOT(t.DataRaw()!=y->DataRaw()&&t.DataRaw()!=out->DataRaw(),"RW07 decoder scratch/output alias");
+      for(const auto* p:live)ORT_RETURN_IF_NOT(t.DataRaw()!=p->DataRaw(),"RW07 decoder live scratch alias");
+      return Status::OK();
+    };
+    ORT_RETURN_IF_ERROR(distinct(main,{}));
+    const std::array<const Tensor*,1> live1{&main};ORT_RETURN_IF_ERROR(distinct(normalized,live1));
+    if(pool){const std::array<const Tensor*,2> live2{&main,&normalized};ORT_RETURN_IF_ERROR(distinct(*pool,live2));}
+    const auto window=[&](const Tensor* src,uint32_t offset,uint32_t count){
+      return ProgramInput::FloatBufferWindow(src,ProgramTensorMetadataDependency::None,
+          TensorShape{1,count,src->Shape()[2]},offset*uint32_t(src->Shape()[2]),uint32_t(alignment));
+    };
+    const auto output_window=[&](Tensor* dst,uint32_t offset,uint32_t count){
+      return ProgramOutput::FloatBufferWindow(dst,ProgramTensorMetadataDependency::None,
+          TensorShape{1,count,cap},offset*cap,uint32_t(alignment));
+    };
+    ORT_RETURN_IF_ERROR(m0_residual_stages::StorageBudget(c,{e,out}));
+    const auto admit_norm=[&](const Tensor* src,int wi)->Status{
+      for(uint32_t offset=0;offset<uint32_t(src->Shape()[1]);offset+=kDecoderPoolTileChannels){
+        const uint32_t count=std::min(kDecoderPoolTileChannels,uint32_t(src->Shape()[1])-offset);
+        ORT_RETURN_IF_ERROR(m0_residual_stages::StorageBudgetWithWindow(c,window(src,offset,count),
+            {out,style,c.Input<Tensor>(wi),c.Input<Tensor>(wi+1),&normalized}));
+      }
+      return Status::OK();
+    };
+    const auto admit_conv=[&](const Tensor* src,Tensor* dst,int wi,int bi,uint32_t channels,bool tiled_input)->Status{
+      for(uint32_t offset=0;offset<channels;offset+=kDecoderPoolTileChannels){
+        const uint32_t count=std::min(kDecoderPoolTileChannels,channels-offset);
+        for(uint32_t o=0;o<co;o+=output_tile){
+          const auto output_view=output_window(dst,o,std::min(output_tile,co-o));
+          if(tiled_input){
+            ORT_RETURN_IF_ERROR(m0_residual_stages::StorageBudgetWithWindows(c,window(src,offset,count),output_view,
+                {c.Input<Tensor>(wi),out}));
+          }else{
+            ORT_RETURN_IF_ERROR(m0_residual_stages::StorageBudgetWithWindow(c,output_view,
+                {src,c.Input<Tensor>(wi),c.Input<Tensor>(bi),out}));
+          }
+        }
+      }
+      return Status::OK();
+    };
+    ORT_RETURN_IF_ERROR(admit_norm(x,3));
+    if(pool)ORT_RETURN_IF_ERROR(m0_residual_stages::StorageBudget(c,{&normalized,c.Input<Tensor>(12),c.Input<Tensor>(13),out,&*pool}));
+    ORT_RETURN_IF_ERROR(admit_conv(pool?&*pool:&normalized,&main,5,6,ci,false));
+    ORT_RETURN_IF_ERROR(admit_norm(&main,7));
+    ORT_RETURN_IF_ERROR(admit_conv(&normalized,y,9,10,co,false));
+    ORT_RETURN_IF_ERROR(admit_conv(x,&main,11,-1,ci,true));
+    for(uint32_t o=0;o<co;o+=output_tile){
+      const uint32_t count=std::min(output_tile,co-o);
+      ORT_RETURN_IF_ERROR(m0_residual_stages::StorageBudgetWithWindows(c,window(&main,o,count),output_window(y,o,count),{out}));
     }
     ORT_RETURN_IF_NOT(c.M0FullGpuClaimExtentV2(*out, *y, role, instance, output), "RW07 decoder output claim");
     const m0_extent_abi2::OpaqueOwnership source{session,run,sid.generation,data.generation,sr,si};
@@ -317,75 +408,87 @@ class DecoderResidual final : public WebGpuKernel {
     ORT_RETURN_IF_NOT(source.Valid() && owner.Valid(), "RW07 decoder opaque ownership");
     const auto sw = source.UniformWords(), words = owner.UniformWords();
     const auto span = [](const auto& a) { return gsl::span<const uint32_t>{a.data(),a.size()}; };
-    const uint32_t cap = uint32_t(capacity_), in_cap = uint32_t(x->Shape()[2]);
     DecoderGuard guard;
     guard.AddInput(Words(e)).AddOutput(Words(out)).SetWorkgroupSize(1).SetDispatchGroupSize(1)
         .AddUniformVariables({in_cap,cap,uint32_t(paired),ci,scale,span(sw),span(words)});
     ORT_RETURN_IF_ERROR(c.RunProgram(guard));
-    const auto scratch = [&](int64_t channels, int64_t capacity) {
-      return c.CreateGPUTensor(x->DataType(),TensorShape{1,channels,capacity});
-    };
-    const auto distinct = [&](const Tensor& t, gsl::span<const Tensor* const> live) -> Status {
-      ORT_RETURN_IF_ERROR(Binding(c,&t));
-      for (int i=0;i<inputs;++i) ORT_RETURN_IF_NOT(t.DataRaw()!=c.Input<Tensor>(i)->DataRaw(),"RW07 decoder scratch/input alias");
-      ORT_RETURN_IF_NOT(t.DataRaw()!=y->DataRaw() && t.DataRaw()!=out->DataRaw(),"RW07 decoder scratch/output alias");
-      for(const auto* p:live) ORT_RETURN_IF_NOT(t.DataRaw()!=p->DataRaw(),"RW07 decoder live scratch alias");
-      return Status::OK();
-    };
     const auto dispatch = [&](auto& p, uint64_t count) -> Status {
       const uint64_t groups=(count+63)/64, gx=std::min(groups,limit),gy=(groups+gx-1)/gx;
       p.SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy));return c.RunProgram(p);
     };
-    const auto norm = [&](const Tensor* src, Tensor* dst, int wi, uint32_t divisor) -> Status {
+    const auto norm = [&](const Tensor* src, Tensor* dst, int wi, uint32_t divisor,
+                          uint32_t offset, uint32_t count) -> Status {
       DecoderNormStyle p;
-      p.AddInputs({{src,ProgramTensorMetadataDependency::None},Words(static_cast<const Tensor*>(out)),
+      p.AddInput(window(src,offset,count));
+      p.AddInputs({Words(static_cast<const Tensor*>(out)),
                    {style,ProgramTensorMetadataDependency::None},{c.Input<Tensor>(wi),ProgramTensorMetadataDependency::None},
                    {c.Input<Tensor>(wi+1),ProgramTensorMetadataDependency::None}})
           .AddOutput({dst,ProgramTensorMetadataDependency::None})
-          .AddUniformVariables({uint32_t(src->Shape()[2]),uint32_t(dst->Shape()[2]),uint32_t(src->Shape()[1]),128u,divisor,cap,span(words)});
-      return dispatch(p,uint64_t(src->Shape()[1]));
+          .AddUniformVariables({uint32_t(src->Shape()[2]),uint32_t(dst->Shape()[2]),uint32_t(src->Shape()[1]),128u,divisor,
+                                offset,count,uint32_t(dst->Shape()[1]),cap,span(words)});
+      return dispatch(p,uint64_t(dst->Shape()[1]));
     };
-    const auto conv = [&](const Tensor* src, Tensor* dst, int wi, int bi, uint32_t width, bool nearest) -> Status {
-      DecoderConv p{bi>=0,nearest};p.CacheHint(bi>=0?"bias":"no-bias",nearest?"nearest":"direct");
-      p.AddInputs({{src,ProgramTensorMetadataDependency::None},{c.Input<Tensor>(wi),ProgramTensorMetadataDependency::None}});
-      if(bi>=0)p.AddInput({c.Input<Tensor>(bi),ProgramTensorMetadataDependency::None});
-      p.AddInput(Words(static_cast<const Tensor*>(out))).AddOutput({dst,ProgramTensorMetadataDependency::None})
-          .AddUniformVariables({uint32_t(src->Shape()[2]),uint32_t(dst->Shape()[2]),uint32_t(src->Shape()[1]),
-                                uint32_t(dst->Shape()[1]),width,1u,cap,span(words)});
-      return dispatch(p,uint64_t(dst->Shape().Size()));
+    const auto conv_tile = [&](const Tensor* src, Tensor* dst, int wi, int bi, uint32_t total_channels, uint32_t offset,
+                               uint32_t count, uint32_t width, bool nearest, bool tiled_input) -> Status {
+      for(uint32_t o=0;o<co;o+=output_tile){
+        const uint32_t output_count=std::min(output_tile,co-o);
+        DecoderConvTile p{bi>=0};p.CacheHint(bi>=0?"bias":"no-bias");
+        p.AddInput(tiled_input?window(src,offset,count):ProgramInput{src,ProgramTensorMetadataDependency::None});
+        p.AddInput({c.Input<Tensor>(wi),ProgramTensorMetadataDependency::None});
+        if(bi>=0)p.AddInput({c.Input<Tensor>(bi),ProgramTensorMetadataDependency::None});
+        p.AddInput(Words(static_cast<const Tensor*>(out))).AddOutput(output_window(dst,o,output_count))
+            .AddUniformVariables({uint32_t(src->Shape()[2]),cap,total_channels,co,width,offset,count,o,output_count,
+                                  uint32_t(nearest),cap,span(words)});
+        ORT_RETURN_IF_ERROR(dispatch(p,uint64_t(output_count)*cap));
+      }
+      return Status::OK();
     };
-    auto skip=scratch(co,cap);ORT_RETURN_IF_ERROR(distinct(skip,{}));
-    ORT_RETURN_IF_ERROR(conv(x,&skip,11,-1,1,block_==4));
-    auto main=scratch(co,cap);
-    const std::array<const Tensor*,1> live1{&skip};ORT_RETURN_IF_ERROR(distinct(main,live1));
-    {
-      auto n1=scratch(ci,in_cap);
-      const std::array<const Tensor*,2> live2{&skip,&main};ORT_RETURN_IF_ERROR(distinct(n1,live2));
-      ORT_RETURN_IF_ERROR(norm(x,&n1,3,scale));
-      if(block_==4){
-        auto pool=scratch(ci,cap);
-        const std::array<const Tensor*,3> live3{&skip,&main,&n1};ORT_RETURN_IF_ERROR(distinct(pool,live3));
-        DecoderPool p;
-        p.AddInputs({{&n1,ProgramTensorMetadataDependency::None},{c.Input<Tensor>(12),ProgramTensorMetadataDependency::None},
-                     {c.Input<Tensor>(13),ProgramTensorMetadataDependency::None},Words(static_cast<const Tensor*>(out))})
-            .AddOutput({&pool,ProgramTensorMetadataDependency::None}).AddUniformVariables({in_cap,cap,ci,cap,span(words)});
-        ORT_RETURN_IF_ERROR(dispatch(p,uint64_t(pool.Shape().Size())));
-        ORT_RETURN_IF_ERROR(conv(&pool,&main,5,6,3,false));
-      }else{ORT_RETURN_IF_ERROR(conv(&n1,&main,5,6,3,false));}
+    if(block_==4){
+        for(uint32_t offset=0;offset<ci;offset+=kDecoderPoolTileChannels){
+          const uint32_t count=std::min(kDecoderPoolTileChannels,ci-offset);
+          ORT_RETURN_IF_ERROR(norm(x,&normalized,3,scale,offset,count));
+          DecoderPoolTile p;
+          p.AddInputs({{&normalized,ProgramTensorMetadataDependency::None},{c.Input<Tensor>(12),ProgramTensorMetadataDependency::None},
+                       {c.Input<Tensor>(13),ProgramTensorMetadataDependency::None},Words(static_cast<const Tensor*>(out))})
+              .AddOutput({&*pool,ProgramTensorMetadataDependency::None})
+              .AddUniformVariables({norm_cap,cap,kDecoderPoolTileChannels,offset,count,cap,span(words)});
+          ORT_RETURN_IF_ERROR(dispatch(p,uint64_t(pool->Shape().Size())));
+          ORT_RETURN_IF_ERROR(conv_tile(&*pool,&main,5,6,ci,offset,count,3,false,false));
+        }
+    }else{
+        for(uint32_t offset=0;offset<ci;offset+=kDecoderPoolTileChannels){
+          const uint32_t count=std::min(kDecoderPoolTileChannels,ci-offset);
+          ORT_RETURN_IF_ERROR(norm(x,&normalized,3,scale,offset,count));
+          ORT_RETURN_IF_ERROR(conv_tile(&normalized,&main,5,6,ci,offset,count,3,false,false));
+        }
     }
-    auto n2=scratch(co,cap);
-    const std::array<const Tensor*,2> live2{&skip,&main};ORT_RETURN_IF_ERROR(distinct(n2,live2));
-    ORT_RETURN_IF_ERROR(norm(&main,&n2,7,1));
-    auto convolved=scratch(co,cap);
-    const std::array<const Tensor*,3> live3{&skip,&main,&n2};ORT_RETURN_IF_ERROR(distinct(convolved,live3));
-    ORT_RETURN_IF_ERROR(conv(&n2,&convolved,9,10,3,false));
-    DecoderResidualAdd add;
-    add.AddInputs({{&convolved,ProgramTensorMetadataDependency::None},{&skip,ProgramTensorMetadataDependency::None},
-                   Words(static_cast<const Tensor*>(out))}).AddOutput({y,ProgramTensorMetadataDependency::None})
-        .AddUniformVariables({cap,co,cap,span(words)});
-    ORT_RETURN_IF_ERROR(dispatch(add,uint64_t(y->Shape().Size())));
+    // Keep main immutable until every channel has been normalized and consumed.
+    for(uint32_t offset=0;offset<co;offset+=kDecoderPoolTileChannels){
+      const uint32_t count=std::min(kDecoderPoolTileChannels,co-offset);
+      ORT_RETURN_IF_ERROR(norm(&main,&normalized,7,1,offset,count));
+      ORT_RETURN_IF_ERROR(conv_tile(&normalized,y,9,10,co,offset,count,3,false,false));
+    }
+    // All readers of the first convolution precede these writes on the queue.
+    for(uint32_t offset=0;offset<ci;offset+=kDecoderPoolTileChannels){
+      const uint32_t count=std::min(kDecoderPoolTileChannels,ci-offset);
+      ORT_RETURN_IF_ERROR(conv_tile(x,&main,11,-1,ci,offset,count,1,block_==4,true));
+    }
+    for(uint32_t o=0;o<co;o+=output_tile){
+      const uint32_t count=std::min(output_tile,co-o);
+      DecoderResidualAdd add;
+      add.AddInput(window(&main,o,count)).AddInput(Words(static_cast<const Tensor*>(out)))
+          .AddOutput(output_window(y,o,count)).AddUniformVariables({cap,count,cap,span(words)});
+      ORT_RETURN_IF_ERROR(dispatch(add,uint64_t(count)*cap));
+    }
+    const uint64_t output_tiles=(uint64_t(co)+output_tile-1)/output_tile;
+    const uint64_t first_tiles=(uint64_t(ci)+kDecoderPoolTileChannels-1)/kDecoderPoolTileChannels;
+    const uint64_t second_tiles=(uint64_t(co)+kDecoderPoolTileChannels-1)/kDecoderPoolTileChannels;
     LOGS(c.Logger(),INFO)<<"M0_RW07_DECODER_RESIDUAL_V1 block="<<block_<<" role="<<role<<" source_pair_valid="<<paired
-                        <<" GPU_dispatches="<<(block_==4?8:7)<<" host_payload_reads=0";
+                        <<" GPU_dispatches="<<1+first_tiles*(1+(block_==4?1:0)+2*output_tiles)
+                            +second_tiles*(1+output_tiles)+output_tiles
+                        <<" input_tile_channels="<<kDecoderPoolTileChannels
+                        <<" output_tile_channels="<<output_tile
+                        <<" pool_tile_channels="<<(block_==4?kDecoderPoolTileChannels:0)<<" host_payload_reads=0";
     return Status::OK();
   }
  private:
