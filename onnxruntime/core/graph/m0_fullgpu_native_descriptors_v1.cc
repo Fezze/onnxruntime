@@ -5,7 +5,9 @@
 #if !defined(ORT_MINIMAL_BUILD)
 #include <algorithm>
 #include "core/common/common.h"
+#include "core/common/logging/logging.h"
 #include "core/graph/model.h"
+#include "core/graph/m0_bounded_backing_v1.h"
 #include "onnx/defs/schema.h"
 #include "sha256.h"
 #include "core/session/plugin_ep/m0_native_kernel_binding_v2.h"
@@ -33,7 +35,35 @@ common::Status M0FullGpuNativeLoweringOwnerV1::Callback(M0CallbackPolicyV1::Chan
 void M0FullGpuNativeLoweringOwnerV1::ResolveExecutionModel(const logging::Logger& logger){
  ORT_ENFORCE(phase_==Phase::Dormant&&!execution_model_&&source_,"RW07 native descriptor construction reuse");
  try{
-  ONNX_NAMESPACE::ModelProto proto=derived_;
+  ORT_ENFORCE(!initializer_payloads_transferred_&&
+   initializer_sources_.size()==size_t(derived_.graph().initializer_size()),
+   "RW07_NATIVE_INITIALIZER_TRANSFER_REUSE");
+  LOGS(logger,INFO)<<"M0_RW07_NATIVE_INITIALIZER_TRANSFER_BEGIN";
+  ONNX_NAMESPACE::ModelProto proto;
+  proto.Swap(&derived_);
+  google::protobuf::RepeatedPtrField<ONNX_NAMESPACE::TensorProto> payloads;
+  payloads.Swap(proto.mutable_graph()->mutable_initializer());
+  derived_.CopyFrom(proto);
+  for(auto& tensor:payloads){
+   const auto found=initializer_sources_.find(tensor.name());
+   ORT_ENFORCE(found!=initializer_sources_.end()&&found->second.first&&!found->second.second&&
+    m0_internal::M0SameInlineInitializerV1(*found->second.first,tensor),
+    "RW07_NATIVE_INITIALIZER_TRANSFER_SOURCE");
+   // Copy metadata while the large raw string is held locally, then restore it
+   // to the execution tensor. No second raw allocation or shared mutable string.
+   std::string raw;
+   const bool has_raw=tensor.has_raw_data();
+   if(has_raw)raw.swap(*tensor.mutable_raw_data());
+   transferred_initializer_raw_bytes_+=raw.size();
+   auto* metadata=derived_.mutable_graph()->add_initializer();
+   metadata->CopyFrom(tensor);
+   if(has_raw)raw.swap(*tensor.mutable_raw_data());
+   found->second.second=metadata;
+  }
+  payloads.Swap(proto.mutable_graph()->mutable_initializer());
+  initializer_payloads_transferred_=true;
+  LOGS(logger,INFO)<<"M0_RW07_NATIVE_INITIALIZER_TRANSFER_END retained_derived_raw_bytes=0 transferred_raw_bytes="
+   <<transferred_initializer_raw_bytes_;
   const auto& source=source_->MainGraph();
   const auto* tokens=source.GetNodeArg("tokens");
   ORT_ENFORCE(tokens&&tokens->TypeAsProto()&&tokens->TypeAsProto()->has_tensor_type()&&
@@ -246,8 +276,10 @@ void M0FullGpuNativeLoweringOwnerV1::ValidateExecutionModel(){
  }
  for(const auto& row:descriptors_)ORT_ENFORCE(row.second.checked&&row.second.selected&&row.second.inferred&&row.second.propagated&&row.second.published,"RW07 native incomplete descriptor callbacks");
  const auto& init=graph.GetAllInitializedTensors();ORT_ENFORCE(init.size()==size_t(derived_.graph().initializer_size()),"RW07 native initializer inventory");
- for(const auto& expected:derived_.graph().initializer()){
-  const auto actual=init.find(expected.name());ORT_ENFORCE(actual!=init.end()&&actual->second&&actual->second->SerializeAsString()==expected.SerializeAsString(),"RW07 native immutable execution initializer");
+ for(const auto& metadata:derived_.graph().initializer()){
+  const auto& expected=ExpectedInitializer(metadata);
+  const auto actual=init.find(metadata.name());ORT_ENFORCE(actual!=init.end()&&actual->second&&
+   m0_internal::M0SameInlineInitializerV1(*actual->second,expected),"RW07 native immutable execution initializer");
  }
  for(size_t i=0;i<3;++i)ORT_ENFORCE(graph.GetInputs()[i]->Name()==source_->MainGraph().GetInputs()[i]->Name()&&graph.GetInputs()[i]->TypeAsProto()->SerializeAsString()==source_->MainGraph().GetInputs()[i]->TypeAsProto()->SerializeAsString(),"RW07 native retained original external contract");
  ORT_ENFORCE(execution_sha256_.empty()||ExecutionFingerprint()==execution_sha256_,"RW07 native resolved graph fingerprint drift");

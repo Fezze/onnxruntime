@@ -77,6 +77,26 @@ M0NativeResourceBindingV3 M0NativeGpuModuleV2::Resource(uintptr_t handle,uint64_
   "RW07_NATIVE_RESOURCE_ACTUAL_ALLOCATION");
  return actual;
 }
+InlinedVector<M0NativeResourceBindingV3> M0NativeGpuModuleV2::Resources(
+ gsl::span<const std::pair<uintptr_t,uint64_t>> queries)const{
+ // One bounded, read-only observation, not a lease retained across uploads,
+ // allocations, kernel construction, dispatch or Run boundaries.
+ ValidateCurrent();
+ auto batch=module_->NativeResourcesV3(queries);
+ ORT_ENFORCE(ContextOnly(batch.before)&&ContextOnly(batch.after)&&
+  SameContext(context_,batch.before)&&SameContext(context_,batch.after)&&
+  batch.resources.size()==queries.size(),"RW07_NATIVE_RESOURCE_BATCH_CONTEXT");
+ for(size_t i=0;i<queries.size();++i){
+  const auto& actual=batch.resources[i];const auto& query=queries[i];
+  ORT_ENFORCE(SameContext(context_,actual),"RW07_NATIVE_RESOURCE_FOREIGN_CONTEXT");
+  ORT_ENFORCE(query.first&&query.second&&actual.handle==query.first&&actual.generation&&
+   actual.requested_bytes>=query.second&&actual.backing_bytes>=actual.requested_bytes&&
+   actual.backing_bytes<=actual.max_buffer_bytes&&actual.storage==1&&
+   actual.copy_source<=1&&actual.copy_destination<=1,"RW07_NATIVE_RESOURCE_ACTUAL_ALLOCATION");
+ }
+ ValidateCurrent();
+ return std::move(batch.resources);
+}
 M0NativeDeviceLimitsV1 M0NativeGpuModuleV2::DeviceLimits(
  uint64_t storage_bytes,uint64_t initializer_bytes,uint64_t uniform_bytes)const{
  ValidateCurrent();

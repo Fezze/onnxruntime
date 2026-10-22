@@ -84,7 +84,8 @@ static common::Status DeserializeTensorProto(const Env& env, const std::basic_st
                                              OrtValue& ort_value, const DataTransferManager& data_transfer_mgr,
                                              const ExternalDataLoaderManager& external_data_loader_mgr,
                                              PrepackedWeightsForGraph& prepacked_for_graph,
-                                             bool use_device_allocator_for_initializers = false) {
+                                             bool use_device_allocator_for_initializers = false,
+                                             bool borrow_m0_inline_raw = false) {
   if (alloc != nullptr && memory_buffer != nullptr) {
     return Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT,
                   "DeserializeTensorProto() takes either pre-allocated buffer or an allocator!");
@@ -196,6 +197,24 @@ static common::Status DeserializeTensorProto(const Env& env, const std::basic_st
       // use_device_allocator_for_initializers
       ORT_RETURN_IF_ERROR(AllocateTensor(memory_buffer, tensor, type, tensor_shape,
                                          use_device_allocator_for_initializers, alloc));
+
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+      const auto dtype = tensor_proto.data_type();
+      if (borrow_m0_inline_raw && tensor_proto.has_raw_data() &&
+          (dtype == ONNX_NAMESPACE::TensorProto::FLOAT || dtype == ONNX_NAMESPACE::TensorProto::INT64 ||
+           dtype == ONNX_NAMESPACE::TensorProto::INT32)) {
+        ORT_RETURN_IF_NOT(tensor_proto.raw_data().size() == tensor.SizeInBytes(),
+                          "RW07_NATIVE_INLINE_UPLOAD_RAW_SIZE");
+        // The strict owner authenticated this retained protobuf before entry.
+        // WebGPU Upload snapshots every chunk synchronously; neither the CPU
+        // Tensor nor an asynchronous command borrows its data after this call.
+        const Tensor source_view(type, tensor_shape, const_cast<char*>(tensor_proto.raw_data().data()),
+                                 default_cpu_alloc->Info());
+        return CopyTensorFromCPUToDevice(data_transfer_mgr, source_view, std::move(tensor), ort_value);
+      }
+#else
+      ORT_UNUSED_PARAMETER(borrow_m0_inline_raw);
+#endif
 
       // deserialize to CPU first for non-CPU allocator, then copy
       // for internal initializer
@@ -526,7 +545,7 @@ common::Status SaveInitializedTensors(
                                            (memory_buffer.has_value()) ? &*memory_buffer : nullptr,
                                            alloc, default_cpu_alloc, ort_value, data_transfer_mgr,
                                            external_data_loader_mgr, prepacked_for_graph,
-                                           use_device_allocator_for_initializers);
+                                           use_device_allocator_for_initializers, m0_native_state != nullptr);
         if (!st.IsOK()) {
           std::ostringstream oss;
           oss << "Deserialize tensor " << name << " failed." << st.ErrorMessage();

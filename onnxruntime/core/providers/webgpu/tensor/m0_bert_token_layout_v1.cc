@@ -58,7 +58,7 @@ class Embedding final : public Program<Embedding> {
   Status GenerateShaderCode(ShaderHelper& s) const override {
     const auto& tokens = s.AddInput("tokens", ShaderUsage::UseValueTypeAlias);
     const auto& word = s.AddInput("word", ShaderUsage::UseValueTypeAlias);
-    const auto& type = s.AddInput("type", ShaderUsage::UseValueTypeAlias);
+    const auto& type_embedding = s.AddInput("type_embedding", ShaderUsage::UseValueTypeAlias);
     const auto& position = s.AddInput("position", ShaderUsage::UseValueTypeAlias);
     const auto& types = s.AddInput("types", ShaderUsage::UseValueTypeAlias);
     const auto& positions = s.AddInput("positions", ShaderUsage::UseValueTypeAlias);
@@ -69,7 +69,7 @@ class Embedding final : public Program<Embedding> {
       << "if(" << status.GetByOffset("0u") << "!=0u){return;}let t=global_idx/128u;let channel=global_idx%128u;"
       << "let token=" << tokens.GetByOffset("2u*t") << ";let type_id=" << types.GetByOffset("2u*t")
       << ";let position_id=" << positions.GetByOffset("2u*t") << ";"
-      << "let first=" << word.GetByOffset("token*128u+channel") << "+" << type.GetByOffset("type_id*128u+channel")
+      << "let first=" << word.GetByOffset("token*128u+channel") << "+" << type_embedding.GetByOffset("type_id*128u+channel")
       << ";let second=first+" << position.GetByOffset("position_id*128u+channel") << ";"
       << out.SetByOffset("global_idx", "second");
     return Status::OK();

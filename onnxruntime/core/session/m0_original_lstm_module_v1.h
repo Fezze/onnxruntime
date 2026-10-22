@@ -3,6 +3,9 @@
 #pragma once
 #include <memory>
 #include <array>
+#include <utility>
+#include "core/common/inlined_containers.h"
+#include "gsl/span"
 #include "core/session/plugin_ep/m0_native_kernel_binding_v2.h"
 #include "core/session/plugin_ep/m0_native_resource_binding_v3.h"
 #include "core/session/plugin_ep/m0_native_device_limits_v1.h"
@@ -41,6 +44,11 @@ class M0OriginalLstmModuleV1 final {
   std::array<M0NativeProviderKernelBindingV2,42> NativeBindingsV2() const;
   M0NativeDeviceLimitsV1 NativeDeviceLimitsV1(uint64_t storage_bytes,uint64_t initializer_bytes,uint64_t uniform_bytes) const;
   M0NativeResourceBindingV3 NativeResourceV3(uintptr_t handle,uint64_t required_bytes) const;
+  struct NativeResourceBatchV3 {
+    M0NativeResourceBindingV3 before, after;
+    InlinedVector<M0NativeResourceBindingV3> resources;
+  };
+  NativeResourceBatchV3 NativeResourcesV3(gsl::span<const std::pair<uintptr_t,uint64_t>> queries) const;
   std::unique_ptr<Impl> impl_;
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(M0OriginalLstmModuleV1);
 };

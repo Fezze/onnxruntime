@@ -42,11 +42,13 @@ inline bool FixedUnsignedLess(std::string_view a, std::string_view b) {
   });
 }
 
-struct FixedWireRecord {
+template <typename Payload>
+struct FixedWireRecordStorage {
   const Rw07KnownWireField* field;
   int wire_type;
-  std::string payload;
+  Payload payload;
 };
+using FixedWireRecord = FixedWireRecordStorage<std::string>;
 
 inline const Rw07KnownWireField& FixedField(int message_id, uint64_t number) {
   ORT_ENFORCE(message_id >= 0 && static_cast<size_t>(message_id) < std::size(kRw07KnownWireMessages),
@@ -67,10 +69,11 @@ inline void FixedCheckEnum(const Rw07KnownWireField& field, uint64_t value) {
   ORT_THROW("RW07_WIRE_UNKNOWN_ENUM");
 }
 
-inline InlinedVector<FixedWireRecord> FixedRecords(std::string_view bytes, int message_id) {
+template <typename Payload>
+inline InlinedVector<FixedWireRecordStorage<Payload>> FixedRecordsAs(std::string_view bytes, int message_id) {
   size_t pos = 0;
   InlinedHashSet<int> singular, oneofs;
-  InlinedVector<FixedWireRecord> records;
+  InlinedVector<FixedWireRecordStorage<Payload>> records;
   while (pos < bytes.size()) {
     const auto tag = ReadFixedVarint(bytes, pos);
     const auto& field = FixedField(message_id, tag >> 3);
@@ -100,53 +103,68 @@ inline InlinedVector<FixedWireRecord> FixedRecords(std::string_view bytes, int m
         }
       }
       pos += static_cast<size_t>(length);
-      records.push_back({&field, wire, std::string(payload)});
+      records.push_back({&field, wire, Payload(payload)});
       continue;
     }
-    records.push_back({&field, wire, std::string(bytes.substr(start, pos - start))});
+    records.push_back({&field, wire, Payload(bytes.substr(start, pos - start))});
   }
   return records;
 }
 
+inline InlinedVector<FixedWireRecord> FixedRecords(std::string_view bytes, int message_id) {
+  return FixedRecordsAs<std::string>(bytes, message_id);
+}
+
 inline std::string FixedKey(std::string_view bytes, int message_id, std::string_view name) {
-  for (const auto& record : FixedRecords(bytes, message_id)) {
-    if (record.field->name == name) return record.payload;
+  for (const auto& record : FixedRecordsAs<std::string_view>(bytes, message_id)) {
+    if (record.field->name == name) return std::string(record.payload);
   }
   return {};
 }
 
-// Only unique unordered attributes/imports are sorted. Nodes, ports and dims keep order.
-inline std::string FixedCanonicalWire(std::string_view bytes, int message_id, size_t depth = 0) {
-  ORT_ENFORCE(depth < 32, "RW07_WIRE_DEPTH");
-  auto records = FixedRecords(bytes, message_id);
-  const std::string_view message = kRw07KnownWireMessages[message_id].name;
+// Share key admission between canonical output and the allocation-light size scan.
+struct FixedWireKeys {
+  const std::string_view message;
   InlinedHashSet<std::string> attrs, imports, values, nodes;
-  for (auto& record : records) {
-    const auto& field = *record.field;
-    if (field.child_message_id >= 0) {
-      record.payload = FixedCanonicalWire(record.payload, field.child_message_id, depth + 1);
-    }
+  explicit FixedWireKeys(int message_id) : message(kRw07KnownWireMessages[message_id].name) {}
+
+  void Check(const Rw07KnownWireField& field, std::string_view payload) {
     if (message == "onnx.NodeProto" && std::string_view(field.name) == "attribute") {
-      auto key = FixedKey(record.payload, field.child_message_id, "name");
+      auto key = FixedKey(payload, field.child_message_id, "name");
       ORT_ENFORCE(!key.empty() && attrs.insert(key).second, "RW07_WIRE_ATTRIBUTE_KEY");
     }
     if ((message == "onnx.ModelProto" || message == "onnx.FunctionProto") &&
         std::string_view(field.name) == "opset_import") {
-      auto key = FixedKey(record.payload, field.child_message_id, "domain");
+      auto key = FixedKey(payload, field.child_message_id, "domain");
       if (key == "ai.onnx") key.clear();
       ORT_ENFORCE(imports.insert(key).second, "RW07_WIRE_IMPORT_KEY");
     }
     if (message == "onnx.GraphProto") {
       const std::string_view name = field.name;
       if (name == "input" || name == "output" || name == "value_info") {
-        ORT_ENFORCE(values.insert(FixedKey(record.payload, field.child_message_id, "name")).second,
+        ORT_ENFORCE(values.insert(FixedKey(payload, field.child_message_id, "name")).second,
                     "RW07_WIRE_VALUE_KEY");
       }
       if (name == "node") {
-        auto key = FixedKey(record.payload, field.child_message_id, "name");
+        auto key = FixedKey(payload, field.child_message_id, "name");
         ORT_ENFORCE(key.empty() || nodes.insert(key).second, "RW07_WIRE_NODE_KEY");
       }
     }
+  }
+};
+
+// Only unique unordered attributes/imports are sorted. Nodes, ports and dims keep order.
+inline std::string FixedCanonicalWire(std::string_view bytes, int message_id, size_t depth = 0) {
+  ORT_ENFORCE(depth < 32, "RW07_WIRE_DEPTH");
+  auto records = FixedRecords(bytes, message_id);
+  FixedWireKeys keys(message_id);
+  const auto message = keys.message;
+  for (auto& record : records) {
+    const auto& field = *record.field;
+    if (field.child_message_id >= 0) {
+      record.payload = FixedCanonicalWire(record.payload, field.child_message_id, depth + 1);
+    }
+    keys.Check(field, record.payload);
   }
   std::stable_sort(records.begin(), records.end(), [&](const auto& a, const auto& b) {
     if (a.field->number != b.field->number) return a.field->number < b.field->number;
@@ -168,6 +186,38 @@ inline std::string FixedCanonicalWire(std::string_view bytes, int message_id, si
     result += record.payload;
   }
   return result;
+}
+
+// The sealed original only needs admission and a canonical size bound, not a
+// second serialized model. Views borrow the authenticated owner's immutable bytes.
+inline size_t FixedCanonicalWireSize(std::string_view bytes, int message_id, size_t depth = 0) {
+  ORT_ENFORCE(depth < 32, "RW07_WIRE_DEPTH");
+  const auto records = FixedRecordsAs<std::string_view>(bytes, message_id);
+  FixedWireKeys keys(message_id);
+  auto varint_size = [](uint64_t value) {
+    size_t size = 1;
+    while (value >= 128) {
+      ++size;
+      value >>= 7;
+    }
+    return size;
+  };
+  size_t total = 0;
+  auto add = [&](size_t size) {
+    ORT_ENFORCE(size <= bytes.size() - total, "RW07_ORIGINAL_WIRE_BOUND");
+    total += size;
+  };
+  for (const auto& record : records) {
+    const auto& field = *record.field;
+    const auto payload_size = field.child_message_id >= 0
+                                  ? FixedCanonicalWireSize(record.payload, field.child_message_id, depth + 1)
+                                  : record.payload.size();
+    keys.Check(field, record.payload);
+    add(varint_size((static_cast<uint64_t>(field.number) << 3) | record.wire_type));
+    if (record.wire_type == 2) add(varint_size(payload_size));
+    add(payload_size);
+  }
+  return total;
 }
 
 inline std::string FixedBytes(const unsigned char* bytes, size_t size) {

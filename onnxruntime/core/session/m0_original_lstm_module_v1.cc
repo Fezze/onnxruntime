@@ -226,6 +226,29 @@ M0NativeResourceBindingV3 M0OriginalLstmModuleV1::NativeResourceV3(uintptr_t han
  ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeResourceV3(impl_->provider->GetOrtEp(),handle,required_bytes,result));
  impl_->file.Verify();return result;
 }
+M0OriginalLstmModuleV1::NativeResourceBatchV3 M0OriginalLstmModuleV1::NativeResourcesV3(
+ gsl::span<const std::pair<uintptr_t,uint64_t>> queries)const{
+ ORT_ENFORCE(!queries.empty()&&queries.size()<=554,"RW07_NATIVE_RESOURCE_BATCH_BOUND");
+ impl_->file.Verify();
+ auto* const provider=impl_->provider;
+ ORT_ENFORCE(provider&&provider->GetOrtEp()&&impl_->providers&&
+  impl_->providers->Get(kWebGpuExecutionProvider)==provider,"RW07_NATIVE_RESOURCE_OWNED_EP");
+ auto* const ep=provider->GetOrtEp();
+ NativeResourceBatchV3 result;
+ result.resources.reserve(queries.size());
+ ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeResourceV3(ep,0,0,result.before));
+ for(const auto& query:queries){
+  ORT_ENFORCE(query.first&&query.second,"RW07_NATIVE_RESOURCE_BATCH_QUERY");
+  M0NativeResourceBindingV3 resource;
+  ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeResourceV3(ep,query.first,query.second,resource));
+  result.resources.push_back(resource);
+ }
+ ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeResourceV3(ep,0,0,result.after));
+ ORT_ENFORCE(impl_->provider==provider&&provider->GetOrtEp()==ep&&
+  impl_->providers->Get(kWebGpuExecutionProvider)==provider,"RW07_NATIVE_RESOURCE_BATCH_CHANGED_EP");
+ impl_->file.Verify();
+ return result;
+}
 M0NativeDeviceLimitsV1 M0OriginalLstmModuleV1::NativeDeviceLimitsV1(
  uint64_t storage_bytes,uint64_t initializer_bytes,uint64_t uniform_bytes)const{
  impl_->file.Verify();M0NativeDeviceLimitsV1 result;
@@ -254,6 +277,8 @@ M0OriginalLstmModuleV1::NativeSnapshotV1 M0OriginalLstmModuleV1::ReadNativeSnaps
 const M0PluginKernelCreatorBindingV1& M0OriginalLstmModuleV1::Binding() const { ORT_THROW("RW07_LSTM_MODULE_UNSUPPORTED"); }
 std::array<M0NativeProviderKernelBindingV2,42> M0OriginalLstmModuleV1::NativeBindingsV2() const { ORT_THROW("RW07_NATIVE_MODULE_UNSUPPORTED"); }
 M0NativeResourceBindingV3 M0OriginalLstmModuleV1::NativeResourceV3(uintptr_t,uint64_t)const { ORT_THROW("RW07_NATIVE_RESOURCE_UNSUPPORTED"); }
+M0OriginalLstmModuleV1::NativeResourceBatchV3 M0OriginalLstmModuleV1::NativeResourcesV3(
+ gsl::span<const std::pair<uintptr_t,uint64_t>>)const { ORT_THROW("RW07_NATIVE_RESOURCE_UNSUPPORTED"); }
 M0NativeDeviceLimitsV1 M0OriginalLstmModuleV1::NativeDeviceLimitsV1(uint64_t,uint64_t,uint64_t)const { ORT_THROW("RW07_NATIVE_DEVICE_LIMITS_UNSUPPORTED"); }
 }  // namespace onnxruntime
 #endif

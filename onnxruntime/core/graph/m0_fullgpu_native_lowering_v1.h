@@ -56,12 +56,14 @@ class M0FullGpuNativeBuilderV1 final {
                                          const std::vector<std::pair<std::string,int64_t>>& attrs={});
  private:
   friend class M0FullGpuNativeLoweringOwnerV1;
-  M0FullGpuNativeBuilderV1(const ONNX_NAMESPACE::ModelProto& original,uint32_t capacity);
+  M0FullGpuNativeBuilderV1(const ONNX_NAMESPACE::ModelProto& original,
+                         const ONNX_NAMESPACE::GraphProto& payload_graph,uint32_t capacity);
   M0FullGpuNativeBuilderV1(const M0FullGpuNativeBuilderV1&)=delete;
   M0FullGpuNativeBuilderV1& operator=(const M0FullGpuNativeBuilderV1&)=delete;
   void Emit(ONNX_NAMESPACE::NodeProto node);
   void Finalize(const M0FullGpuNativeOutputV1& outputs);
   const ONNX_NAMESPACE::ModelProto& original_;
+  const ONNX_NAMESPACE::GraphProto& payload_graph_;
   const uint32_t capacity_;
   ONNX_NAMESPACE::ModelProto derived_;
   std::array<M0FullGpuNativeCoverageV1,2464> coverage_;

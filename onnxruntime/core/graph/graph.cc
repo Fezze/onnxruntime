@@ -22,6 +22,7 @@
 #include "core/common/inlined_containers.h"
 #include "core/common/logging/logging.h"
 #include "core/common/narrow.h"
+#include "core/common/m0_memory_reserve_v1.h"
 #include "core/providers/common.h"
 #include "core/flatbuffers/flatbuffers_utils.h"
 #include "core/framework/error_code_helper.h"
@@ -8396,7 +8397,10 @@ class M0OriginalPreloadOwnerV1::WholeModel final {
     auto required_imports = expected_domains;
     required_imports.erase(kMSInternalNHWCDomain);
     ORT_ENFORCE(imports.size() == required_imports.size(), "RW07_WHOLE_NORMALIZED_IMPORT_INVENTORY");
-    ORT_ENFORCE(m0_internal::M0SameWholeBackingV1(seal_->proto_, live), "RW07_WHOLE_IMMUTABLE_BACKING");
+    ORT_ENFORCE(m0_internal::M0SameWholeBackingV1(seal_->proto_, live,
+        [this](const TensorProto& expected, const TensorProto& actual) {
+          return seal_->SameInitializer(expected, actual);
+        }), "RW07_WHOLE_IMMUTABLE_BACKING");
   }
   void CheckInventory(M0OriginalPreloadOwnerV1& owner) {
     const auto& graph = *owner.graph_;
@@ -8706,6 +8710,24 @@ void M0OriginalPreloadOwnerV1::ValidateNativeLoweringSource(const Model& source)
     owner->active_=false;owner->poisoned_=true;throw;
   }
 }
+void M0OriginalPreloadOwnerV1::ValidateNativeInitializer(
+    const Model& source, const ONNX_NAMESPACE::TensorProto& tensor) {
+  auto* owner = source.m0_original_preload_owner_v1_.get();
+  ORT_ENFORCE(owner && owner->whole_ && owner->stage_ == 7 && !owner->poisoned_ &&
+                  !owner->active_ && owner->model_ == &source,
+              "RW07_NATIVE_INITIALIZER_SOURCE_OWNER");
+  try {
+    const auto found = owner->whole_->initializers_.find(tensor.name());
+    ORT_ENFORCE(found != owner->whole_->initializers_.end() && found->second.live == &tensor &&
+                    tensor.raw_data().data() == found->second.raw_backing &&
+                    tensor.raw_data().size() == found->second.raw_size &&
+                    owner->whole_->seal_->SameInitializer(*found->second.original, tensor),
+                "RW07_NATIVE_INITIALIZER_INDEPENDENT_BACKING");
+  } catch (...) {
+    owner->poisoned_ = true;
+    throw;
+  }
+}
 std::unique_ptr<M0FullGpuNativeLoweringOwnerV1> M0OriginalPreloadOwnerV1::PrepareNativeLowering(
     const Model& source,const InferenceSession& session,uint32_t capacity,bool device_capacity) {
   ValidateNativeLoweringSource(source);
@@ -8726,9 +8748,11 @@ std::unique_ptr<Model> M0OriginalPreloadOwnerV1::MakeWhole(std::string_view byte
   return model;
 }
 std::unique_ptr<Model> M0OriginalPreloadOwnerV1::MakeWholeUnresolved(std::string_view bytes, const logging::Logger& logger) {
-  auto seal = M0WholeModelSealV1::ValidateAndParse(bytes);
+  auto seal = M0WholeModelSealV1::ValidateAndParse(bytes, logger);
+  LOGS(logger, INFO) << "M0_RW07_ORIGINAL_LIVE_PROTO_TRANSFER_BEGIN";
+  auto live = seal->TakeLiveModel();
+  LOGS(logger, INFO) << "M0_RW07_ORIGINAL_LIVE_PROTO_TRANSFER_END sealed_raw_heap_bytes=0";
   auto owner = std::unique_ptr<M0OriginalPreloadOwnerV1>(new M0OriginalPreloadOwnerV1(std::move(seal)));
-  ONNX_NAMESPACE::ModelProto live(owner->whole_->seal_->proto_);
   ModelOptions options(true, true);
   auto model = std::unique_ptr<Model>(new Model(std::move(live), PathString(), nullptr, logger, options, nullptr, std::move(owner)));
   auto& bound = *model->m0_original_preload_owner_v1_;
@@ -8763,7 +8787,7 @@ size_t M0QualifyWholeRetirementV1(std::string_view bytes) {
 M0WholeDescriptorRulesReceiptV1 M0OriginalPreloadOwnerV1::QualifyWholeRules(std::string_view bytes) {
   // Exact original-node metadata fixtures through the actual owner's private
   // rule facade. This does not construct a Model or confer load authority.
-  auto seal = M0WholeModelSealV1::ValidateAndParse(bytes);
+  auto seal = M0WholeModelSealV1::ValidateAndParse(bytes, logging::LoggingManager::DefaultLogger());
   WholeModel fixture(std::move(seal));
   M0WholeDescriptorRulesReceiptV1 receipt;
   for (const auto& profile : Rules::kProfiles) {

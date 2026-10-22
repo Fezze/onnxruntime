@@ -19,6 +19,7 @@ M0FullGpuNativeLoweringOwnerV1::~M0FullGpuNativeLoweringOwnerV1(){
 }
 #if !defined(ORT_MINIMAL_BUILD)
 #include "core/common/common.h"
+#include "core/common/logging/logging.h"
 #include "core/framework/tensorprotoutils.h"
 #include "core/graph/m0_original_preload_owner_v1.h"
 #include "core/session/inference_session.h"
@@ -26,7 +27,19 @@ M0FullGpuNativeLoweringOwnerV1::~M0FullGpuNativeLoweringOwnerV1(){
 #include <algorithm>
 #include <tuple>
 #include "sha256.h"
+#include "core/graph/m0_proto_hash_v1.h"
+#include "core/graph/m0_bounded_backing_v1.h"
 namespace onnxruntime {
+const ONNX_NAMESPACE::TensorProto& M0FullGpuNativeLoweringOwnerV1::ExpectedInitializer(
+ const ONNX_NAMESPACE::TensorProto& metadata)const{
+ const auto found=initializer_sources_.find(metadata.name());
+ ORT_ENFORCE(initializer_payloads_transferred_&&found!=initializer_sources_.end()&&
+  found->second.first&&found->second.second==&metadata&&metadata.raw_data().empty()&&
+  m0_internal::M0SameInitializerMetadataV1(*found->second.first,metadata),
+  "RW07_NATIVE_RETIRED_INITIALIZER_METADATA");
+ M0OriginalPreloadOwnerV1::ValidateNativeInitializer(*source_,*found->second.first);
+ return *found->second.first;
+}
 namespace {
 auto CapacityProfile(const M0NativeDeviceLimitsV1& l){
  return std::make_tuple(l.abi,l.structure_bytes,l.ep,l.context,l.device,l.queue,
@@ -119,14 +132,29 @@ std::unique_ptr<M0FullGpuNativeLoweringOwnerV1> M0FullGpuNativeLoweringOwnerV1::
   pending->prepared_module_.reset(module.release());pending->device_limits_=limits;
   pending->initializer_capacity_bytes_=initializer_bytes;
  }
- M0FullGpuNativeBuilderV1 builder(original,capacity);
+ M0OriginalPreloadOwnerV1::ValidateNativeLoweringSource(source);
+ const auto& payload_graph=source.model_proto_.graph();
+ M0FullGpuNativeBuilderV1 builder(original,payload_graph,capacity);
  M0FullGpuNativeEncoderV1 encoder;
  ORT_THROW_IF_ERROR(M0AppendNativeEncoderV1(builder,encoder));
  ORT_THROW_IF_ERROR(M0AppendNativeDecoderV1(builder,encoder,pending->outputs_));
  builder.Finalize(pending->outputs_);
  pending->derived_.Swap(&builder.derived_);pending->coverage_=std::move(builder.coverage_);
+ std::map<std::string,const ONNX_NAMESPACE::TensorProto*> original_initializers;
+ for(const auto& tensor:payload_graph.initializer())
+  ORT_ENFORCE(original_initializers.emplace(tensor.name(),&tensor).second,
+   "RW07_NATIVE_INITIALIZER_SEALED_DUPLICATE");
+ for(const auto& tensor:pending->derived_.graph().initializer()){
+  const auto found=original_initializers.find(tensor.name());
+  ORT_ENFORCE(found!=original_initializers.end()&&
+   m0_internal::M0SameInlineInitializerV1(*found->second,tensor)&&
+   pending->initializer_sources_.emplace(tensor.name(),std::make_pair(found->second,nullptr)).second,
+   "RW07_NATIVE_INITIALIZER_SEALED_ORIGIN");
+ }
  // Hash actual protobuf/ledger bytes, not a caller's description or certificate.
- pending->derived_sha256_=model_package::Sha256::HashStringHex(pending->derived_.SerializeAsString());
+ LOGS(*session.session_logger_,INFO)<<"M0_RW07_NATIVE_DERIVED_HASH_BEGIN bytes="<<pending->derived_.ByteSizeLong();
+ pending->derived_sha256_=m0_internal::M0ProtoSha256V1(pending->derived_);
+ LOGS(*session.session_logger_,INFO)<<"M0_RW07_NATIVE_DERIVED_HASH_END scratch_bytes=4096";
  model_package::Sha256 ledger;
  const auto field=[&](const std::string& value){
   const uint64_t n=value.size();uint8_t length[8];for(size_t i=0;i<8;++i)length[i]=uint8_t(n>>(8*i));

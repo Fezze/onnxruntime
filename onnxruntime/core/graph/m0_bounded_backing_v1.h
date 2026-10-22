@@ -163,8 +163,23 @@ inline std::string M0ProjectedBackingBytesV1(
   return output.Finish();
 }
 
+inline bool M0SameInitializerMetadataV1(const ONNX_NAMESPACE::TensorProto& expected,
+                                       const ONNX_NAMESPACE::TensorProto& actual) {
+  if (expected.has_raw_data() != actual.has_raw_data()) return false;
+  const size_t raw_fields = expected.has_raw_data() ? 1 : 0;
+  return M0ProjectedBackingBytesV1(expected, {{9, raw_fields}}) ==
+         M0ProjectedBackingBytesV1(actual, {{9, raw_fields}});
+}
+
+inline bool M0SameInlineInitializerV1(const ONNX_NAMESPACE::TensorProto& expected,
+                                     const ONNX_NAMESPACE::TensorProto& actual) {
+  return expected.raw_data() == actual.raw_data() && M0SameInitializerMetadataV1(expected, actual);
+}
+
+template <typename SameInitializer>
 inline bool M0SameWholeBackingV1(const ONNX_NAMESPACE::ModelProto& sealed,
-                                const ONNX_NAMESPACE::ModelProto& live) {
+                                const ONNX_NAMESPACE::ModelProto& live,
+                                SameInitializer same_initializer) {
   if (!sealed.has_graph() || !live.has_graph()) return false;
   {
     const auto expected = M0ProjectedBackingBytesV1(sealed, {{7, 1}, {8, size_t(sealed.opset_import_size())}});
@@ -182,16 +197,12 @@ inline bool M0SameWholeBackingV1(const ONNX_NAMESPACE::ModelProto& sealed,
     if (expected != actual) return false;
   }
   // The pinned original's largest initializer is 13,393,975 serialized bytes.
-  // Reject oversized or changed-sized messages before allocating either string.
+  // Retain the original encoded-size bound without serializing payload copies.
   constexpr size_t kInitializerLimit = 16 * 1024 * 1024;
   for (int i = 0; i < expected_graph.initializer_size(); ++i) {
     const auto& expected = expected_graph.initializer(i);
     const auto& actual = actual_graph.initializer(i);
-    const auto bytes = expected.ByteSizeLong();
-    if (bytes > kInitializerLimit || bytes != actual.ByteSizeLong()) return false;
-    std::string expected_bytes, actual_bytes;
-    if (!expected.SerializeToString(&expected_bytes) || !actual.SerializeToString(&actual_bytes) ||
-        expected_bytes != actual_bytes) return false;
+    if (actual.ByteSizeLong() > kInitializerLimit || !same_initializer(expected, actual)) return false;
   }
   return true;
 }

@@ -12,6 +12,7 @@
 #include "core/framework/session_state.h"
 #include "core/framework/sequential_execution_plan.h"
 #include "core/graph/model.h"
+#include "core/graph/m0_bounded_backing_v1.h"
 #include "core/graph/m0_original_preload_owner_v1.h"
 #include "core/session/m0_fullgpu_native_execution_state_v1.h"
 
@@ -97,7 +98,8 @@ void M0FullGpuNativeLoweringOwnerV1::ValidateInitializerPlan(const SessionState&
   for (const auto& tensor : original_proto.initializer())
     ORT_ENFORCE(originals.emplace(tensor.name(), &tensor).second, "RW07_NATIVE_INITIALIZER_ORIGINAL_DUPLICATE");
   for (const auto& tensor : derived_.graph().initializer())
-    ORT_ENFORCE(expected.emplace(tensor.name(), &tensor).second, "RW07_NATIVE_INITIALIZER_DERIVED_DUPLICATE");
+    ORT_ENFORCE(expected.emplace(tensor.name(), &ExpectedInitializer(tensor)).second,
+                "RW07_NATIVE_INITIALIZER_DERIVED_DUPLICATE");
   for (const auto& tensor : execution_proto.initializer())
     ORT_ENFORCE(backing.emplace(tensor.name(), &tensor).second, "RW07_NATIVE_INITIALIZER_LIVE_DUPLICATE");
   const auto& live = graph.GetAllInitializedTensors();
@@ -117,9 +119,9 @@ void M0FullGpuNativeLoweringOwnerV1::ValidateInitializerPlan(const SessionState&
     const auto original_live = original_graph.GetAllInitializedTensors().find(entry.first);
     ORT_ENFORCE(original_live != original_graph.GetAllInitializedTensors().end() && original_live->second &&
                     original_graph.GetConstantInitializer(entry.first, false) == original_live->second &&
-                    original_live->second->SerializeAsString() == original->second->SerializeAsString() &&
-                    entry.second->SerializeAsString() == original->second->SerializeAsString() &&
-                    actual->second->SerializeAsString() == original->second->SerializeAsString(),
+                    m0_internal::M0SameInlineInitializerV1(*original_live->second, *original->second) &&
+                    m0_internal::M0SameInlineInitializerV1(*entry.second, *original->second) &&
+                    m0_internal::M0SameInlineInitializerV1(*actual->second, *original->second),
                 "RW07_NATIVE_INITIALIZER_IMMUTABLE_ORIGINAL_BYTES");
     const size_t bytes = CheckPayload(*actual->second);
     ORT_ENFORCE(execution_plan_ && execution_plan_->module && bytes &&

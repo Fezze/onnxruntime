@@ -115,10 +115,10 @@ class EdgeData final : public Program<EdgeData> {
     if(mode_==0){
       f<<"let stride=select(10u,6u,uniforms.stage==1u);let kernel=select(20u,12u,uniforms.stage==1u);"
        <<"let pad=select(5u,3u,uniforms.stage==1u);let input_length=select(count/10u,(count-1u)/6u,uniforms.stage==1u);"
-       <<"var target=t;";
-      f<<"if(uniforms.stage==1u){target=select(t-1u,1u,t==0u);}"
+       <<"var output_frame=t;";
+      f<<"if(uniforms.stage==1u){output_frame=select(t-1u,1u,t==0u);}"
        <<"let input_channels=select(512u,256u,uniforms.stage==1u);var total:f32=0.0;"
-       <<"for(var k=0u;k<kernel;k++){let numerator=i32(target+pad)-i32(k);"
+       <<"for(var k=0u;k<kernel;k++){let numerator=i32(output_frame+pad)-i32(k);"
        <<"if(numerator>=0&&u32(numerator)%stride==0u){let pos=u32(numerator)/stride;if(pos<input_length){var column:f32=0.0;"
        <<"for(var ic=0u;ic<input_channels;ic++){let value="<<inputs[0]->GetByOffset("ic*"+GetElementAt("uniforms.input_capacity","0u",3)+"+pos")<<";"
        <<"let negative=original_mul(value,bitcast<f32>(0x3dcccccdu));let activated=select(negative,value,value>=0.0);"
@@ -148,8 +148,8 @@ fn upsample_source(frame:u32,count:u32)->i32 {
  let stride=select(10u,6u,uniforms.stage==1u);
  let pad=select(5u,3u,uniforms.stage==1u);
  let length=select(count/10u,(count-1u)/6u,uniforms.stage==1u);
- var target=frame;if(uniforms.stage==1u){target=select(frame-1u,1u,frame==0u);}
- let numerator=i32(target+pad)-i32(uniforms.tap);
+ var output_frame=frame;if(uniforms.stage==1u){output_frame=select(frame-1u,1u,frame==0u);}
+ let numerator=i32(output_frame+pad)-i32(uniforms.tap);
  if(numerator<0||u32(numerator)%stride!=0u){return -1;}
  let pos=u32(numerator)/stride;
  if(pos>=length||pos>=uniforms.input_capacity){return -1;}

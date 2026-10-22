@@ -19,6 +19,9 @@
 #include "core/framework/session_state.h"
 #include "core/graph/model.h"
 #include "core/graph/m0_fixed_wire_v1.h"
+#if !defined(ORT_MINIMAL_BUILD)
+#include "core/graph/m0_proto_hash_v1.h"
+#endif
 #include "core/graph/m0_descriptor_schema_v1.h"
 #include "core/graph/data_propagation/custom_data_propagation.h"
 #include "core/graph/function_impl.h"
@@ -622,6 +625,15 @@ TEST(M0FullGpuPreInitAdmissionTest, CHelperRejectsStrictAndMutatedIntentBeforePr
             std::string::npos);
   OrtApis::ReleaseStatus(creation_status);
   EXPECT_EQ(created, nullptr);
+  EXPECT_EQ(calls, 0);
+  OrtSession* array_session = nullptr;
+  const char malformed = '\xff';
+  OrtStatus* array_status = OrtApis::CreateSessionFromArray(env.get(), &malformed, 1, &options, &array_session);
+  ASSERT_NE(array_status, nullptr);
+  EXPECT_NE(std::string(OrtApis::GetErrorMessage(array_status)).find("RW07_PRELOAD_DENY_UNREVIEWED_CONTRACT"),
+            std::string::npos);
+  OrtApis::ReleaseStatus(array_status);
+  EXPECT_EQ(array_session, nullptr);
   EXPECT_EQ(calls, 0);
   InferenceSession session(options.value, GetEnvironment());
   for (bool disable : {false, true}) {
@@ -2665,8 +2677,11 @@ void CheckRw07NativeRoundtrip(const m0_internal::Rw07FixedFixtureBinding& bindin
   Proto proto;
   ASSERT_TRUE(proto.ParseFromString(original)) << binding.id;
   ASSERT_EQ(proto.SerializeAsString(), original) << binding.id;
+  ASSERT_EQ(m0_internal::M0ProtoSha256V1(proto), model_package::Sha256::HashStringHex(original)) << binding.id;
   const auto canonical = m0_internal::FixedCanonicalWire(proto.SerializeAsString(), binding.message_id);
   ASSERT_EQ(canonical, m0_internal::FixedBytes(binding.canonical, binding.canonical_size)) << binding.id;
+  ASSERT_EQ(m0_internal::FixedCanonicalWireSize(original, binding.message_id), canonical.size()) << binding.id;
+  ASSERT_EQ(m0_internal::FixedCanonicalWireSize(canonical, binding.message_id), canonical.size()) << binding.id;
   Proto reparsed;
   ASSERT_TRUE(reparsed.ParseFromString(canonical)) << binding.id;
   ASSERT_EQ(reparsed.SerializeAsString(), canonical) << binding.id;
@@ -2708,13 +2723,19 @@ TEST(M0FixedNativeBindingTest, RejectsCollapsedWireAndKeyAmbiguityBeforeNativePa
   AppendFixedVarint(unknown, uint64_t{999} << 3);
   unknown.push_back('\0');
   EXPECT_THROW(FixedCanonicalWire(unknown, marker.message_id), std::exception);
+  EXPECT_THROW(FixedCanonicalWireSize(unknown, marker.message_id), std::exception);
   const auto marker_bytes = CheckedFixedBytes(marker.id);
   EXPECT_THROW(FixedCanonicalWire(marker_bytes + marker_bytes, marker.message_id), std::exception);
+  EXPECT_THROW(FixedCanonicalWireSize(marker_bytes + marker_bytes, marker.message_id), std::exception);
   EXPECT_THROW(FixedCanonicalWire(std::string("\x80\x00", 2), marker.message_id), std::exception);
+  EXPECT_THROW(FixedCanonicalWireSize(std::string("\x80\x00", 2), marker.message_id), std::exception);
   EXPECT_THROW(FixedCanonicalWire(std::string("\x0a\xff", 2), marker.message_id), std::exception);
+  EXPECT_THROW(FixedCanonicalWireSize(std::string("\x0a\xff", 2), marker.message_id), std::exception);
   EXPECT_THROW(FixedCanonicalWire(std::string("\x0b", 1), marker.message_id), std::exception);
+  EXPECT_THROW(FixedCanonicalWireSize(std::string("\x0b", 1), marker.message_id), std::exception);
   const auto& type = FixedBinding("type.dp-default-empty");
   EXPECT_THROW(FixedCanonicalWire(std::string("\x0a\x00\x22\x00", 4), type.message_id), std::exception);
+  EXPECT_THROW(FixedCanonicalWireSize(std::string("\x0a\x00\x22\x00", 4), type.message_id), std::exception);
   ONNX_NAMESPACE::ModelProto model;
   const auto& model_binding = FixedBinding("nested-depth2.model-original");
   ASSERT_TRUE(model.ParseFromString(CheckedFixedBytes(model_binding.id)));
@@ -2722,16 +2743,19 @@ TEST(M0FixedNativeBindingTest, RejectsCollapsedWireAndKeyAmbiguityBeforeNativePa
   auto duplicate = attrs->Get(0);
   attrs->Add()->CopyFrom(duplicate);
   EXPECT_THROW(FixedCanonicalWire(model.SerializeAsString(), model_binding.message_id), std::exception);
+  EXPECT_THROW(FixedCanonicalWireSize(model.SerializeAsString(), model_binding.message_id), std::exception);
   ASSERT_TRUE(model.ParseFromString(CheckedFixedBytes(model_binding.id)));
   auto import = model.opset_import(0);
   model.add_opset_import()->CopyFrom(import);
   EXPECT_THROW(FixedCanonicalWire(model.SerializeAsString(), model_binding.message_id), std::exception);
+  EXPECT_THROW(FixedCanonicalWireSize(model.SerializeAsString(), model_binding.message_id), std::exception);
   ASSERT_TRUE(model.ParseFromString(CheckedFixedBytes(model_binding.id)));
   model.add_opset_import()->set_domain("");
   model.mutable_opset_import(1)->set_version(1);
   model.add_opset_import()->set_domain("ai.onnx");
   model.mutable_opset_import(2)->set_version(1);
   EXPECT_THROW(FixedCanonicalWire(model.SerializeAsString(), model_binding.message_id), std::exception);
+  EXPECT_THROW(FixedCanonicalWireSize(model.SerializeAsString(), model_binding.message_id), std::exception);
 }
 
 #if !defined(ORT_NO_EXCEPTIONS)
@@ -3191,9 +3215,39 @@ TEST(M0OriginalPreload, WholeOriginalStrictBufferLoadResolvesWithoutModelValues)
     EXPECT_FALSE(replay.IsOK());
     EXPECT_NE(replay.ErrorMessage().find("RW07_ORIGINAL_LOAD_REUSE"), std::string::npos);
     std::cerr << "M0_ORIGINAL_PRELOAD phase=initialize_begin" << std::endl;
+    // Initialization must retain its own authenticated bytes after Load returns.
+    bytes[1000000] ^= 1;
     ExpectWholeOriginalInitializeResult(session);
+    bytes[1000000] ^= 1;
     std::cerr << "M0_ORIGINAL_PRELOAD phase=initialize_returned" << std::endl;
   }
+  std::cerr << "M0_ORIGINAL_PRELOAD phase=c_api_original_begin" << std::endl;
+  OrtEnv* raw_env = nullptr;
+  ASSERT_EQ(OrtApis::CreateEnv(ORT_LOGGING_LEVEL_WARNING, "rw07_original_c_api", &raw_env), nullptr);
+  std::unique_ptr<OrtEnv, decltype(&OrtApis::ReleaseEnv)> api_env(raw_env, OrtApis::ReleaseEnv);
+  OrtSessionOptions api_options;
+  api_options.value = StrictIngressOptions();
+  api_options.value.session_log_severity_level = 1;
+  ASSERT_EQ(OrtApis::SetIntraOpNumThreads(&api_options, 1), nullptr);
+  ASSERT_EQ(OrtApis::SetInterOpNumThreads(&api_options, 1), nullptr);
+  ASSERT_STATUS_OK(api_options.value.config_options.AddConfigEntry("session.disable_cpu_ep_fallback", "1"));
+  {
+    OrtSession* raw_session = nullptr;
+    OrtStatus* raw_status = OrtApis::CreateSessionFromArray(api_env.get(), bytes.data(), bytes.size(),
+                                                         &api_options, &raw_session);
+    std::unique_ptr<OrtStatus, decltype(&OrtApis::ReleaseStatus)> api_status(raw_status, OrtApis::ReleaseStatus);
+    std::unique_ptr<OrtSession, decltype(&OrtApis::ReleaseSession)> api_session(raw_session, OrtApis::ReleaseSession);
+#if defined(__ANDROID__) && defined(USE_WEBGPU) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
+    ASSERT_EQ(raw_status, nullptr) << (raw_status ? OrtApis::GetErrorMessage(raw_status) : "");
+    ASSERT_NE(raw_session, nullptr);
+#else
+    ASSERT_NE(raw_status, nullptr);
+    EXPECT_NE(std::string(OrtApis::GetErrorMessage(raw_status)).find("RW07_NATIVE_LOWERING_FAILED"), std::string::npos);
+    EXPECT_NE(std::string(OrtApis::GetErrorMessage(raw_status)).find("RW07_LSTM_MODULE_UNSUPPORTED"), std::string::npos);
+    EXPECT_EQ(raw_session, nullptr);
+#endif
+  }
+  std::cerr << "M0_ORIGINAL_PRELOAD phase=c_api_original_done" << std::endl;
   std::cerr << "M0_ORIGINAL_PRELOAD phase=source_mutation_rejection_begin" << std::endl;
   bytes[0] ^= 1;
   InferenceSession changed(StrictIngressOptions(), GetEnvironment());
@@ -3202,6 +3256,16 @@ TEST(M0OriginalPreload, WholeOriginalStrictBufferLoadResolvesWithoutModelValues)
   EXPECT_NE(rejected.ErrorMessage().find("RW07_ORIGINAL_BYTE_IDENTITY"), std::string::npos);
   EXPECT_FALSE(changed.GetModelMetadata().first.IsOK());
   EXPECT_NE(changed.Load(bytes.data(), static_cast<int>(bytes.size())).ErrorMessage().find("RW07_ORIGINAL_LOAD_REUSE"), std::string::npos);
+  {
+    OrtSession* raw_session = nullptr;
+    OrtStatus* raw_status = OrtApis::CreateSessionFromArray(api_env.get(), bytes.data(), bytes.size(),
+                                                         &api_options, &raw_session);
+    std::unique_ptr<OrtStatus, decltype(&OrtApis::ReleaseStatus)> api_status(raw_status, OrtApis::ReleaseStatus);
+    std::unique_ptr<OrtSession, decltype(&OrtApis::ReleaseSession)> api_session(raw_session, OrtApis::ReleaseSession);
+    ASSERT_NE(raw_status, nullptr);
+    EXPECT_NE(std::string(OrtApis::GetErrorMessage(raw_status)).find("RW07_ORIGINAL_BYTE_IDENTITY"), std::string::npos);
+    EXPECT_EQ(raw_session, nullptr);
+  }
   std::cerr << "M0_ORIGINAL_PRELOAD phase=source_mutation_rejection_done" << std::endl;
 }
 

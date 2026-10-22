@@ -13,6 +13,7 @@
 #include "asserts.h"
 #include "core/common/common.h"
 #include "core/graph/model.h"
+#include "sha256.h"
 #include "gtest/gtest.h"
 #include "test/test_environment.h"
 #include "core/session/m0_native_terminal_result_v1.h"
@@ -104,9 +105,13 @@ TEST_F(M0NativeLowering, ActualSourceRemainsAliveAndUnchangedAndPreparationDoesN
   EXPECT_GT(receipt.derived_nodes, 0u);
   EXPECT_TRUE(receipt.original_model_retained);
   EXPECT_TRUE(receipt.original_ports_retained);
+  EXPECT_TRUE(receipt.initializer_payloads_transferred);
+  EXPECT_EQ(receipt.retained_derived_raw_bytes, 0u);
+  EXPECT_GT(receipt.transferred_initializer_raw_bytes, 0u);
   EXPECT_EQ(receipt.derived_sha256.size(), 64u);
   EXPECT_EQ(receipt.ledger_sha256.size(), 64u);
   EXPECT_FALSE(receipt.derived_model_wire.empty());
+  EXPECT_EQ(receipt.derived_sha256, model_package::Sha256::HashStringHex(receipt.derived_model_wire));
   // The Python DAG oracle consumes these actual bytes, never an authored
   // replacement graph. A stale capture must not be silently overwritten.
   constexpr const char* capture = "rw07_native_lowered_v1.onnx";

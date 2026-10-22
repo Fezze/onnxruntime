@@ -1351,6 +1351,13 @@ AddTest(
   TEST_ARGS ${test_all_args}
 )
 target_include_directories(onnxruntime_test_all PRIVATE ${ONNXRUNTIME_ROOT}/core/flatbuffers/schema) # ort.fbs.h
+if(NOT onnxruntime_MINIMAL_BUILD)
+  # Only these private qualification sources consume the model-package SHA helper.
+  set_property(SOURCE
+    "${TEST_SRC_DIR}/framework/m0_fullgpu_preinit_test.cc"
+    "${TEST_SRC_DIR}/framework/m0_native_lowering_test.cc"
+    APPEND PROPERTY INCLUDE_DIRECTORIES "${ONNXRUNTIME_ROOT}/../model_package/src")
+endif()
 
 onnxruntime_apply_test_target_workarounds(onnxruntime_test_all)
 

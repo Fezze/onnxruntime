@@ -30,6 +30,8 @@ class M0NativeGpuModuleV2 final {
   M0OriginalLstmModuleV1::NativeSnapshotV1 ValidateCurrent(uintptr_t handle=0,uint64_t required_bytes=0)const;
   M0NativeDeviceLimitsV1 DeviceLimits(uint64_t storage_bytes=0,uint64_t initializer_bytes=0,uint64_t uniform_bytes=0)const;
   M0NativeResourceBindingV3 Resource(uintptr_t handle,uint64_t required_bytes)const;
+  InlinedVector<M0NativeResourceBindingV3> Resources(
+      gsl::span<const std::pair<uintptr_t,uint64_t>> queries)const;
   const ExecutionProviders& Providers()const;
   PluginExecutionProvider& Provider()const;
   std::shared_ptr<KernelRegistry> Registry()const;

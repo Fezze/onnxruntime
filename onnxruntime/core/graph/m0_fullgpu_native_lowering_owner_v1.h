@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include "gsl/span"
 #include "core/graph/m0_fullgpu_native_lowering_v1.h"
 #include "core/graph/m0_callback_policy_v1.h"
@@ -52,6 +53,7 @@ class M0FullGpuNativeLoweringOwnerV1 final {
                                 uint32_t capacity,bool device_capacity=false);
   ~M0FullGpuNativeLoweringOwnerV1();
   void ResolveExecutionModel(const logging::Logger& logger);
+  const ONNX_NAMESPACE::TensorProto& ExpectedInitializer(const ONNX_NAMESPACE::TensorProto& metadata) const;
   common::Status Callback(M0CallbackPolicyV1::Channel channel,const Model* model);
   void CheckNode(const Node& node) const;
   void Checked(const Node& node,const ONNX_NAMESPACE::NodeProto& wire);
@@ -130,6 +132,12 @@ class M0FullGpuNativeLoweringOwnerV1 final {
   M0NativeDeviceLimitsV1 device_limits_;
   uint64_t initializer_capacity_bytes_=0;
   ONNX_NAMESPACE::ModelProto derived_;
+  // Live source payload checked against the independent seal, and bound metadata
+  // after one-shot transfer into the execution model.
+  std::map<std::string, std::pair<const ONNX_NAMESPACE::TensorProto*,
+                                const ONNX_NAMESPACE::TensorProto*>> initializer_sources_;
+  bool initializer_payloads_transferred_ = false;
+  size_t transferred_initializer_raw_bytes_ = 0;
   std::array<M0FullGpuNativeCoverageV1,2464> coverage_;
   M0FullGpuNativeOutputV1 outputs_;
   std::string derived_sha256_,ledger_sha256_,execution_sha256_;

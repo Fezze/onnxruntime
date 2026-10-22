@@ -6,6 +6,8 @@
 #include "core/framework/m0_native_initializer_visit_v1.h"
 #include "core/framework/allocator.h"
 #include "core/graph/model.h"
+#include "core/graph/m0_bounded_backing_v1.h"
+#include "core/common/m0_memory_reserve_v1.h"
 #include "core/graph/m0_original_preload_owner_v1.h"
 #include "core/session/inference_session.h"
 #include "core/session/plugin_ep/ep_plugin_provider_interfaces.h"
@@ -112,8 +114,8 @@ common::Status M0FullGpuNativeLoweringOwnerV1::BeforeInitializerUpload(
    state.graph_.GetConstantInitializer(name,false)==&proto&&!state.graph_.IsSparseInitializer(name),
    "RW07_NATIVE_UPLOAD_EXACT_SOURCE_OBJECT");
   const ONNX_NAMESPACE::TensorProto* expected=nullptr;
-  for(const auto& candidate:derived_.graph().initializer())if(candidate.name()==name)expected=&candidate;
-  ORT_ENFORCE(expected&&expected->SerializeAsString()==proto.SerializeAsString()&&
+  for(const auto& candidate:derived_.graph().initializer())if(candidate.name()==name)expected=&ExpectedInitializer(candidate);
+  ORT_ENFORCE(expected&&m0_internal::M0SameInlineInitializerV1(*expected,proto)&&
    proto.data_location()==ONNX_NAMESPACE::TensorProto::DEFAULT&&proto.external_data_size()==0&&!proto.has_segment(),
    "RW07_NATIVE_UPLOAD_IMMUTABLE_INLINE_SOURCE");
   int actual_index=-1;ORT_THROW_IF_ERROR(state.ort_value_name_idx_map_.GetIdx(name,actual_index));
@@ -122,12 +124,14 @@ common::Status M0FullGpuNativeLoweringOwnerV1::BeforeInitializerUpload(
    p.plan->allocation_plan[size_t(index)].location==p.module->Provider().GetOrtDeviceByMemType(OrtMemTypeDefault),
    "RW07_NATIVE_UPLOAD_PLANNED_SOURCE_INDEX");
   if(visit==M0NativeInitializerVisitV1::Plan){
+   ORT_THROW_IF_ERROR(M0CheckMemoryReserveV1(0));
    ORT_ENFORCE(!p.pending_source&&p.pending_upload==-1&&p.uploaded.empty()&&
     p.planned_sources.emplace(index,&proto).second,"RW07_NATIVE_UPLOAD_SOURCE_PLAN_REPLAY");
   }else{
    ORT_ENFORCE(visit==M0NativeInitializerVisitV1::Copy&&p.planned_sources.size()==size_t(derived_.graph().initializer_size())&&
     p.planned_sources.at(index)==&proto&&!p.pending_source&&p.pending_upload==-1&&!p.uploaded.count(index),
     "RW07_NATIVE_UPLOAD_SOURCE_COPY_REPLAY");
+   ORT_THROW_IF_ERROR(M0CheckMemoryReserveV1(proto.ByteSizeLong()));
    p.pending_upload=index;p.pending_source=&proto;
    LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=initializer_copy_admitted value_index="<<index;
   }
@@ -182,6 +186,15 @@ void M0FullGpuNativeLoweringOwnerV1::ValidateInitializedExecution(uint64_t activ
  LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=completion_source_check_done";
  ORT_ENFORCE(ExecutionPlanFingerprint(state)==p.plan_sha256,"RW07_NATIVE_INITIALIZED_CHANGED_PLAN");
  const auto device=p.module->Provider().GetOrtDeviceByMemType(OrtMemTypeDefault);
+ InlinedVector<std::pair<uintptr_t,uint64_t>> resource_queries;
+ resource_queries.reserve(p.uploaded.size());
+ for(const auto& item:p.uploaded){
+  const auto& tensor=item.second.value.Get<Tensor>();
+  resource_queries.emplace_back(reinterpret_cast<uintptr_t>(tensor.DataRaw()),tensor.SizeInBytes());
+ }
+ LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=completion_resource_snapshot_begin total="<<resource_queries.size();
+ const auto resources=p.module->Resources(resource_queries);
+ LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=completion_resource_snapshot_done total="<<resources.size();
  size_t checked_resources=0;
  for(const auto& item:p.uploaded){
   if(checked_resources%32==0){
@@ -194,7 +207,10 @@ void M0FullGpuNativeLoweringOwnerV1::ValidateInitializedExecution(uint64_t activ
    &actual->second.Get<Tensor>()==&item.second.value.Get<Tensor>()&&
    &immutable->second.Get<Tensor>()==&item.second.value.Get<Tensor>(),"RW07_NATIVE_INITIALIZED_PARAMETER_SUBSTITUTION");
   const auto& tensor=actual->second.Get<Tensor>();TensorDescriptor(tensor,*item.second.source,device);
-  ORT_ENFORCE(SameAllocation(item.second.resource,p.module->Resource(reinterpret_cast<uintptr_t>(tensor.DataRaw()),tensor.SizeInBytes())),
+  ORT_ENFORCE(checked_resources<resources.size()&&
+   reinterpret_cast<uintptr_t>(tensor.DataRaw())==resource_queries[checked_resources].first&&
+   tensor.SizeInBytes()==resource_queries[checked_resources].second&&
+   SameAllocation(item.second.resource,resources[checked_resources]),
    "RW07_NATIVE_INITIALIZED_PARAMETER_GENERATION");
   ++checked_resources;
  }

@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 #include "core/graph/m0_fullgpu_native_lowering_v1.h"
+#include "core/common/m0_memory_reserve_v1.h"
 #include <algorithm>
 #include <functional>
 #include <set>
@@ -21,7 +22,11 @@ void OutputInfo(ONNX_NAMESPACE::GraphProto& graph,const std::string& name,int ty
  auto* v=graph.add_output();v->set_name(name);auto* t=v->mutable_type()->mutable_tensor_type();t->set_elem_type(type);t->mutable_shape()->add_dim()->set_dim_value(length);
 }
 }  // namespace
-M0FullGpuNativeBuilderV1::M0FullGpuNativeBuilderV1(const ONNX_NAMESPACE::ModelProto& original,uint32_t capacity):original_(original),capacity_(capacity){
+M0FullGpuNativeBuilderV1::M0FullGpuNativeBuilderV1(const ONNX_NAMESPACE::ModelProto& original,
+ const ONNX_NAMESPACE::GraphProto& payload_graph,uint32_t capacity)
+ :original_(original),payload_graph_(payload_graph),capacity_(capacity){
+ ORT_ENFORCE(payload_graph_.initializer_size()==original_.graph().initializer_size(),
+  "RW07_NATIVE_PAYLOAD_GRAPH_INVENTORY");
  ORT_ENFORCE(capacity_>0&&capacity_<=102400&&original_.graph().node_size()==2464&&original_.graph().input_size()==3&&original_.graph().output_size()==1,"RW07 native lowering closed source domain");
  derived_.set_ir_version(original_.ir_version());derived_.mutable_opset_import()->CopyFrom(original_.opset_import());
  auto* domain=derived_.add_opset_import();domain->set_domain(Domain);domain->set_version(1);
@@ -41,7 +46,10 @@ std::string M0FullGpuNativeBuilderV1::Output(size_t i,size_t slot)const{
 std::string M0FullGpuNativeBuilderV1::Initializer(const std::string& name){
  const auto it=initializers_.find(name);ORT_ENFORCE(it!=initializers_.end(),"RW07 native parameter is not an original initializer: ",name);
  if(!copied_initializers_.count(name)){
-  derived_.mutable_graph()->add_initializer()->CopyFrom(original_.graph().initializer(int(it->second)));copied_initializers_.emplace(name,true);
+  const auto& payload=payload_graph_.initializer(int(it->second));
+  ORT_ENFORCE(payload.name()==name,"RW07_NATIVE_PAYLOAD_GRAPH_ORDER");
+  ORT_THROW_IF_ERROR(M0CheckMemoryReserveV1(payload.ByteSizeLong()));
+  derived_.mutable_graph()->add_initializer()->CopyFrom(payload);copied_initializers_.emplace(name,true);
  }
  return name;
 }

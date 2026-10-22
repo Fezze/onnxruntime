@@ -4,6 +4,7 @@
 #include <limits>
 #include "core/providers/webgpu/buffer_manager.h"
 #include "core/providers/webgpu/webgpu_context.h"
+#include "core/common/m0_memory_reserve_v1.h"
 #include <gsl/gsl>
 
 namespace onnxruntime {
@@ -12,6 +13,12 @@ namespace webgpu {
 namespace {
 
 constexpr size_t kM0TransferChunkBytes = 8 * 1024 * 1024;
+
+void EnforceM0MemoryReserve(const WebGpuContext& context, uint64_t additional_bytes) {
+  if (context.M0BoundedSubmissionsActiveV1()) {
+    ORT_THROW_IF_ERROR(M0CheckMemoryReserveV1(additional_bytes));
+  }
+}
 
 constexpr size_t NormalizeBufferSize(size_t size) {
   return (size + 15) / 16 * 16;
@@ -541,6 +548,7 @@ void BufferManager::Upload(CommandRecordingState& recording, void* src, WGPUBuff
     desc.size=copy_size;
     desc.usage=wgpu::BufferUsage::CopySrc|wgpu::BufferUsage::MapWrite;
     desc.mappedAtCreation=true;
+    EnforceM0MemoryReserve(context_, desc.size);
     auto staging_buffer=context_.Device().CreateBuffer(&desc);
     mapped_data=staging_buffer.GetMappedRange();
     ORT_ENFORCE(mapped_data,"Failed to map GPU upload staging buffer.");
@@ -605,6 +613,7 @@ WGPUBuffer BufferManager::Create(CommandRecordingState& recording, size_t size, 
   }
   if (buffer) {
     auto buffer_guard = wgpu::Buffer::Acquire(buffer);
+    EnforceM0MemoryReserve(context_, 0);
     const uint64_t generation = M0OwnershipV2().Acquire(reinterpret_cast<uintptr_t>(buffer), size);
     bool ownership_committed = false;
     auto ownership_rollback = gsl::finally([&]() {
@@ -634,6 +643,7 @@ WGPUBuffer BufferManager::Create(CommandRecordingState& recording, size_t size, 
   if (usage & wgpu::BufferUsage::MapWrite) {
     desc.mappedAtCreation = true;  // ensure the buffer is mapped for writing at creation
   }
+  EnforceM0MemoryReserve(context_, buffer_size);
   buffer = context_.Device().CreateBuffer(&desc).MoveToCHandle();
   LOGS_DEFAULT(INFO) << "M0_RW02_ALLOC cached=0 requested=" << size << " actual=" << buffer_size << " handle=" << buffer;
 
@@ -740,6 +750,7 @@ void BufferManager::DownloadRange(CommandRecordingState& recording,WGPUBuffer sr
   desc.size = buffer_size;
   desc.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
 
+  EnforceM0MemoryReserve(context_, desc.size);
   auto staging_buffer = context_.Device().CreateBuffer(&desc);
   auto& command_encoder = context_.GetCommandEncoder(recording);
   context_.EndComputePass(recording);

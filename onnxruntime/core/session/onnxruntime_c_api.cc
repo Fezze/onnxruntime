@@ -23,6 +23,7 @@
 #include "core/framework/execution_provider.h"
 #include "core/framework/onnxruntime_typeinfo.h"
 #include "core/framework/ort_value.h"
+#include "core/framework/m0_fullgpu_preinit_admission.h"
 #include "core/framework/plugin_ep_stream.h"
 #include "core/framework/tensor.h"
 #include "core/framework/tensor_type_and_shape.h"
@@ -935,6 +936,22 @@ ORT_API_STATUS_IMPL(OrtApis::CreateSession, _In_ const OrtEnv* env, _In_ const O
 ORT_API_STATUS_IMPL(OrtApis::CreateSessionFromArray, _In_ const OrtEnv* env, _In_ const void* model_data,
                     size_t model_data_length, _In_ const OrtSessionOptions* options, _Outptr_ OrtSession** out) {
   API_IMPL_BEGIN
+#if !defined(ORT_MINIMAL_BUILD)
+  if (options && M0FullGpuPreinitRequestedV1(options->value)) {
+    ORT_API_RETURN_IF_STATUS_NOT_OK(M0FullGpuValidatePreinitOptionsV1(options->value));
+    ORT_API_RETURN_IF_STATUS_NOT_OK(M0FullGpuValidateIngressAuthoritiesV1(options->value));
+    ORT_API_RETURN_IF(!options->provider_factories.empty() || !options->custom_op_domains_.empty() ||
+                          !model_data || model_data_length != 325532387,
+                      ORT_FAIL, "RW07_PRELOAD_DENY_UNREVIEWED_CONTRACT");
+    // Use the closed original owner, without generic provider/domain wiring.
+    // Load authenticates the owned bytes; Initialize retains all native gates.
+    auto pending = std::make_unique<InferenceSession>(options->value, env->GetEnvironment());
+    ORT_API_RETURN_IF_STATUS_NOT_OK(pending->Load(model_data, static_cast<int>(model_data_length)));
+    ORT_API_RETURN_IF_STATUS_NOT_OK(pending->Initialize());
+    *out = reinterpret_cast<OrtSession*>(pending.release());
+    return nullptr;
+  }
+#endif
   std::unique_ptr<onnxruntime::InferenceSession> sess;
   ORT_API_RETURN_IF_ERROR(CreateSessionAndLoadModel(options, env, nullptr, model_data, model_data_length, sess));
   ORT_API_RETURN_IF_ERROR(InitializeSession(options, *sess));

@@ -91,6 +91,9 @@ struct M0NativeModuleReceiptV2 {
 struct M0NativeLoweringReceiptV1 {
   size_t original_nodes = 0, covered_nodes = 0, derived_nodes = 0;
   bool original_model_retained = false, original_ports_retained = false;
+  bool initializer_payloads_transferred = false;
+  size_t retained_derived_raw_bytes = 0;
+  size_t transferred_initializer_raw_bytes = 0;
   // Only the actual private owner's derived bytes, never a caller's graph.
   std::string derived_model_wire, derived_sha256, ledger_sha256;
 };

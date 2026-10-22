@@ -61,7 +61,17 @@ common::Status M0NativeLoweringQualificationV1::Prepare(InferenceSession& sessio
   pending.derived_nodes = size_t(native->derived_.graph().node_size());
   pending.original_model_retained = session.model_.get() == source;
   pending.original_ports_retained = inputs == source->MainGraph().GetInputs() && outputs == source->MainGraph().GetOutputs();
-  pending.derived_model_wire = native->derived_.SerializeAsString();
+  pending.initializer_payloads_transferred = native->initializer_payloads_transferred_;
+  pending.transferred_initializer_raw_bytes = native->transferred_initializer_raw_bytes_;
+  for(const auto& tensor:native->derived_.graph().initializer())
+    pending.retained_derived_raw_bytes += tensor.raw_data().size();
+  // Full wire materialization is qualification-only and requires an explicit
+  // receipt. The application retains metadata plus sealed payload references.
+  ONNX_NAMESPACE::ModelProto evidence_proto(native->derived_);
+  for(int i=0;i<evidence_proto.graph().initializer_size();++i)
+    evidence_proto.mutable_graph()->mutable_initializer(i)->CopyFrom(
+        native->ExpectedInitializer(native->derived_.graph().initializer(i)));
+  pending.derived_model_wire = evidence_proto.SerializeAsString();
   pending.derived_sha256 = native->derived_sha256_;
   pending.ledger_sha256 = native->ledger_sha256_;
   *receipt = std::move(pending);
