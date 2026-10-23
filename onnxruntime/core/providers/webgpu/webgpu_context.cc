@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include "core/common/m0_memory_reserve_v1.h"
 
 #if defined(_WIN32) && defined(ENABLE_D3D12_FILE_LOADING)
 #include <d3d12.h>
@@ -778,7 +779,10 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
   // of starting another build for the same key.
   std::optional<PendingPipelineBuild> pending_build;
   const std::vector<int>* deferred_ranks = nullptr;
-  const wgpu::BindGroupLayout* bind_group_layout = nullptr;
+  // Uniform allocation can drain the current window under memory pressure.
+  // Own handles before that drain retires pending builds or grows the cache.
+  wgpu::BindGroupLayout bind_group_layout;
+  std::optional<wgpu::ComputePipeline> cached_pipeline;
   if (program_artifact == nullptr) {
     PendingPipelineBuild* in_flight_build = FindPendingPipelineBuild(recording, key);
 
@@ -796,9 +800,10 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
       in_flight_build = &*pending_build;
     }
     deferred_ranks = &in_flight_build->shape_uniform_ranks;
-    bind_group_layout = &in_flight_build->bind_group_layout;
+    bind_group_layout = in_flight_build->bind_group_layout;
   } else {
-    bind_group_layout = &program_artifact->bind_group_layout;
+    bind_group_layout = program_artifact->bind_group_layout;
+    cached_pipeline = program_artifact->compute_pipeline;
   }
 
   // prepare shape uniforms for shader variables (if any) and user defined uniforms
@@ -996,11 +1001,9 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
   // and encode the dispatch commands.
   webgpu::CapturedCommandInfo command;
   command.program_key = key;
-  if (program_artifact != nullptr) {
-    command.compute_pipeline = program_artifact->compute_pipeline;
-  }
+  command.compute_pipeline = std::move(cached_pipeline);
   command.bind_group = CreateBindGroup(bind_buffers, bind_buffers_segments, bind_buffer_offsets, bind_buffer_sizes, uniform_buffer_total_size,
-                                       *bind_group_layout, program.Name());
+                                       bind_group_layout, program.Name());
   command.pending_build = std::move(pending_build);
   recording.has_unsubmitted_work.store(true, std::memory_order_relaxed);
   if (uniform_buffer) {
@@ -1430,6 +1433,25 @@ Status WebGpuContext::CheckDeviceStatus() const {
   return device_error_state_->status;
 }
 
+Status WebGpuContext::M0DrainOnMemoryPressureV1(const webgpu::BufferManager& buffer_mgr,
+                                              CommandRecordingState& recording,
+                                              uint64_t allocation_bytes) {
+  if (!recording.m0_submission_budget_bytes ||
+      !recording.has_unsubmitted_work.load(std::memory_order_relaxed)) return Status::OK();
+  ORT_RETURN_IF_NOT(M0BoundedSubmissionsActiveV1() && !M0OwnershipV2().Poisoned(),
+                    "RW07 native allocation recording inactive or poisoned");
+  uint64_t available=0;
+  const auto reading=M0ReadMemoryAvailableV1(available);
+  if(!reading.IsOK())return M0CheckMemoryReserveV1(allocation_bytes);
+  if(M0MemoryHeadroomV1(available,allocation_bytes))return Status::OK();
+  // Drain our own queued references under pressure; monitor mode then continues.
+  LOGS_DEFAULT(INFO) << "M0_RW07_MEMORY_PRESSURE_DRAIN phase=begin allocation_bytes=" << allocation_bytes
+                     << " queued_reference_bytes=" << recording.m0_queued_reference_bytes;
+  ORT_RETURN_IF_ERROR(FlushAndWaitChecked(buffer_mgr, recording));
+  LOGS_DEFAULT(INFO) << "M0_RW07_MEMORY_PRESSURE_DRAIN phase=done allocation_bytes=" << allocation_bytes;
+  return Status::OK();
+}
+
 Status WebGpuContext::M0BeforeEnqueueV1(const webgpu::BufferManager& buffer_mgr,
                                       CommandRecordingState& recording,uint64_t reference_bytes){
   const uint64_t budget=recording.m0_submission_budget_bytes;
@@ -1709,6 +1731,15 @@ void WebGpuContext::DispatchCommand(const webgpu::CapturedCommandInfo& command,
                                             command.dispatch_group[1],
                                             command.dispatch_group[2]);
   }
+  uint64_t groups=uint64_t(command.dispatch_group[0])*command.dispatch_group[1];
+  // Counters are observations; an unrepresentable grid must not change dispatch.
+  const uint64_t z=command.dispatch_group[2];
+  const bool saturated=z&&groups>std::numeric_limits<uint64_t>::max()/z;
+  if(saturated)groups=std::numeric_limits<uint64_t>::max();
+  else groups*=z;
+  const auto ordinal=M0OwnershipV2().RecordWorkload(command.indirect_buffer
+      ? webgpu::M0WorkloadEventV1::IndirectDispatch : webgpu::M0WorkloadEventV1::Dispatch,groups,uint64_t(saturated));
+  if(ordinal%128==0)M0OwnershipV2().LogWorkload("dispatch_encoded");
   WriteTimestamp(recording, recording.num_pending_dispatches * 2 + 1);
   ++recording.num_pending_dispatches;
   if (recording.num_pending_dispatches >= max_num_pending_dispatches_ ||

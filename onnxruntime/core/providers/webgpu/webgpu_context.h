@@ -341,6 +341,8 @@ class WebGpuContext final {
                             bool diagnostic_zero_deadline = false);
   Status M0BeforeEnqueueV1(const webgpu::BufferManager& buffer_mgr, CommandRecordingState& recording,
                          uint64_t reference_bytes);
+  Status M0DrainOnMemoryPressureV1(const webgpu::BufferManager& buffer_mgr,
+                                  CommandRecordingState& recording, uint64_t allocation_bytes);
   Status M0FlushIfBudgetReachedV1(const webgpu::BufferManager& buffer_mgr, CommandRecordingState& recording);
 
   // Context-level managers are shared by sessions and synchronize their buffer caches internally.

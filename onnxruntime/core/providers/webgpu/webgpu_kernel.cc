@@ -25,12 +25,17 @@ Status WebGpuKernel::Compute(OpKernelContext* p_op_kernel_context) const {
     webgpu_context_.PushErrorScope();
   }
 
+  webgpu_context_.M0OwnershipV2().RecordWorkload(M0WorkloadEventV1::OperatorStarted);
   Status s = ComputeInternal(context);
 
   if (webgpu_context_.ValidationMode() >= ValidationMode::Full) {
     ORT_RETURN_IF_ERROR(webgpu_context_.PopErrorScope());
   }
 
+  if(s.IsOK()){
+    const auto ordinal=webgpu_context_.M0OwnershipV2().RecordWorkload(M0WorkloadEventV1::OperatorCompleted);
+    if(ordinal%64==0)webgpu_context_.M0OwnershipV2().LogWorkload("operator_completed");
+  }
   return s;
 }
 

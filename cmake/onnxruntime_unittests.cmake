@@ -821,6 +821,8 @@ if(onnxruntime_USE_WEBGPU AND NOT onnxruntime_USE_EP_API_ADAPTERS)
     "${TEST_SRC_DIR}/providers/webgpu/*.h")
 
   list(APPEND onnxruntime_test_providers_src ${onnxruntime_test_providers_webgpu_src})
+  set_property(SOURCE "${TEST_SRC_DIR}/providers/webgpu/m0_signal_numerics_test.cc"
+    APPEND PROPERTY INCLUDE_DIRECTORIES "${ONNXRUNTIME_ROOT}/../model_package/src")
   list(APPEND onnxruntime_test_providers_dependencies onnxruntime_providers_webgpu)
   list(APPEND onnxruntime_test_providers_libs onnxruntime_providers_webgpu)
 endif()
@@ -1356,6 +1358,7 @@ if(NOT onnxruntime_MINIMAL_BUILD)
   set_property(SOURCE
     "${TEST_SRC_DIR}/framework/m0_fullgpu_preinit_test.cc"
     "${TEST_SRC_DIR}/framework/m0_native_lowering_test.cc"
+    "${TEST_SRC_DIR}/framework/m0_module_audit_test.cc"
     APPEND PROPERTY INCLUDE_DIRECTORIES "${ONNXRUNTIME_ROOT}/../model_package/src")
 endif()
 

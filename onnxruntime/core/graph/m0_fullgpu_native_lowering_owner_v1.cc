@@ -29,6 +29,8 @@ M0FullGpuNativeLoweringOwnerV1::~M0FullGpuNativeLoweringOwnerV1(){
 #include "sha256.h"
 #include "core/graph/m0_proto_hash_v1.h"
 #include "core/graph/m0_bounded_backing_v1.h"
+#include "core/graph/m0_fullgpu_native_memory_plan_v1.h"
+#include "core/common/m0_memory_reserve_v1.h"
 namespace onnxruntime {
 const ONNX_NAMESPACE::TensorProto& M0FullGpuNativeLoweringOwnerV1::ExpectedInitializer(
  const ONNX_NAMESPACE::TensorProto& metadata)const{
@@ -79,21 +81,60 @@ uint64_t InitializerEnvelope(const ONNX_NAMESPACE::ModelProto& model){
 }
 }  // namespace
 uint32_t M0FullGpuNativeLoweringOwnerV1::SelectPhysicalCapacity(M0NativeGpuModuleV2& module,
- const ONNX_NAMESPACE::ModelProto& original,M0NativeDeviceLimitsV1& limits,uint64_t& initializer_bytes){
+ const ONNX_NAMESPACE::ModelProto& original,const Model& source,ExecutionOrder execution_order,M0NativeDeviceLimitsV1& limits,
+ uint64_t& initializer_bytes,std::vector<std::string>& memory_order,uint64_t& available_bytes,uint64_t& peak_bytes){
  limits=module.DeviceLimits();initializer_bytes=InitializerEnvelope(original);
+ // The seal contains metadata and independently owned raw byte views. Building
+ // only its compiled wiring avoids another host copy of the model weights.
+ for(const auto& tensor:original.graph().initializer())
+  ORT_ENFORCE(tensor.raw_data().empty(),"RW07_NATIVE_MEMORY_PLAN_METADATA_SOURCE");
+ M0FullGpuNativeBuilderV1 metadata(original,original.graph(),m0_internal::M0NativeMemoryPlanV1::kLogicalCapacity);
+ M0FullGpuNativeEncoderV1 encoder;M0FullGpuNativeOutputV1 outputs;
+ ORT_THROW_IF_ERROR(M0AppendNativeEncoderV1(metadata,encoder));
+ ORT_THROW_IF_ERROR(M0AppendNativeDecoderV1(metadata,encoder,outputs));metadata.Finalize(outputs);
+ const m0_internal::M0NativeMemoryPlanV1 memory(metadata.derived_.graph(),source.MainGraph(),execution_order);
+ const auto reading=M0ReadMemoryAvailableV1(available_bytes);
+ if(kM0EnforceMemoryReserveV1)ORT_THROW_IF_ERROR(reading);
+ if(!reading.IsOK()) {
+  LOGS_DEFAULT(WARNING)<<"M0_RW07_MEMORY_WARNING phase=capacity available=unknown policy=monitor";
+ }
+ ORT_ENFORCE(memory.InitializerBytes()<=(std::numeric_limits<uint64_t>::max()-metadata.derived_.ByteSizeLong())/2,
+  "RW07_NATIVE_MEMORY_PLAN_WEIGHT_OVERFLOW");
+ const uint64_t future_weights=2*memory.InitializerBytes()+metadata.derived_.ByteSizeLong();
+ const uint64_t minimum_peak=memory.PeakBytes(1);
+ const uint64_t planning_budget=M0MemoryPlanningBudgetV1(available_bytes,future_weights,minimum_peak);
+ if(!reading.IsOK()||(planning_budget>=minimum_peak&&
+    (available_bytes<kM0MemoryReserveBytesV1||future_weights>available_bytes-kM0MemoryReserveBytesV1||
+     minimum_peak>(available_bytes-kM0MemoryReserveBytesV1-future_weights)/2))) {
+  LOGS_DEFAULT(WARNING)<<"M0_RW07_MEMORY_WARNING phase=capacity policy=monitor available_bytes="<<available_bytes
+   <<" future_weight_bytes="<<future_weights<<" minimum_peak_bytes="<<minimum_peak
+   <<" planning_budget_bytes="<<planning_budget;
+ }
+ const auto memory_fits=[&](uint32_t d){return memory.PeakBytes(d)<=planning_budget;};
  const auto fits=[&](uint32_t d){
   const auto sized=module.DeviceLimits(CarrierBytes(d),initializer_bytes,kUniformBytes);
   const auto single=module.DeviceLimits(SingleBindingBytes(d));
   ORT_ENFORCE(CapacityProfile(limits)==CapacityProfile(sized)&&CapacityProfile(limits)==CapacityProfile(single),
     "RW07_NATIVE_CAPACITY_DEVICE_CHANGED");
-  return CapacityFits(d,sized,single);
+  return CapacityFits(d,sized,single)&&memory_fits(d);
  };
- ORT_ENFORCE(fits(1),"RW07_NATIVE_CAPACITY_DEVICE_UNSUPPORTED");
+ ORT_ENFORCE(fits(1),"RW07_NATIVE_CAPACITY_DEVICE_OR_MEMORY_UNSUPPORTED available_bytes=",available_bytes,
+  " reserve_bytes=",kM0MemoryReserveBytesV1," future_weight_bytes=",future_weights,
+  " minimum_peak_bytes=",memory.PeakBytes(1));
  uint32_t low=1,high=102400;
  while(low<high){
   const uint32_t middle=low+(high-low+1)/2;
   if(fits(middle))low=middle;else high=middle-1;
  }
+ memory_order=memory.Order();peak_bytes=memory.PeakBytes(low);
+ const uint64_t remaining=available_bytes>=future_weights?available_bytes-future_weights:0;
+ const uint64_t reserved=remaining>=kM0MemoryReserveBytesV1?remaining-kM0MemoryReserveBytesV1:0;
+ const bool queued_slack=kM0EnforceMemoryReserveV1||minimum_peak<=reserved/2||
+  (minimum_peak>reserved&&minimum_peak<=remaining/2);
+ LOGS_DEFAULT(INFO)<<"M0_RW07_MEMORY_CAPACITY selected_duration="<<low<<" available_bytes="<<available_bytes
+  <<" reserve_bytes="<<kM0MemoryReserveBytesV1<<" future_weight_bytes="<<future_weights
+  <<" estimated_live_and_scratch_bytes="<<peak_bytes<<" queued_slack_bytes="<<(queued_slack?peak_bytes:0)
+  <<" planning_budget_bytes="<<planning_budget<<" memory_policy="<<(kM0EnforceMemoryReserveV1?"enforce":"monitor");
  return low;
 }
 void M0FullGpuNativeLoweringOwnerV1::ValidatePhysicalCapacity(M0NativeGpuModuleV2& module)const{
@@ -111,6 +152,7 @@ std::unique_ptr<M0FullGpuNativeLoweringOwnerV1> M0FullGpuNativeLoweringOwnerV1::
  bool device_capacity){
  std::unique_ptr<M0NativeGpuModuleV2> module;
  M0NativeDeviceLimitsV1 limits;uint64_t initializer_bytes=0;
+ std::vector<std::string> memory_order;uint64_t memory_available=0,memory_peak=0;
  const auto cancellation=session.session_options_.load_cancellation_flag;
  const auto validate=[&](){
   ORT_ENFORCE(session.model_.get()==&source&&session.is_model_loaded_&&!session.is_inited_&&!session.session_state_,
@@ -124,13 +166,16 @@ std::unique_ptr<M0FullGpuNativeLoweringOwnerV1> M0FullGpuNativeLoweringOwnerV1::
  };
  if(device_capacity){
   validate();module=M0NativeGpuModuleV2::Open(*session.session_logger_);
-  capacity=SelectPhysicalCapacity(*module,original,limits,initializer_bytes);validate();
+  capacity=SelectPhysicalCapacity(*module,original,source,session.session_options_.execution_order,limits,initializer_bytes,
+   memory_order,memory_available,memory_peak);validate();
  }
  auto pending=std::unique_ptr<M0FullGpuNativeLoweringOwnerV1>(
    new M0FullGpuNativeLoweringOwnerV1(source,session,capacity,device_capacity));
  if(device_capacity){
   pending->prepared_module_.reset(module.release());pending->device_limits_=limits;
   pending->initializer_capacity_bytes_=initializer_bytes;
+  pending->memory_plan_order_=std::move(memory_order);pending->memory_plan_available_bytes_=memory_available;
+  pending->memory_plan_peak_bytes_=memory_peak;
  }
  M0OriginalPreloadOwnerV1::ValidateNativeLoweringSource(source);
  const auto& payload_graph=source.model_proto_.graph();

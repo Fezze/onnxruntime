@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "core/providers/webgpu/webgpu_execution_provider.h"
+#include "core/common/m0_memory_reserve_v1.h"
 #if defined(_WIN32) && defined(ENABLE_D3D12_FILE_LOADING)
 #include "core/providers/webgpu/d3d12_external_data_loader.h"
 #endif
@@ -1069,6 +1070,20 @@ Status WebGpuExecutionProvider::OnRunStart(const onnxruntime::RunOptions& run_op
         !recording_->m0_submission_budget_bytes&&!recording_->m0_queued_reference_bytes,
         "RW07 native submission recording not idle");
     submission_budget=context_.DeviceLimits().maxBufferSize;
+#if defined(__ANDROID__)
+    uint64_t available_bytes=0;
+    const auto reading=M0ReadMemoryAvailableV1(available_bytes);
+    if(!reading.IsOK()||available_bytes<=kM0MemoryReserveBytesV1) {
+      LOGS_DEFAULT(WARNING)<<"M0_RW07_MEMORY_WARNING phase=submission available_bytes="<<available_bytes
+        <<" reading_valid="<<reading.IsOK()<<" policy="<<(kM0EnforceMemoryReserveV1?"enforce":"monitor");
+    }
+    if(kM0EnforceMemoryReserveV1)ORT_RETURN_IF_ERROR(reading);
+    ORT_RETURN_IF_NOT(!kM0EnforceMemoryReserveV1||available_bytes>kM0MemoryReserveBytesV1,"RW07 native submission memory reserve");
+    // Leave the other half of current headroom for live allocations/scratch.
+    // The capacity planner budgets both halves; allocation guards remain live.
+    submission_budget=std::min(submission_budget,available_bytes>kM0MemoryReserveBytesV1
+        ? std::max<uint64_t>(1,(available_bytes-kM0MemoryReserveBytesV1)/2) : 64*1024);
+#endif
     ORT_RETURN_IF_NOT(submission_budget,"RW07 native submission zero budget");
   }else{
     ORT_RETURN_IF_NOT(!recording_->m0_submission_budget_bytes&&!recording_->m0_queued_reference_bytes,
@@ -1199,13 +1214,17 @@ Status WebGpuExecutionProvider::OnRunStart(const onnxruntime::RunOptions& run_op
   }
 
   if (strict_ownership) {
+    context_.M0OwnershipV2().LogWorkload("run_begin");
     const auto stats = context_.M0OwnershipV2().Statistics();
     LOGS_DEFAULT(INFO) << "M0_RW07_RESOURCE_REQUESTS phase=begin session="
       << run_options.config_options.GetConfigOrDefault("m0.fullgpu.actual_session_v2", "")
       << " run=" << run_options.config_options.GetConfigOrDefault("m0.fullgpu.actual_run_v2", "")
       << " live_allocations=" << stats.live_allocations << " live_requested_bytes=" << stats.live_requested_bytes
       << " peak_live_requested_bytes=" << stats.peak_live_requested_bytes << " acquisitions=" << stats.acquisitions
-      << " retirements=" << stats.retirements << " includes_cache=0 includes_driver=0";
+      << " retirements=" << stats.retirements << " includes_cache=0 includes_driver=0"
+      << " bounded_submissions=" << (submission_budget != 0)
+      << " submission_budget_bytes=" << submission_budget
+      << " bounded_scope_active=" << context_.M0BoundedSubmissionsActiveV1();
   }
   recording_->m0_submission_budget_bytes=submission_budget;
   run_active_.store(true);
@@ -1233,6 +1252,7 @@ Status WebGpuExecutionProvider::OnRunEnd(bool sync_stream, const onnxruntime::Ru
   bool m0_end_scope_pending = context_.ValidationMode() >= ValidationMode::Basic;
   auto m0_end_failure = gsl::finally([&]() noexcept {
     if (!strict_ownership || m0_end_committed) return;
+    try { context_.M0OwnershipV2().LogWorkload("failed_run_end"); } catch (...) {}
     context_.M0OwnershipV2().Poison();
     graph_buffer_mgr_active_ = false;
     run_active_.store(false);
@@ -1275,6 +1295,7 @@ Status WebGpuExecutionProvider::OnRunEnd(bool sync_stream, const onnxruntime::Ru
       : context_.Flush(BufferManager(), *recording_);
   if (strict_ownership && flush_status.IsOK()) {
     LOGS_DEFAULT(INFO) << "M0_RW07_RUN_QUEUE_COMPLETE timeline=" << recording_.get();
+    context_.M0OwnershipV2().LogWorkload("checked_run_end");
     const auto stats = context_.M0OwnershipV2().Statistics();
     LOGS_DEFAULT(INFO) << "M0_RW07_RESOURCE_REQUESTS phase=checked_end session="
       << run_options.config_options.GetConfigOrDefault("m0.fullgpu.actual_session_v2", "")

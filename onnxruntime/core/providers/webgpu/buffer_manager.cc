@@ -14,8 +14,10 @@ namespace {
 
 constexpr size_t kM0TransferChunkBytes = 8 * 1024 * 1024;
 
-void EnforceM0MemoryReserve(const WebGpuContext& context, uint64_t additional_bytes) {
+void EnforceM0MemoryReserve(WebGpuContext& context, const BufferManager& manager,
+                            CommandRecordingState& recording, uint64_t additional_bytes) {
   if (context.M0BoundedSubmissionsActiveV1()) {
+    ORT_THROW_IF_ERROR(context.M0DrainOnMemoryPressureV1(manager, recording, additional_bytes));
     ORT_THROW_IF_ERROR(M0CheckMemoryReserveV1(additional_bytes));
   }
 }
@@ -531,6 +533,8 @@ void BufferManager::Upload(CommandRecordingState& recording, void* src, WGPUBuff
   if (mapped_data) {
     memcpy(mapped_data, src, size);
     wgpuBufferUnmap(dst);
+    M0OwnershipV2().RecordWorkload(M0WorkloadEventV1::Upload,size,0);
+    M0OwnershipV2().LogWorkload("upload_mapped");
     return;
   }
 
@@ -540,15 +544,15 @@ void BufferManager::Upload(CommandRecordingState& recording, void* src, WGPUBuff
     const size_t payload=std::min(chunk_limit,size-offset),copy_size=NormalizeCopySize(payload);
     ORT_ENFORCE(offset%4==0&&offset<=dst_bytes&&copy_size<=dst_bytes-offset,
                 "GPU upload range exceeds destination backing.");
-    if(recording.m0_submission_budget_bytes){
-      ORT_ENFORCE(dst_bytes<=std::numeric_limits<uint64_t>::max()-copy_size,"RW07 upload reference size overflow");
-      ORT_THROW_IF_ERROR(context_.M0BeforeEnqueueV1(*this,recording,dst_bytes+copy_size));
-    }
     wgpu::BufferDescriptor desc{};
     desc.size=copy_size;
     desc.usage=wgpu::BufferUsage::CopySrc|wgpu::BufferUsage::MapWrite;
     desc.mappedAtCreation=true;
-    EnforceM0MemoryReserve(context_, desc.size);
+    EnforceM0MemoryReserve(context_, *this, recording, desc.size);
+    if(recording.m0_submission_budget_bytes){
+      ORT_ENFORCE(dst_bytes<=std::numeric_limits<uint64_t>::max()-copy_size,"RW07 upload reference size overflow");
+      ORT_THROW_IF_ERROR(context_.M0BeforeEnqueueV1(*this,recording,dst_bytes+copy_size));
+    }
     auto staging_buffer=context_.Device().CreateBuffer(&desc);
     mapped_data=staging_buffer.GetMappedRange();
     ORT_ENFORCE(mapped_data,"Failed to map GPU upload staging buffer.");
@@ -559,6 +563,8 @@ void BufferManager::Upload(CommandRecordingState& recording, void* src, WGPUBuff
     auto& command_encoder=context_.GetCommandEncoder(recording);
     context_.EndComputePass(recording);
     command_encoder.CopyBufferToBuffer(staging_buffer,0,dst,offset,copy_size);
+    M0OwnershipV2().RecordWorkload(M0WorkloadEventV1::Upload,payload,copy_size);
+    M0OwnershipV2().LogWorkload("upload_encoded");
     // Wait before allocating another staging chunk, not merely at the queue budget.
     if(chunked){
       ORT_THROW_IF_ERROR(context_.FlushAndWaitChecked(*this,recording));
@@ -597,6 +603,7 @@ void BufferManager::MemCpyRange(CommandRecordingState& recording,WGPUBuffer src,
   auto& command_encoder = context_.GetCommandEncoder(recording);
   context_.EndComputePass(recording);
   command_encoder.CopyBufferToBuffer(src,source_offset,dst,destination_offset,size);
+  M0OwnershipV2().RecordWorkload(M0WorkloadEventV1::DeviceCopy,size);
   ORT_THROW_IF_ERROR(context_.M0FlushIfBudgetReachedV1(*this,recording));
 }
 
@@ -613,7 +620,7 @@ WGPUBuffer BufferManager::Create(CommandRecordingState& recording, size_t size, 
   }
   if (buffer) {
     auto buffer_guard = wgpu::Buffer::Acquire(buffer);
-    EnforceM0MemoryReserve(context_, 0);
+    EnforceM0MemoryReserve(context_, *this, recording, 0);
     const uint64_t generation = M0OwnershipV2().Acquire(reinterpret_cast<uintptr_t>(buffer), size);
     bool ownership_committed = false;
     auto ownership_rollback = gsl::finally([&]() {
@@ -643,7 +650,7 @@ WGPUBuffer BufferManager::Create(CommandRecordingState& recording, size_t size, 
   if (usage & wgpu::BufferUsage::MapWrite) {
     desc.mappedAtCreation = true;  // ensure the buffer is mapped for writing at creation
   }
-  EnforceM0MemoryReserve(context_, buffer_size);
+  EnforceM0MemoryReserve(context_, *this, recording, buffer_size);
   buffer = context_.Device().CreateBuffer(&desc).MoveToCHandle();
   LOGS_DEFAULT(INFO) << "M0_RW02_ALLOC cached=0 requested=" << size << " actual=" << buffer_size << " handle=" << buffer;
 
@@ -736,10 +743,6 @@ void BufferManager::DownloadRange(CommandRecordingState& recording,WGPUBuffer sr
   const uint64_t source_bytes=wgpuBufferGetSize(src);
   ORT_ENFORCE(source_offset<=source_bytes&&buffer_size<=source_bytes-source_offset,
               "GPU download range exceeds source backing.");
-  if(recording.m0_submission_budget_bytes){
-    ORT_ENFORCE(source_bytes<=std::numeric_limits<uint64_t>::max()-buffer_size,"RW07 download reference size overflow");
-    ORT_THROW_IF_ERROR(context_.M0BeforeEnqueueV1(*this,recording,source_bytes+buffer_size));
-  }
   // Encode pending deferred dispatches before recording the readback; the flush below submits both
   // in order.
   ORT_THROW_IF_ERROR(context_.EncodeDeferredDispatches(recording));
@@ -750,11 +753,17 @@ void BufferManager::DownloadRange(CommandRecordingState& recording,WGPUBuffer sr
   desc.size = buffer_size;
   desc.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
 
-  EnforceM0MemoryReserve(context_, desc.size);
+  EnforceM0MemoryReserve(context_, *this, recording, desc.size);
+  if(recording.m0_submission_budget_bytes){
+    ORT_ENFORCE(source_bytes<=std::numeric_limits<uint64_t>::max()-buffer_size,"RW07 download reference size overflow");
+    ORT_THROW_IF_ERROR(context_.M0BeforeEnqueueV1(*this,recording,source_bytes+buffer_size));
+  }
   auto staging_buffer = context_.Device().CreateBuffer(&desc);
   auto& command_encoder = context_.GetCommandEncoder(recording);
   context_.EndComputePass(recording);
   command_encoder.CopyBufferToBuffer(src, source_offset, staging_buffer, 0, buffer_size);
+  M0OwnershipV2().RecordWorkload(M0WorkloadEventV1::Download,size,buffer_size);
+  M0OwnershipV2().LogWorkload("download_encoded");
   ORT_THROW_IF_ERROR(context_.Flush(*this, recording));
   ORT_THROW_IF_ERROR(context_.M0FlushIfBudgetReachedV1(*this,recording));
 

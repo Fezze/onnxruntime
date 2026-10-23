@@ -1,12 +1,16 @@
 // RW04 isolated v1. Fixed seven-node recipe; no generic shape/control changes.
 #include "core/providers/webgpu/webgpu_kernel.h"
 #include "core/providers/webgpu/shader_helper.h"
+#if defined(ORT_USE_EP_API_ADAPTERS)
 #include "core/providers/webgpu/ep/sync_stream.h"
+#endif
 #include <atomic>
 
 namespace onnxruntime::webgpu {
 namespace {
+#if defined(ORT_USE_EP_API_ADAPTERS)
 std::atomic<void*> previous_stream{nullptr}; // Diagnostic only; adapter keeps all involved Sessions alive.
+#endif
 ProgramInput WordsIn(const Tensor* t, uint32_t words) {
   ProgramInput p(t, ProgramTensorMetadataDependency::None, TensorShape{words}, 1);
   p.var_type = ProgramVariableDataType::Uint32;
@@ -109,6 +113,7 @@ class ShapeRegion final : public WebGpuKernel {
     if(rank==3) ORT_RETURN_IF_NOT(d[0]>=0&&d[0]<=1&&d[1]>=0&&d[1]<=512&&d[2]>=0&&d[2]<=1024,"RW04 admission: bounded dimensions required");
     if(rank==1) ORT_RETURN_IF_NOT(d[0]>=0&&d[0]<=1024,"RW04 admission: diagnostic rank-one bound");
     ORT_RETURN_IF_NOT(fault_>=0&&fault_<=4,"RW04 admission: invalid diagnostic fault");
+#if defined(ORT_USE_EP_API_ADAPTERS)
     auto* current_stream=c.KernelContext().GetSyncStream();
     if(fault_==4){
       auto* foreign=previous_stream.load();
@@ -128,6 +133,9 @@ class ShapeRegion final : public WebGpuKernel {
       return ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,rejected?"RW04 diagnostic: foreign-Session allocation rejected":"RW04 diagnostic FAILURE: foreign-Session allocation unexpectedly accepted");
     }
     previous_stream.store(current_stream);
+#else
+    ORT_RETURN_IF(fault_==4,"RW04 diagnostic: foreign-Session allocation requires plugin stream API");
+#endif
     const auto* expected=audit_?c.Input<Tensor>(1):nullptr;
     if(audit_) ORT_RETURN_IF_NOT(expected&&expected->IsDataType<uint32_t>()&&expected->Shape()==TensorShape{22},"RW04 audit: expected UINT32[22]");
     auto* y=c.Output(0,rank==3?TensorShape{b,t,12,64}:TensorShape{0,0,12,64});

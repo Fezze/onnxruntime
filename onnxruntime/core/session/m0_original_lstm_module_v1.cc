@@ -12,7 +12,7 @@
 #include <filesystem>
 #include <sys/stat.h>
 #include <unistd.h>
-#include "sha256.h"
+#include "core/session/m0_module_file_lease_v1.h"
 // Generated after provider strip; session-only dependency, never provider-linked.
 #include "m0_qualified_webgpu_provider_v1.inc"
 #include "core/framework/error_code_helper.h"
@@ -27,43 +27,13 @@
 namespace onnxruntime {
 namespace {
 void M0OriginalLstmCoreAnchorV1() {}
-struct FileLeaseV1 {
-  int fd = -1;
-  std::filesystem::path path;
-  struct stat stamp{};
-  ~FileLeaseV1() {
-    if (fd >= 0) close(fd);
-  }
-  void Verify() const {
-    struct stat current{}, named{};
-    ORT_ENFORCE(fd >= 0 && fstat(fd, &current) == 0 && stat(path.c_str(), &named) == 0,
-                "RW07_LSTM_MODULE_FILE_STAT");
-    ORT_ENFORCE(S_ISREG(current.st_mode) && current.st_dev == stamp.st_dev && current.st_ino == stamp.st_ino &&
-                    named.st_dev == stamp.st_dev && named.st_ino == stamp.st_ino && current.st_size == stamp.st_size &&
-                    current.st_mtim.tv_sec == stamp.st_mtim.tv_sec && current.st_mtim.tv_nsec == stamp.st_mtim.tv_nsec &&
-                    current.st_ctim.tv_sec == stamp.st_ctim.tv_sec && current.st_ctim.tv_nsec == stamp.st_ctim.tv_nsec,
-                "RW07_LSTM_MODULE_FILE_CHANGED");
-    model_package::Sha256 hash;
-    std::array<char, 65536> bytes;
-    off_t offset = 0;
-    while (offset < current.st_size) {
-      ssize_t count = pread(fd, bytes.data(), bytes.size(), offset);
-      if (count < 0 && errno == EINTR) continue;
-      ORT_ENFORCE(count > 0, "RW07_LSTM_MODULE_FILE_READ");
-      hash.Update(bytes.data(), static_cast<size_t>(count));
-      offset += count;
-    }
-    ORT_ENFORCE(hash.FinalHex() == kM0QualifiedWebGpuProviderSha256V1, "RW07_LSTM_MODULE_DIGEST");
-    struct stat after{};
-    ORT_ENFORCE(fstat(fd, &after) == 0 && after.st_size == current.st_size &&
-                    after.st_mtim.tv_sec == current.st_mtim.tv_sec && after.st_mtim.tv_nsec == current.st_mtim.tv_nsec &&
-                    after.st_ctim.tv_sec == current.st_ctim.tv_sec && after.st_ctim.tv_nsec == current.st_ctim.tv_nsec,
-                "RW07_LSTM_MODULE_HASH_RACE");
-  }
-};
 }  // namespace
 struct M0OriginalLstmModuleV1::Impl {
-  FileLeaseV1 file;
+#if defined(ORT_M0_DEEP_MODULE_AUDIT)
+  M0ModuleFileLeaseV1 file{kM0QualifiedWebGpuProviderSha256V1, true};
+#else
+  M0ModuleFileLeaseV1 file{kM0QualifiedWebGpuProviderSha256V1};
+#endif
   OrtEnvPtr env{nullptr, OrtEnv::Release};
   std::unique_ptr<EpLibraryPlugin> library;
   OrtSessionOptions options;
@@ -113,12 +83,12 @@ std::unique_ptr<M0OriginalLstmModuleV1> M0OriginalLstmModuleV1::Open(const loggi
   ORT_ENFORCE(impl->file.fd >= 0 && fstat(impl->file.fd, &impl->file.stamp) == 0 &&
                   impl->file.stamp.st_size > 0,
               "RW07_LSTM_MODULE_FILE_OPEN");
-  impl->file.Verify();
+  impl->file.Verify(true);
   impl->library = std::make_unique<EpLibraryPlugin>("rw07-private-original-lstm449-v1", impl->file.path);
   ORT_THROW_IF_ERROR(impl->library->M0LoadOriginalLstmV1());
-  impl->file.Verify();
+  impl->file.Verify(true);
   ORT_THROW_IF_ERROR(impl->library->M0QueryOriginalLstmV1(impl->binding));
-  impl->file.Verify();
+  impl->file.Verify(true);
   OrtEpFactory* selected = nullptr;
   size_t factory_count = 0;
   for (auto* candidate : impl->library->GetFactories()) {
@@ -176,7 +146,9 @@ std::unique_ptr<M0OriginalLstmModuleV1> M0OriginalLstmModuleV1::Open(const loggi
   ORT_ENFORCE(impl->provider && impl->provider->Type() == kWebGpuExecutionProvider, "RW07_LSTM_MODULE_EP");
   impl->registry = impl->provider->GetKernelRegistry();
   ORT_ENFORCE(impl->registry && impl->binding.callback && impl->binding.state, "RW07_LSTM_MODULE_REGISTRY");
-  impl->file.Verify();
+  impl->file.Verify(true);
+  LOGS(logger, INFO) << "M0_RW07_MODULE_AUDIT deep_audit=" << impl->file.DeepAuditEnabled()
+                     << " load_sha256=1 file_stat=1 resource_registry_audit=" << impl->file.DeepAuditEnabled();
   return std::unique_ptr<M0OriginalLstmModuleV1>(new M0OriginalLstmModuleV1(std::move(impl)));
 }
 PluginExecutionProvider& M0OriginalLstmModuleV1::Provider() const {
@@ -191,10 +163,12 @@ std::shared_ptr<KernelRegistry> M0OriginalLstmModuleV1::Registry() const {
   impl_->file.Verify();
   return impl_->registry;
 }
+bool M0OriginalLstmModuleV1::AuditRegistry(uintptr_t handle) const {
+  return impl_->file.AuditRegistry(handle);
+}
 M0OriginalLstmModuleV1::NativeSnapshotV1 M0OriginalLstmModuleV1::ReadNativeSnapshot(
-    uintptr_t handle,uint64_t required_bytes) const {
-  // Each operation authenticates its complete live observation before and
-  // after querying. No digest or initialization permission is cached.
+    uintptr_t handle,uint64_t required_bytes,bool audit_bindings) const {
+  // File identity and live context/resource checks remain active in both modes.
   impl_->file.Verify();
   NativeSnapshotV1 result;
   ORT_ENFORCE(impl_->provider&&impl_->provider->GetOrtEp()&&impl_->providers&&impl_->registry&&
@@ -204,8 +178,10 @@ M0OriginalLstmModuleV1::NativeSnapshotV1 M0OriginalLstmModuleV1::ReadNativeSnaps
   result.provider=impl_->provider;
   result.providers=impl_->providers.get();
   ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeResourceV3(impl_->provider->GetOrtEp(),0,0,result.context));
-  for(const auto& record:kM0NativeKernelRecordsV2)
-    ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeKernelV2(record.id,result.bindings[record.id-1]));
+  if (audit_bindings) {
+    for(const auto& record:kM0NativeKernelRecordsV2)
+      ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeKernelV2(record.id,result.bindings[record.id-1]));
+  }
   if(handle||required_bytes)
     ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeResourceV3(
         impl_->provider->GetOrtEp(),handle,required_bytes,result.resource));
@@ -271,7 +247,8 @@ std::unique_ptr<M0OriginalLstmModuleV1> M0OriginalLstmModuleV1::Open(const loggi
 PluginExecutionProvider& M0OriginalLstmModuleV1::Provider() const { ORT_THROW("RW07_LSTM_MODULE_UNSUPPORTED"); }
 const ExecutionProviders& M0OriginalLstmModuleV1::Providers() const { ORT_THROW("RW07_LSTM_MODULE_UNSUPPORTED"); }
 std::shared_ptr<KernelRegistry> M0OriginalLstmModuleV1::Registry() const { ORT_THROW("RW07_LSTM_MODULE_UNSUPPORTED"); }
-M0OriginalLstmModuleV1::NativeSnapshotV1 M0OriginalLstmModuleV1::ReadNativeSnapshot(uintptr_t,uint64_t) const {
+bool M0OriginalLstmModuleV1::AuditRegistry(uintptr_t) const { ORT_THROW("RW07_NATIVE_MODULE_UNSUPPORTED"); }
+M0OriginalLstmModuleV1::NativeSnapshotV1 M0OriginalLstmModuleV1::ReadNativeSnapshot(uintptr_t,uint64_t,bool) const {
   ORT_THROW("RW07_NATIVE_MODULE_UNSUPPORTED");
 }
 const M0PluginKernelCreatorBindingV1& M0OriginalLstmModuleV1::Binding() const { ORT_THROW("RW07_LSTM_MODULE_UNSUPPORTED"); }

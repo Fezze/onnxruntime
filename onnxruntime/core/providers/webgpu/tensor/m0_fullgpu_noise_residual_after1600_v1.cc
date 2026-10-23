@@ -18,6 +18,7 @@ using m0_residual_stages::StorageBudgetWithWindow;
 using m0_residual_stages::StorageBudgetWithWindows;
 using m0_residual_stages::GeneratorStyleParameters;
 using m0_residual_stages::GeneratorNormSnake;
+using m0_residual_stages::GeneratorNormStatistics;
 using m0_residual_stages::GeneratorResidualConv;
 using m0_residual_stages::GeneratorResidualAdd;
 class Guard final : public Program<Guard> {
@@ -127,7 +128,7 @@ class NoiseResidualExtent final : public WebGpuKernel {
     ORT_RETURN_IF_NOT(Gpu(y)&&y->IsDataType<float>()&&Gpu(out)&&out->IsDataType<uint32_t>(),"RW07 noise residual output types");
     auto activated=c.CreateGPUTensor(x->DataType(),TensorShape{1,tile_channels,capacity_});
     auto conv=c.CreateGPUTensor(x->DataType(),TensorShape{1,channels,capacity_});
-    auto coefficients=c.CreateGPUTensor(x->DataType(),TensorShape{channels,4});
+    auto coefficients=c.CreateGPUTensor(x->DataType(),TensorShape{channels,6});
     std::array<const Tensor*,5> outputs{y,out,&activated,&conv,&coefficients};
     for(size_t i=0;i<outputs.size();i++){
       ORT_RETURN_IF_ERROR(binding(outputs[i]));
@@ -178,11 +179,14 @@ class NoiseResidualExtent final : public WebGpuKernel {
         .SetWorkgroupSize(1).SetDispatchGroupSize(1)
         .AddUniformVariables({pc,oc,channels,minimum,maximum,modulus,remainder,uint32_t(paired),source_identity,identity});
     ORT_RETURN_IF_ERROR(c.RunProgram(guard));
+    uint64_t dispatches=1;
     const auto dispatch_window=[&](auto& program,uint32_t count)->Status{
       const uint64_t window_groups=(uint64_t(count)*oc+63)/64;
       const uint64_t gx=std::min(window_groups,limit),gy=(window_groups+gx-1)/gx;
       program.SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy));
-      return c.RunProgram(program);
+      ORT_RETURN_IF_ERROR(c.RunProgram(program));
+      ++dispatches;
+      return Status::OK();
     };
     for(uint32_t h=0;h<2;h++){
       const auto* input=h==0?x:&conv;auto* normout=&activated;auto* convout=h==0?&conv:y;
@@ -195,24 +199,51 @@ class NoiseResidualExtent final : public WebGpuKernel {
           .SetWorkgroupSize(64).SetDispatchGroupSize((channels+63)/64)
           .AddUniformVariables({inputcap,oc,channels,minimum,maximum,modulus,remainder,kernel,dilation,pc,identity});
       ORT_RETURN_IF_ERROR(c.RunProgram(prepare));
+      ++dispatches;
       for(uint32_t offset=0;offset<channels;offset+=tile_channels){
         const uint32_t count=std::min(tile_channels,channels-offset);
-        GeneratorNormSnake norm;
-        norm.AddInput(window(input,offset,count)).AddInputs({{out,ProgramTensorMetadataDependency::None},
-            {&coefficients,ProgramTensorMetadataDependency::None}}).AddOutput({normout,ProgramTensorMetadataDependency::None})
-            .SetWorkgroupSize(64).SetDispatchGroupSize((tile_channels+63)/64)
+        GeneratorNormStatistics statistics;
+        statistics.AddInput(window(input,offset,count)).AddInput({out,ProgramTensorMetadataDependency::None})
+            .AddOutput({&coefficients,ProgramTensorMetadataDependency::None})
+            .SetWorkgroupSize(64).SetDispatchGroupSize((count+63)/64)
             .AddUniformVariables({inputcap,oc,channels,minimum,maximum,modulus,remainder,kernel,dilation,pc,
                                   offset,count,tile_channels,identity});
-        ORT_RETURN_IF_ERROR(c.RunProgram(norm));
+        ORT_RETURN_IF_ERROR(c.RunProgram(statistics));
+        ++dispatches;
+        const uint64_t norm_elements=uint64_t(tile_channels)*oc;
+        const uint32_t norm_chunk=m0_residual_stages::kResidualSnakeElementsPerDispatchV1;
+        for(uint64_t first=0;first<norm_elements;first+=norm_chunk){
+          const uint32_t size=static_cast<uint32_t>(std::min<uint64_t>(norm_chunk,norm_elements-first));
+          GeneratorNormSnake norm;
+          norm.AddInput(window(input,offset,count)).AddInputs({{out,ProgramTensorMetadataDependency::None},
+              {&coefficients,ProgramTensorMetadataDependency::None}}).AddOutput({normout,ProgramTensorMetadataDependency::None})
+              .AddUniformVariables({inputcap,oc,channels,minimum,maximum,modulus,remainder,kernel,dilation,pc,
+                                    offset,count,tile_channels,uint32_t(first),size,identity});
+          const uint64_t norm_groups=(uint64_t(size)+63)/64;
+          const uint64_t nx=std::min(norm_groups,limit),ny=(norm_groups+nx-1)/nx;
+          norm.SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(nx),uint32_t(ny));
+          ORT_RETURN_IF_ERROR(c.RunProgram(norm));
+          ++dispatches;
+        }
         for(uint32_t output_offset=0;output_offset<channels;output_offset+=output_tile_channels){
           const uint32_t output_count=std::min(output_tile_channels,channels-output_offset);
-          GeneratorResidualConv convolution;
-          convolution.AddInputs({{normout,ProgramTensorMetadataDependency::None},{out,ProgramTensorMetadataDependency::None},
-              {params[6*h+4],ProgramTensorMetadataDependency::None},{params[6*h+5],ProgramTensorMetadataDependency::None}});
-          convolution.AddOutput(output_window(convout,output_offset,output_count))
-              .AddUniformVariables({oc,oc,channels,minimum,maximum,modulus,remainder,kernel,dilation,pc,
-                                    offset,count,output_offset,output_count,identity});
-          ORT_RETURN_IF_ERROR(dispatch_window(convolution,output_count));
+          const uint32_t chunk=m0_residual_stages::ResidualConvElementsPerDispatchV1(count,kernel);
+          ORT_RETURN_IF_NOT(chunk>0,"RW07 residual convolution dispatch work bound");
+          const uint64_t elements=uint64_t(output_count)*oc;
+          for(uint64_t first=0;first<elements;first+=chunk){
+            const uint32_t size=static_cast<uint32_t>(std::min<uint64_t>(chunk,elements-first));
+            GeneratorResidualConv convolution;
+            convolution.AddInputs({{normout,ProgramTensorMetadataDependency::None},{out,ProgramTensorMetadataDependency::None},
+                {params[6*h+4],ProgramTensorMetadataDependency::None},{params[6*h+5],ProgramTensorMetadataDependency::None}});
+            convolution.AddOutput(output_window(convout,output_offset,output_count))
+                .AddUniformVariables({oc,oc,channels,minimum,maximum,modulus,remainder,kernel,dilation,pc,
+                                      offset,count,output_offset,output_count,uint32_t(first),size,identity});
+            const uint64_t groups=(uint64_t(size)+63)/64;
+            const uint64_t gx=std::min(groups,limit),gy=(groups+gx-1)/gx;
+            convolution.SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy));
+            ORT_RETURN_IF_ERROR(c.RunProgram(convolution));
+            ++dispatches;
+          }
         }
       }
     }
@@ -226,8 +257,9 @@ class NoiseResidualExtent final : public WebGpuKernel {
     }
     LOGS(c.Logger(),INFO)<<"M0_RW07_NOISE_RESIDUAL_V1 session="<<session<<" run="<<run<<" branch="<<branch_
       <<" block="<<block_<<" source_pair_valid="<<paired<<" role="<<role<<" instance="<<instance
-      <<" GPU_dispatches="<<(3+2*((channels+tile_channels-1)/tile_channels)*
-          (1+(channels+output_tile_channels-1)/output_tile_channels)+(channels+output_tile_channels-1)/output_tile_channels)
+      <<" GPU_dispatches="<<dispatches
+      <<" max_residual_scalar_products_per_dispatch="<<m0_residual_stages::kResidualProductsPerDispatchV1
+      <<" max_snake_elements_per_dispatch="<<m0_residual_stages::kResidualSnakeElementsPerDispatchV1
       <<" activation_tile_channels="<<tile_channels<<" output_tile_channels="<<output_tile_channels<<" host_payload_reads=0";
     return Status::OK();
   }

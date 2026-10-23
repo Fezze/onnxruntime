@@ -239,7 +239,7 @@ OrtStatus* ORT_API_CALL Ep::OnRunStartImpl(_In_ OrtEp* this_ptr,
                                            _In_ const OrtRunOptions* run_options) noexcept {
   EXCEPTION_TO_RETURNED_STATUS_BEGIN
   onnxruntime::RunOptions options{};
-  // currently only option "gpu_graph_id" is used
+  // Forward the closed native execution profile as well as graph annotation.
   auto graph_annotation_str = Api().ort.GetRunConfigEntry(run_options, kOrtRunOptionsConfigCudaGraphAnnotation);
   if (graph_annotation_str != nullptr) {
     auto status = options.config_options.AddConfigEntry(kOrtRunOptionsConfigCudaGraphAnnotation, graph_annotation_str);
@@ -248,7 +248,8 @@ OrtStatus* ORT_API_CALL Ep::OnRunStartImpl(_In_ OrtEp* this_ptr,
                                     status.ErrorMessage().c_str());
     }
   }
-  for (const char* key : {"m0.fullgpu.actual_session_v2", "m0.fullgpu.actual_run_v2",
+  for (const char* key : {"m0.fullgpu.bounded_submissions_v1",
+                          "m0.fullgpu.actual_session_v2", "m0.fullgpu.actual_run_v2",
                           "m0.fullgpu.fault_authorized_v2", "m0.fullgpu.diagnostic_fault_mode_v2"}) {
     const char* value = Api().ort.GetRunConfigEntry(run_options, key);
     if (value) {
@@ -277,7 +278,8 @@ OrtStatus* ORT_API_CALL Ep::OnRunEndImpl(_In_ OrtEp* this_ptr,
   EXCEPTION_TO_RETURNED_STATUS_BEGIN
   auto* ep = static_cast<Ep*>(this_ptr);
   onnxruntime::RunOptions options{};
-  for (const char* key : {"m0.fullgpu.actual_session_v2", "m0.fullgpu.actual_run_v2",
+  for (const char* key : {"m0.fullgpu.bounded_submissions_v1",
+                          "m0.fullgpu.actual_session_v2", "m0.fullgpu.actual_run_v2",
                           "m0.fullgpu.fault_authorized_v2", "m0.fullgpu.diagnostic_fault_mode_v2"}) {
     const char* value = Api().ort.GetRunConfigEntry(run_options, key);
     if (value) {

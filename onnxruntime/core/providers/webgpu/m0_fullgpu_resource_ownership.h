@@ -28,12 +28,19 @@ struct M0FullGpuStorageAllocationV1 {
 
 // Registry observations count client-visible acquisitions only. They exclude
 // deferred cache retention, driver allocations and physical memory residency.
+enum class M0WorkloadEventV1 { Upload, Download, DeviceCopy, OperatorStarted, OperatorCompleted, Dispatch, IndirectDispatch };
 struct M0FullGpuResourceStatisticsV1 {
   uint64_t live_allocations = 0;
   uint64_t live_requested_bytes = 0;
   uint64_t peak_live_requested_bytes = 0;
   uint64_t acquisitions = 0;
   uint64_t retirements = 0;
+  uint64_t total_requested_bytes = 0, total_retired_bytes = 0;
+  uint64_t upload_payload_bytes = 0, upload_copy_bytes = 0;
+  uint64_t download_payload_bytes = 0, download_copy_bytes = 0, device_copy_bytes = 0;
+  uint64_t operators_started = 0, operators_completed = 0;
+  uint64_t dispatches_encoded = 0, workgroups_encoded = 0, indirect_dispatches_encoded = 0;
+  bool counters_saturated = false;
 };
 
 // Integration must call Acquire on EVERY successful physical allocation/cache
@@ -46,6 +53,8 @@ class M0FullGpuResourceOwnership final {
   bool Retire(uintptr_t handle, uint64_t generation);
   bool Describe(uintptr_t handle, M0FullGpuAllocationIdentity& out) const;
   M0FullGpuResourceStatisticsV1 Statistics() const;
+  uint64_t RecordWorkload(M0WorkloadEventV1 event, uint64_t value = 0, uint64_t auxiliary = 0);
+  void LogWorkload(const char* phase) const;
   // Atomically snapshots actual live bound allocations, without comparing
   // producer provenance. GPU guards compare these descriptors with payloads.
   bool DescribeBindings(uintptr_t sidecar, uintptr_t data_handle,

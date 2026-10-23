@@ -53,6 +53,10 @@ endif()
 source_group(TREE ${REPO_ROOT} FILES ${onnxruntime_session_srcs})
 
 onnxruntime_add_static_library(onnxruntime_session ${onnxruntime_session_srcs})
+if(onnxruntime_M0_DEEP_MODULE_AUDIT)
+  set_property(SOURCE "${ONNXRUNTIME_ROOT}/core/session/m0_original_lstm_module_v1.cc"
+    APPEND PROPERTY COMPILE_DEFINITIONS ORT_M0_DEEP_MODULE_AUDIT=1)
+endif()
 onnxruntime_add_include_to_target(onnxruntime_session onnxruntime_common onnxruntime_framework onnxruntime_lora onnx onnx_proto ${PROTOBUF_LIB} flatbuffers::flatbuffers Boost::mp11 safeint_interface nlohmann_json::nlohmann_json Eigen3::Eigen)
 target_link_libraries(onnxruntime_session PRIVATE onnxruntime_lora)
 # The provider digest is generated after its final strip, in the session-only build layer.

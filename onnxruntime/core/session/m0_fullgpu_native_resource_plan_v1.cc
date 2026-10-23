@@ -30,6 +30,9 @@ void M0FullGpuNativeLoweringOwnerV1::ValidateResourcePlan(const SessionState& st
               "RW07_NATIVE_RESOURCE_SINGLE_STREAM_PROFILE");
   const auto& stream = *plan.execution_plan[0];
   const auto& order = state.graph_viewer_->GetNodesInTopologicalOrder(state.sess_options_.execution_order);
+  if(device_capacity_)
+    ORT_ENFORCE(memory_plan_order_.size()==order.size()&&memory_plan_peak_bytes_>0&&memory_plan_available_bytes_>0,
+                "RW07_NATIVE_MEMORY_PLAN_ACTUAL_ORDER_PROFILE");
   ORT_ENFORCE(stream.steps_.size() == order.size() && order.size() == static_cast<size_t>(graph.NumberOfNodes()) &&
                   plan.node_stream_map_.size() == size_t(state.graph_viewer_->MaxNodeIndex()) + 1,
               "RW07_NATIVE_RESOURCE_NODE_ORDER_INVENTORY");
@@ -37,6 +40,8 @@ void M0FullGpuNativeLoweringOwnerV1::ValidateResourcePlan(const SessionState& st
   for (size_t pc = 0; pc < order.size(); ++pc) {
     const auto* node = graph.GetNode(order[pc]);
     const auto& step = stream.steps_[pc];
+    if(device_capacity_)
+      ORT_ENFORCE(node&&node->Name()==memory_plan_order_[pc],"RW07_NATIVE_MEMORY_PLAN_ACTUAL_LAUNCH_ORDER");
     ORT_ENFORCE(node && step && step->GetNodeIndex() == node->Index() &&
                     step->ToString() == MakeString("LaunchKernel - NodeIndex: ", node->Index(), ", Name: ", node->Name()) &&
                     plan.node_stream_map_[node->Index()] == 0 && positions.emplace(node->Index(), pc).second,

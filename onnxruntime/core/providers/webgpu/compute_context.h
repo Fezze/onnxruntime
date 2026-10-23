@@ -243,6 +243,7 @@ class ComputeContext final : public ComputeContextBase {
   //
   template <typename TensorShapeType>
   inline Tensor* Output(int index, TensorShapeType&& shape) {
+    if (ep_.Recording().m0_submission_budget_bytes) M0PrepareAllocationV1(TensorShape(shape));
     return kernel_context_.Output(index, std::forward<TensorShapeType>(shape));
   }
 
@@ -275,6 +276,8 @@ class ComputeContext final : public ComputeContextBase {
   // not an Env shared allocator or a new allocator created for each tensor.
   //
   Tensor CreateGPUTensor(MLDataType data_type, const TensorShape& shape);
+
+  void M0PrepareAllocationV1(const TensorShape& shape) const;
 
   //
   // Copy data from a tensor to another tensor.

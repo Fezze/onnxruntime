@@ -6,6 +6,7 @@
 #include <initializer_list>
 #include "core/providers/webgpu/webgpu_kernel.h"
 #include "core/providers/webgpu/shader_helper.h"
+#include "m0_fullgpu_trig_v1.h"
 
 // Both original generator and noise residual paths use the same scalar stage
 // ordering. Roles, extents, parameters and capacities remain caller supplied.
@@ -28,29 +29,30 @@ inline void ValidOutput(ShaderHelper& s, const ShaderVariableHelper& e) {
 // Preserve the original scalar operation order across the staged GPU programs.
 inline void OriginalArithmetic(ShaderHelper& s) {
     s.AdditionalImplementation() << R"WGSL(
+fn original_f32_from_bits(bits:u32)->f32 {return bitcast<f32>(bits);}
 fn original_mul(a:f32,b:f32)->f32 {
  let aa=bitcast<u32>(a)&0x7fffffffu;let bb=bitcast<u32>(b)&0x7fffffffu;
  if(aa>0x7f800000u||bb>0x7f800000u||(aa==0u&&bb==0x7f800000u)||(bb==0u&&aa==0x7f800000u)){
- return bitcast<f32>(0x7fc00000u);}
+ return original_f32_from_bits(0x7fc00000u);}
  if(aa==0x7f800000u||bb==0x7f800000u){return bitcast<f32>(((bitcast<u32>(a)^bitcast<u32>(b))&0x80000000u)|0x7f800000u);}
  return a*b;
 }
 fn original_add(a:f32,b:f32)->f32 {
  let aa=bitcast<u32>(a)&0x7fffffffu;let bb=bitcast<u32>(b)&0x7fffffffu;
  if(aa>0x7f800000u||bb>0x7f800000u||(aa==0x7f800000u&&bb==0x7f800000u&&((bitcast<u32>(a)^bitcast<u32>(b))&0x80000000u)!=0u)){
- return bitcast<f32>(0x7fc00000u);}
+ return original_f32_from_bits(0x7fc00000u);}
  if(aa==0x7f800000u){return a;}if(bb==0x7f800000u){return b;}return a+b;
 }
 fn original_sub(a:f32,b:f32)->f32{return original_add(a,-b);}
 fn original_sqrt(x:f32)->f32 {
  let bits=bitcast<u32>(x);let magnitude=bits&0x7fffffffu;
- if(magnitude>0x7f800000u||((bits&0x80000000u)!=0u&&magnitude!=0u)){return bitcast<f32>(0x7fc00000u);}
+ if(magnitude>0x7f800000u||((bits&0x80000000u)!=0u&&magnitude!=0u)){return original_f32_from_bits(0x7fc00000u);}
  if(magnitude==0x7f800000u||magnitude==0u){return x;}return sqrt(x);
 }
 fn original_div(a:f32,b:f32)->f32 {
  let ua=bitcast<u32>(a);let ub=bitcast<u32>(b);let aa=ua&0x7fffffffu;let bb=ub&0x7fffffffu;
  let sign=(ua^ub)&0x80000000u;
- if(aa>0x7f800000u||bb>0x7f800000u||(aa==0u&&bb==0u)||(aa==0x7f800000u&&bb==0x7f800000u)){return bitcast<f32>(0x7fc00000u);}
+ if(aa>0x7f800000u||bb>0x7f800000u||(aa==0u&&bb==0u)||(aa==0x7f800000u&&bb==0x7f800000u)){return original_f32_from_bits(0x7fc00000u);}
  if(bb==0u||aa==0x7f800000u){return bitcast<f32>(sign|0x7f800000u);}
  if(aa==0u||bb==0x7f800000u){return bitcast<f32>(sign);}return a/b;
 }
@@ -156,7 +158,7 @@ inline Status StorageBudgetWithWindows(ComputeContext& c, const ProgramInput& in
 }
 class GeneratorStyleParameters final : public Program<GeneratorStyleParameters> {
  public:
-  GeneratorStyleParameters() : Program{"RW07ResidualStyleParametersV1"} {}
+  GeneratorStyleParameters() : Program{"RW07ResidualStyleParametersAndStatsV2"} {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"input_capacity", ProgramUniformVariableDataType::Uint32},
       {"output_capacity", ProgramUniformVariableDataType::Uint32},
@@ -181,7 +183,7 @@ class GeneratorStyleParameters final : public Program<GeneratorStyleParameters> 
     OriginalArithmetic(s);
     auto& f=s.MainFunctionBody();
     f << "if(global_idx>=uniforms.channels){return;}let channel=global_idx;"
-      << "for(var i=0u;i<4u;i++){" << y.SetByOffset("channel*4u+i","0.0") << "}"
+      << "for(var i=0u;i<6u;i++){" << y.SetByOffset("channel*6u+i","0.0") << "}"
       << "if(!valid_output()){return;}"
       << "var gs:f32=0.0;var bs:f32=0.0;for(var k=0u;k<128u;k++){let value=" << style.GetByOffset("k") << ";"
       << "gs=original_add(gs,original_mul(value," << w.GetByOffset("channel*128u+k") << "));"
@@ -189,16 +191,19 @@ class GeneratorStyleParameters final : public Program<GeneratorStyleParameters> 
       << "let gamma=original_add(original_add(gs," << b.GetByOffset("channel") << "),1.0);"
       << "let beta=original_add(bs," << b.GetByOffset("channel+uniforms.channels") << ");"
       << "let a=" << alpha.GetByOffset("channel") << ";let reciprocal_a=" << reciprocal.GetByOffset("channel") << ";";
-    f << y.SetByOffset("channel*4u","gamma")
-      << y.SetByOffset("channel*4u+1u","beta")
-      << y.SetByOffset("channel*4u+2u","a")
-      << y.SetByOffset("channel*4u+3u","reciprocal_a");
+    f << y.SetByOffset("channel*6u","gamma")
+      << y.SetByOffset("channel*6u+1u","beta")
+      << y.SetByOffset("channel*6u+2u","a")
+      << y.SetByOffset("channel*6u+3u","reciprocal_a");
     return Status::OK();
   }
 };
-class GeneratorNormSnake final : public Program<GeneratorNormSnake> {
+// Compensated FP32 sums avoid linear rounding drift on long channels.
+// Mean/variance stay separate original graph stages; no per-sample trig loop.
+// The coefficient allocation also holds mean/denominator; no carrier copy.
+class GeneratorNormStatistics final : public Program<GeneratorNormStatistics> {
  public:
-  GeneratorNormSnake() : Program{"RW07ResidualNormSnakeChannelTileV2"} {}
+  GeneratorNormStatistics() : Program{"RW07ResidualNormStatisticsCompensatedV2"} {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"input_capacity", ProgramUniformVariableDataType::Uint32},
       {"output_capacity", ProgramUniformVariableDataType::Uint32},
@@ -217,39 +222,104 @@ class GeneratorNormSnake final : public Program<GeneratorNormSnake> {
   Status GenerateShaderCode(ShaderHelper& s) const override {
     const auto& x=s.AddInput("carrier",ShaderUsage::UseValueTypeAlias);
     const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
+    const auto& y=s.AddOutput("coefficients",ShaderUsage::UseValueTypeAlias);
+    ValidOutput(s,e);
+    OriginalArithmetic(s);
+    s.AdditionalImplementation() << R"WGSL(
+fn residual_accumulate(state:vec2<f32>,value:f32)->vec2<f32> {
+ let adjusted=original_sub(value,state.y);let next=original_add(state.x,adjusted);
+ // Preserve ordinary NaN/Inf/overflow propagation instead of compensating it.
+ if((bitcast<u32>(state.x)&0x7fffffffu)>=0x7f800000u||
+    (bitcast<u32>(value)&0x7fffffffu)>=0x7f800000u||
+    (bitcast<u32>(next)&0x7fffffffu)>=0x7f800000u){
+   return vec2<f32>(original_add(state.x,value),0.0);
+ }
+ return vec2<f32>(next,original_sub(original_sub(next,state.x),adjusted));
+}
+)WGSL";
+    auto& f=s.MainFunctionBody();
+    f << "if(global_idx>=uniforms.channel_count||uniforms.channel_offset>=uniforms.channels||"
+      << "uniforms.channel_count>uniforms.channels-uniforms.channel_offset){return;}"
+      << "let local_channel=global_idx;let channel=uniforms.channel_offset+local_channel;"
+      << y.SetByOffset("channel*6u+4u","0.0") << y.SetByOffset("channel*6u+5u","0.0")
+      << "if(!valid_output()){return;}let count=" << e.GetByOffset("6u")
+      << ";if(count>uniforms.input_capacity){return;}var sum=vec2<f32>(0.0,0.0);"
+      << "for(var t=0u;t<count;t++){sum=residual_accumulate(sum," << x.GetByOffset("local_channel*uniforms.input_capacity+t") << ");}"
+      << "let mean=original_div(sum.x,f32(count));var squares=vec2<f32>(0.0,0.0);"
+      << "for(var t=0u;t<count;t++){let delta=original_sub(" << x.GetByOffset("local_channel*uniforms.input_capacity+t") << ",mean);"
+      << "squares=residual_accumulate(squares,original_mul(delta,delta));}"
+      << "let variance=original_div(squares.x,f32(count));let denominator=original_sqrt(original_add(variance,bitcast<f32>(0x3727c5acu)));"
+      << y.SetByOffset("channel*6u+4u","mean") << y.SetByOffset("channel*6u+5u","denominator");
+    return Status::OK();
+  }
+};
+// Each invocation evaluates at most one sample; cap the number per dispatch.
+inline constexpr uint32_t kResidualSnakeElementsPerDispatchV1 = 16384;
+class GeneratorNormSnake final : public Program<GeneratorNormSnake> {
+ public:
+  GeneratorNormSnake() : Program{"RW07ResidualNormSnakeElementChunksV3"} {}
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+      {"input_capacity", ProgramUniformVariableDataType::Uint32},
+      {"output_capacity", ProgramUniformVariableDataType::Uint32},
+      {"channels", ProgramUniformVariableDataType::Uint32},
+      {"minimum", ProgramUniformVariableDataType::Uint32},
+      {"maximum", ProgramUniformVariableDataType::Uint32},
+      {"modulus", ProgramUniformVariableDataType::Uint32},
+      {"remainder", ProgramUniformVariableDataType::Uint32},
+      {"kernel", ProgramUniformVariableDataType::Uint32},
+      {"dilation", ProgramUniformVariableDataType::Uint32},
+      {"residual_capacity", ProgramUniformVariableDataType::Uint32},
+      {"channel_offset", ProgramUniformVariableDataType::Uint32},
+      {"channel_count", ProgramUniformVariableDataType::Uint32},
+      {"tile_channels", ProgramUniformVariableDataType::Uint32},
+      {"element_begin", ProgramUniformVariableDataType::Uint32},
+      {"element_count", ProgramUniformVariableDataType::Uint32},
+      {"identity", ProgramUniformVariableDataType::Uint32});
+  Status GenerateShaderCode(ShaderHelper& s) const override {
+    const auto& x=s.AddInput("carrier",ShaderUsage::UseValueTypeAlias);
+    const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
     const auto& coefficients=s.AddInput("coefficients",ShaderUsage::UseValueTypeAlias);
     const auto& y=s.AddOutput("activated",ShaderUsage::UseValueTypeAlias);
     ValidOutput(s,e);
     OriginalArithmetic(s);
+    s.AdditionalImplementation() << m0_trig_detail::Trig;
     auto& f=s.MainFunctionBody();
-    f << "if(global_idx>=uniforms.tile_channels){return;}let local_channel=global_idx;"
-      << "for(var t=0u;t<uniforms.output_capacity;t++){"
-      << y.SetByOffset("local_channel*uniforms.output_capacity+t","0.0") << "}if(!valid_output()){return;}"
+    f << "let elements=uniforms.tile_channels*uniforms.output_capacity;"
+      << "if(uniforms.element_begin>=elements||uniforms.element_count>elements-uniforms.element_begin||"
+      << "global_idx>=uniforms.element_count){return;}let at=uniforms.element_begin+global_idx;"
+      << y.SetByOffset("at","0.0") << "if(!valid_output()){return;}"
+      << "let local_channel=at/uniforms.output_capacity;let t=at%uniforms.output_capacity;"
       << "if(local_channel>=uniforms.channel_count||uniforms.channel_offset>=uniforms.channels||"
       << "uniforms.channel_count>uniforms.channels-uniforms.channel_offset){return;}"
-      << "let channel=uniforms.channel_offset+local_channel;"
-      << "let count=" << e.GetByOffset("6u") << ";if(count>uniforms.input_capacity){return;}var sum:f32=0.0;"
-      << "for(var t=0u;t<count;t++){sum=original_add(sum," << x.GetByOffset("local_channel*uniforms.input_capacity+t") << ");}"
-      << "let mean=original_div(sum,f32(count));var squares:f32=0.0;"
-      << "for(var t=0u;t<count;t++){let delta=original_sub(" << x.GetByOffset("local_channel*uniforms.input_capacity+t") << ",mean);"
-      << "squares=original_add(squares,original_mul(delta,delta));}"
-      << "let variance=original_div(squares,f32(count));let denominator=original_sqrt(original_add(variance,bitcast<f32>(0x3727c5acu)));"
-      << "let gamma=" << coefficients.GetByOffset("channel*4u") << ";"
-      << "let beta=" << coefficients.GetByOffset("channel*4u+1u") << ";"
-      << "let a=" << coefficients.GetByOffset("channel*4u+2u") << ";"
-      << "let reciprocal_a=" << coefficients.GetByOffset("channel*4u+3u") << ";"
-      << "for(var t=0u;t<count;t++){let centered=original_sub(" << x.GetByOffset("local_channel*uniforms.input_capacity+t") << ",mean);"
+      << "let channel=uniforms.channel_offset+local_channel;let count=" << e.GetByOffset("6u")
+      << ";if(count>uniforms.input_capacity||t>=count){return;}"
+      << "let mean=" << coefficients.GetByOffset("channel*6u+4u") << ";"
+      << "let denominator=" << coefficients.GetByOffset("channel*6u+5u") << ";"
+      << "let gamma=" << coefficients.GetByOffset("channel*6u") << ";"
+      << "let beta=" << coefficients.GetByOffset("channel*6u+1u") << ";"
+      << "let a=" << coefficients.GetByOffset("channel*6u+2u") << ";"
+      << "let reciprocal_a=" << coefficients.GetByOffset("channel*6u+3u") << ";"
+      << "let centered=original_sub(" << x.GetByOffset("local_channel*uniforms.input_capacity+t") << ",mean);"
       << "let normalized=original_div(centered,denominator);let affine=original_add(original_mul(gamma,normalized),beta);"
-      << "let angle=original_mul(a,affine);let bits=bitcast<u32>(angle)&0x7fffffffu;var sine:f32=bitcast<f32>(0x7fc00000u);"
-      << "if(bits<0x7f800000u){sine=sin(angle);}let square=original_mul(sine,sine);"
+      << "let angle=original_mul(a,affine);let bits=bitcast<u32>(angle)&0x7fffffffu;var sine:f32=original_f32_from_bits(0x7fc00000u);"
+      << "if(bits<0x7f800000u){sine=rw07_sin(angle);}let square=original_mul(sine,sine);"
       << "let result=original_add(affine,original_mul(reciprocal_a,square));"
-      << y.SetByOffset("local_channel*uniforms.output_capacity+t","result") << "}";
+      << y.SetByOffset("at","result");
     return Status::OK();
   }
 };
+// Bound scalar products encoded by one residual convolution dispatch. This
+// is a scheduling upper bound, not measured GPU instructions, FLOPs or time.
+inline constexpr uint32_t kResidualProductsPerDispatchV1 = 1u << 22;
+inline uint32_t ResidualConvElementsPerDispatchV1(uint32_t input_channels, uint32_t kernel) {
+  const uint64_t products_per_element = uint64_t(input_channels) * kernel;
+  if (products_per_element == 0 || products_per_element > kResidualProductsPerDispatchV1) return 0;
+  const auto elements = static_cast<uint32_t>(kResidualProductsPerDispatchV1 / products_per_element);
+  return elements >= 64 ? elements / 64 * 64 : elements;
+}
 class GeneratorResidualConv final : public Program<GeneratorResidualConv> {
  public:
-  GeneratorResidualConv() : Program{"RW07ResidualConvInputOutputChannelTileV3"} {}
+  GeneratorResidualConv() : Program{"RW07ResidualConvChannelElementChunksV4"} {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"input_capacity", ProgramUniformVariableDataType::Uint32},
       {"output_capacity", ProgramUniformVariableDataType::Uint32},
@@ -265,6 +335,8 @@ class GeneratorResidualConv final : public Program<GeneratorResidualConv> {
       {"channel_count", ProgramUniformVariableDataType::Uint32},
       {"output_channel_offset", ProgramUniformVariableDataType::Uint32},
       {"output_channel_count", ProgramUniformVariableDataType::Uint32},
+      {"element_begin", ProgramUniformVariableDataType::Uint32},
+      {"element_count", ProgramUniformVariableDataType::Uint32},
       {"identity", ProgramUniformVariableDataType::Uint32});
   Status GenerateShaderCode(ShaderHelper& s) const override {
     const auto& x=s.AddInput("carrier",ShaderUsage::UseValueTypeAlias);
@@ -275,18 +347,20 @@ class GeneratorResidualConv final : public Program<GeneratorResidualConv> {
     ValidOutput(s,e);
     OriginalArithmetic(s);
     auto& f=s.MainFunctionBody();
-    f << "if(global_idx>=uniforms.output_channel_count*uniforms.output_capacity){return;}"
-      << "if(!valid_output()){ " << y.SetByOffset("global_idx","0.0") << "return;}"
-      << "let count=" << e.GetByOffset("6u") << ";let t=global_idx%uniforms.output_capacity;"
-      << "let local_oc=global_idx/uniforms.output_capacity;"
+    f << "let elements=uniforms.output_channel_count*uniforms.output_capacity;"
+      << "if(uniforms.element_begin>=elements||uniforms.element_count>elements-uniforms.element_begin||"
+      << "global_idx>=uniforms.element_count){return;}let at=uniforms.element_begin+global_idx;"
+      << "if(!valid_output()){ " << y.SetByOffset("at","0.0") << "return;}"
+      << "let count=" << e.GetByOffset("6u") << ";let t=at%uniforms.output_capacity;"
+      << "let local_oc=at/uniforms.output_capacity;"
       << "if(uniforms.output_channel_offset>=uniforms.channels||uniforms.output_channel_count==0u||"
       << "uniforms.output_channel_count>uniforms.channels-uniforms.output_channel_offset){"
-      << y.SetByOffset("global_idx","0.0") << "return;}"
+      << y.SetByOffset("at","0.0") << "return;}"
       << "let oc=uniforms.output_channel_offset+local_oc;"
       << "if(t>=count||uniforms.channel_offset>=uniforms.channels||uniforms.channel_count==0u||"
       << "uniforms.channel_count>uniforms.channels-uniforms.channel_offset){"
-      << y.SetByOffset("global_idx","0.0") << "return;}"
-      << "var total:f32=0.0;if(uniforms.channel_offset!=0u){total=" << y.GetByOffset("global_idx") << ";}"
+      << y.SetByOffset("at","0.0") << "return;}"
+      << "var total:f32=0.0;if(uniforms.channel_offset!=0u){total=" << y.GetByOffset("at") << ";}"
       << "let pad=i32((uniforms.kernel-1u)*uniforms.dilation/2u);"
       << "for(var local_ic=0u;local_ic<uniforms.channel_count;local_ic++){let ic=uniforms.channel_offset+local_ic;"
       << "for(var k=0u;k<uniforms.kernel;k++){"
@@ -295,7 +369,7 @@ class GeneratorResidualConv final : public Program<GeneratorResidualConv> {
       << "total=original_add(total,original_mul(value," << w.GetByOffset("(oc*uniforms.channels+ic)*uniforms.kernel+k") << "));}}"
       << "if(uniforms.channel_offset+uniforms.channel_count==uniforms.channels){total=original_add(total,"
       << b.GetByOffset("oc") << ");}";
-    f << y.SetByOffset("global_idx","total");
+    f << y.SetByOffset("at","total");
     return Status::OK();
   }
 };

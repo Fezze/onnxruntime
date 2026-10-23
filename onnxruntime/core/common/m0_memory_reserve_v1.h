@@ -12,11 +12,31 @@
 #include "core/common/logging/logging.h"
 
 namespace onnxruntime {
-// Android shares physical memory with the GPU. This is a current availability
-// check before allocation, not a measurement of GPU residency or an OS reservation.
-inline common::Status M0CheckMemoryReserveV1(uint64_t additional_bytes) {
+inline constexpr uint64_t kM0MemoryReserveBytesV1 = 512ull * 1024 * 1024;
+#if defined(ORT_M0_ENFORCE_MEMORY_RESERVE)
+inline constexpr bool kM0EnforceMemoryReserveV1 = true;
+#else
+inline constexpr bool kM0EnforceMemoryReserveV1 = false;
+#endif
+inline bool M0MemoryHeadroomV1(uint64_t available, uint64_t additional) {
+  return available >= kM0MemoryReserveBytesV1 && additional <= available - kM0MemoryReserveBytesV1;
+}
+// Select a planning target, never an execution permission in monitor mode.
+inline uint64_t M0MemoryPlanningBudgetV1(uint64_t available, uint64_t future, uint64_t minimum,
+                                       bool enforce = kM0EnforceMemoryReserveV1) {
+  const uint64_t headroom = available >= kM0MemoryReserveBytesV1 &&
+      future <= available - kM0MemoryReserveBytesV1 ? available - kM0MemoryReserveBytesV1 - future : 0;
+  if (enforce || minimum <= headroom / 2) return headroom / 2;
+  if (minimum <= headroom) return headroom;
+  const uint64_t remaining = available >= future ? available - future : 0;
+  if (minimum <= remaining / 2) return remaining / 2;
+  if (minimum <= remaining) return remaining;
+  return std::numeric_limits<uint64_t>::max();
+}
+
+// Output is assigned only after the complete bounded reading is validated.
+inline common::Status M0ReadMemoryAvailableV1(uint64_t& output) {
 #if defined(__ANDROID__)
-  constexpr uint64_t kReserveBytes = 512ull * 1024 * 1024;
   std::array<char, 16384> buffer;
   auto* file = std::fopen("/proc/meminfo", "r");
   ORT_RETURN_IF_NOT(file, "RW07_NATIVE_MEMORY_UNAVAILABLE");
@@ -54,12 +74,34 @@ inline common::Status M0CheckMemoryReserveV1(uint64_t additional_bytes) {
   }
   ORT_RETURN_IF_NOT(found && available_kib <= std::numeric_limits<uint64_t>::max() / 1024,
                     "RW07_NATIVE_MEMORY_UNAVAILABLE");
-  const uint64_t available_bytes = available_kib * 1024;
-  LOGS_DEFAULT(INFO) << "M0_RW07_MEMORY_ADMISSION additional_bytes=" << additional_bytes
-                     << " available_bytes=" << available_bytes << " reserve_bytes=" << kReserveBytes;
-  ORT_RETURN_IF_NOT(available_bytes >= kReserveBytes && additional_bytes <= available_bytes - kReserveBytes,
+  output = available_kib * 1024;
+#else
+  output = std::numeric_limits<uint64_t>::max();
+#endif
+  return common::Status::OK();
+}
+
+// Android shares physical memory with the GPU. This is a current availability
+// observation before allocation, not GPU residency or an OS reservation.
+inline common::Status M0CheckMemoryReserveV1(uint64_t additional_bytes) {
+#if defined(__ANDROID__)
+  uint64_t available_bytes = 0;
+  const auto reading = M0ReadMemoryAvailableV1(available_bytes);
+  if (!reading.IsOK()) {
+    LOGS_DEFAULT(WARNING) << "M0_RW07_MEMORY_WARNING available=unknown policy="
+                         << (kM0EnforceMemoryReserveV1 ? "enforce" : "monitor");
+    return kM0EnforceMemoryReserveV1 ? reading : common::Status::OK();
+  }
+  LOGS_DEFAULT(INFO) << "M0_RW07_MEMORY_OBSERVATION additional_bytes=" << additional_bytes
+                     << " available_bytes=" << available_bytes << " reserve_bytes=" << kM0MemoryReserveBytesV1;
+  if (!M0MemoryHeadroomV1(available_bytes, additional_bytes)) {
+    LOGS_DEFAULT(WARNING) << "M0_RW07_MEMORY_WARNING additional_bytes=" << additional_bytes
+                         << " available_bytes=" << available_bytes << " reserve_bytes=" << kM0MemoryReserveBytesV1
+                         << " policy=" << (kM0EnforceMemoryReserveV1 ? "enforce" : "monitor");
+  }
+  ORT_RETURN_IF_NOT(!kM0EnforceMemoryReserveV1 || M0MemoryHeadroomV1(available_bytes, additional_bytes),
                     "RW07_NATIVE_MEMORY_RESERVE additional_bytes=", additional_bytes,
-                    " available_bytes=", available_bytes, " reserve_bytes=", kReserveBytes);
+                    " available_bytes=", available_bytes, " reserve_bytes=", kM0MemoryReserveBytesV1);
 #else
   (void)additional_bytes;
 #endif

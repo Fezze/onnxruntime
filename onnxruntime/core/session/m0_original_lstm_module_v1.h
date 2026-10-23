@@ -36,11 +36,12 @@ class M0OriginalLstmModuleV1 final {
     std::shared_ptr<KernelRegistry> registry;
     PluginExecutionProvider* provider = nullptr;
     const ExecutionProviders* providers = nullptr;
-    std::array<M0NativeProviderKernelBindingV2,42> bindings;
+    std::array<M0NativeProviderKernelBindingV2,42> bindings{};
     M0NativeResourceBindingV3 context;
     M0NativeResourceBindingV3 resource;
   };
-  NativeSnapshotV1 ReadNativeSnapshot(uintptr_t handle=0,uint64_t required_bytes=0) const;
+  bool AuditRegistry(uintptr_t handle) const;
+  NativeSnapshotV1 ReadNativeSnapshot(uintptr_t handle=0,uint64_t required_bytes=0,bool audit_bindings=true) const;
   std::array<M0NativeProviderKernelBindingV2,42> NativeBindingsV2() const;
   M0NativeDeviceLimitsV1 NativeDeviceLimitsV1(uint64_t storage_bytes,uint64_t initializer_bytes,uint64_t uniform_bytes) const;
   M0NativeResourceBindingV3 NativeResourceV3(uintptr_t handle,uint64_t required_bytes) const;

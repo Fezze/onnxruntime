@@ -78,17 +78,18 @@ class ASR final : public Program<ASR> {
     const auto& y = s.AddOutput("asr", ShaderUsage::UseValueTypeAlias);
     ValidOutput(s, e);
     s.AdditionalImplementation() << R"WGSL(
+fn original_f32_from_bits(bits:u32)->f32 {return bitcast<f32>(bits);}
 fn original_mul(a:f32,b:f32)->f32 {
  let aa=bitcast<u32>(a)&0x7fffffffu;let bb=bitcast<u32>(b)&0x7fffffffu;
  if(aa>0x7f800000u||bb>0x7f800000u||(aa==0u&&bb==0x7f800000u)||(bb==0u&&aa==0x7f800000u)){
- return bitcast<f32>(0x7fc00000u);}
+ return original_f32_from_bits(0x7fc00000u);}
  if(aa==0x7f800000u||bb==0x7f800000u){return bitcast<f32>(((bitcast<u32>(a)^bitcast<u32>(b))&0x80000000u)|0x7f800000u);}
  return a*b;
 }
 fn original_add(a:f32,b:f32)->f32 {
  let aa=bitcast<u32>(a)&0x7fffffffu;let bb=bitcast<u32>(b)&0x7fffffffu;
  if(aa>0x7f800000u||bb>0x7f800000u||(aa==0x7f800000u&&bb==0x7f800000u&&((bitcast<u32>(a)^bitcast<u32>(b))&0x80000000u)!=0u)){
- return bitcast<f32>(0x7fc00000u);}
+ return original_f32_from_bits(0x7fc00000u);}
  if(aa==0x7f800000u){return a;}if(bb==0x7f800000u){return b;}return a+b;
 }
 )WGSL";

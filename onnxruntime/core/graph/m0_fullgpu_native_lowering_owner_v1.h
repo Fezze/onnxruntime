@@ -12,6 +12,7 @@
 #include <map>
 #include <set>
 #include "core/framework/run_options.h"
+#include "core/framework/session_options.h"
 #include "core/framework/ortdevice.h"
 #include "core/session/plugin_ep/m0_native_device_limits_v1.h"
 struct OrtValue;
@@ -123,7 +124,8 @@ class M0FullGpuNativeLoweringOwnerV1 final {
   struct PreparedModuleDeleter { void operator()(M0NativeGpuModuleV2* module)const; };
   std::unique_ptr<M0NativeGpuModuleV2,PreparedModuleDeleter> prepared_module_;
   static uint32_t SelectPhysicalCapacity(M0NativeGpuModuleV2& module,const ONNX_NAMESPACE::ModelProto& original,
-      M0NativeDeviceLimitsV1& limits,uint64_t& initializer_bytes);
+      const Model& source,ExecutionOrder execution_order,M0NativeDeviceLimitsV1& limits,uint64_t& initializer_bytes,
+      std::vector<std::string>& memory_order,uint64_t& available_bytes,uint64_t& peak_bytes);
   void ValidatePhysicalCapacity(M0NativeGpuModuleV2& module)const;
   const Model* const source_;
   const InferenceSession* const session_;
@@ -131,6 +133,8 @@ class M0FullGpuNativeLoweringOwnerV1 final {
   const bool device_capacity_;
   M0NativeDeviceLimitsV1 device_limits_;
   uint64_t initializer_capacity_bytes_=0;
+  std::vector<std::string> memory_plan_order_;
+  uint64_t memory_plan_available_bytes_=0,memory_plan_peak_bytes_=0;
   ONNX_NAMESPACE::ModelProto derived_;
   // Live source payload checked against the independent seal, and bound metadata
   // after one-shot transfer into the execution model.

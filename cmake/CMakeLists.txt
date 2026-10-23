@@ -284,6 +284,11 @@ option(onnxruntime_ENABLE_TRAINING "Enable full training functionality. Includes
 option(onnxruntime_ENABLE_TRAINING_APIS "Enable ort training apis." OFF)
 option(onnxruntime_ENABLE_TRAINING_OPS "Include training operators but no training session support." OFF)
 option(onnxruntime_ENABLE_TRAINING_E2E_TESTS "Enable training end-to-end tests." OFF)
+option(onnxruntime_M0_ENFORCE_MEMORY_RESERVE "Stop M0 execution at the diagnostic RAM reserve" OFF)
+if(onnxruntime_M0_ENFORCE_MEMORY_RESERVE)
+  add_compile_definitions(ORT_M0_ENFORCE_MEMORY_RESERVE=1)
+endif()
+option(onnxruntime_M0_DEEP_MODULE_AUDIT "Repeat M0 provider digest and full registry audits on resource queries" OFF)
 option(onnxruntime_M0_DESCRIPTOR_QUALIFICATION "Compile fixed private M0 descriptor qualification routes" OFF)
 if(onnxruntime_M0_DESCRIPTOR_QUALIFICATION)
   if(onnxruntime_MINIMAL_BUILD OR onnxruntime_EXTENDED_MINIMAL_BUILD OR onnxruntime_DISABLE_EXCEPTIONS OR

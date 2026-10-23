@@ -42,11 +42,13 @@ std::unique_ptr<M0NativeGpuModuleV2> M0NativeGpuModuleV2::Open(const logging::Lo
 M0OriginalLstmModuleV1::NativeSnapshotV1 M0NativeGpuModuleV2::ValidateCurrent(
  uintptr_t handle,uint64_t required_bytes)const{
  ORT_ENFORCE(module_&&registry_,"RW07_NATIVE_MODULE_CURRENT_REGISTRY");
- auto snapshot=module_->ReadNativeSnapshot(handle,required_bytes);
+ const bool audit_bindings=module_->AuditRegistry(handle);
+ auto snapshot=module_->ReadNativeSnapshot(handle,required_bytes,audit_bindings);
  ORT_ENFORCE(snapshot.registry.get()==registry_.get(),"RW07_NATIVE_MODULE_CURRENT_REGISTRY");
  const auto& actual_context=snapshot.context;
  ORT_ENFORCE(ContextOnly(actual_context)&&SameContext(context_,actual_context),"RW07_NATIVE_RESOURCE_CONTEXT_CHANGED");
  const auto& current=snapshot.bindings;
+ if(!audit_bindings)return snapshot;
  for(const auto& record:kM0NativeKernelRecordsV2){
   const size_t i=record.id-1;const auto& a=queried_[i];const auto& b=current[i];
   ORT_ENFORCE(a.abi==b.abi&&a.record_id==b.record_id&&a.type==b.type&&a.registry==b.registry&&
