@@ -6,6 +6,9 @@
 #include <cerrno>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
+#include <mutex>
+#include <utility>
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
@@ -14,6 +17,46 @@
 #include "sha256.h"
 
 namespace onnxruntime {
+// One core-owned authenticated module may be borrowed by one private session.
+// Keep its actual handle/file lease resident after session teardown: destructor-
+// bearing provider TLS can otherwise keep dlclose's mapping alive without a core
+// owner. Failed/poisoned residency remains owned but is never borrowed again.
+template<class Resident>
+class M0ExclusiveModuleResidencyV1 final {
+ public:
+  template<class Create,class Verify>
+  std::unique_ptr<Resident> Acquire(Create&& create,Verify&& verify){
+    return Acquire(std::forward<Create>(create),std::forward<Verify>(verify),[](){});
+  }
+  template<class Create,class Verify,class Preflight>
+  std::unique_ptr<Resident> Acquire(Create&& create,Verify&& verify,Preflight&& preflight){
+    std::lock_guard<std::mutex> lock(mutex_);
+    ORT_ENFORCE(!borrowed_&&!poisoned_,"RW07_PRIVATE_MODULE_RESIDENCY_UNAVAILABLE");
+    // A read-only admission refusal before owning any module is retryable.
+    // Once creation begins, an uncertain partial load remains permanently denied.
+    if(!resident_)preflight();
+    try{
+      if(!resident_)resident_=create();
+      ORT_ENFORCE(resident_,"RW07_PRIVATE_MODULE_RESIDENCY_MISSING");
+      verify(*resident_);
+      borrowed_=resident_.get();
+      return std::move(resident_);
+    }catch(...){poisoned_=true;throw;}
+  }
+  void Release(std::unique_ptr<Resident>& resident,bool reusable){
+    std::lock_guard<std::mutex> lock(mutex_);
+    ORT_ENFORCE(borrowed_&&borrowed_==resident.get()&&!resident_,"RW07_PRIVATE_MODULE_RESIDENCY_STATE");
+    resident_=std::move(resident);
+    borrowed_=nullptr;
+    poisoned_=!reusable;
+  }
+ private:
+  std::mutex mutex_;
+  std::unique_ptr<Resident> resident_;
+  Resident* borrowed_=nullptr;
+  bool poisoned_=false;
+};
+
 class M0ModuleFileLeaseV1 final {
  public:
   explicit M0ModuleFileLeaseV1(std::string_view expected_digest, bool deep_audit = false)

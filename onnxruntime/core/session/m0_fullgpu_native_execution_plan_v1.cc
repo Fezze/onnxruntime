@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 #include "core/graph/m0_fullgpu_native_lowering_owner_v1.h"
 #if !defined(ORT_MINIMAL_BUILD)
+#include "core/common/m0_observation_options_v1.h"
 #include "core/framework/session_state.h"
 #include "core/framework/sequential_execution_plan.h"
 #include "core/graph/model.h"
@@ -33,11 +34,11 @@ common::Status M0FullGpuNativeLoweringOwnerV1::CreateExecutionPlan(InferenceSess
     session.m0_native_lowering_v1_.get()==this&&session.is_model_loaded_&&!session.is_inited_&&!session.session_state_,
     "RW07_NATIVE_PLAN_ACTUAL_SOURCE");
   ORT_THROW_IF_ERROR(session.M0ValidateOriginalSelectionOptionsV1());
-  LOGS(*session.session_logger_,INFO)<<"M0_NATIVE_INIT phase=source_validation_begin";
+  LOGS(*session.session_logger_,INFO)<<"M0_NATIVE_INIT phase=source_validation_begin"<<" mono_us="<<M0MonotonicMicrosecondsV1();
   const auto cancellation=session.session_options_.load_cancellation_flag;
   M0OriginalPreloadOwnerV1::ValidateNativeLoweringSource(*source_);
   ValidateExecutionModel();
-  LOGS(*session.session_logger_,INFO)<<"M0_NATIVE_INIT phase=source_validation_done";
+  LOGS(*session.session_logger_,INFO)<<"M0_NATIVE_INIT phase=source_validation_done"<<" mono_us="<<M0MonotonicMicrosecondsV1();
   if(execution_plan_){
    if(execution_plan_->stage==ExecutionPlan::Stage::Initialized){
     ORT_ENFORCE(intent==ExecutionIntent::Initialize,"RW07_NATIVE_PLAN_ALREADY_INITIALIZED");
@@ -59,12 +60,12 @@ common::Status M0FullGpuNativeLoweringOwnerV1::CreateExecutionPlan(InferenceSess
   p.options.enable_mem_pattern=false;p.options.enable_mem_reuse=false;
   p.options.enable_cpu_mem_arena=false;p.options.use_per_session_threads=false;
   ORT_ENFORCE(bool(prepared_module_)==device_capacity_,"RW07_NATIVE_CAPACITY_MODULE_LEASE");
-  LOGS(*session.session_logger_,INFO)<<"M0_NATIVE_INIT phase=module_open_begin";
+  LOGS(*session.session_logger_,INFO)<<"M0_NATIVE_INIT phase=module_open_begin"<<" mono_us="<<M0MonotonicMicrosecondsV1();
   p.module=device_capacity_?std::unique_ptr<M0NativeGpuModuleV2>(prepared_module_.release()):
       M0NativeGpuModuleV2::Open(*session.session_logger_);
-  LOGS(*session.session_logger_,INFO)<<"M0_NATIVE_INIT phase=module_open_done";
+  LOGS(*session.session_logger_,INFO)<<"M0_NATIVE_INIT phase=module_open_done"<<" mono_us="<<M0MonotonicMicrosecondsV1();
   ValidatePhysicalCapacity(*p.module);
-  LOGS(*session.session_logger_,INFO)<<"M0_NATIVE_INIT phase=kernel_selection_begin total="<<descriptors_.size();
+  LOGS(*session.session_logger_,INFO)<<"M0_NATIVE_INIT phase=kernel_selection_begin total="<<descriptors_.size()<<" mono_us="<<M0MonotonicMicrosecondsV1();
   p.provider=&p.module->Provider();
   ORT_THROW_IF_ERROR(p.registry_manager.RegisterKernels(p.module->Providers()));
   auto registry=p.module->Registry();
@@ -83,7 +84,7 @@ common::Status M0FullGpuNativeLoweringOwnerV1::CreateExecutionPlan(InferenceSess
    ORT_ENFORCE(p.selected.emplace(node.Index(),selected).second,"RW07_NATIVE_PLAN_DUPLICATE_NODE");
    node.SetExecutionProviderType(kWebGpuExecutionProvider);
   }
-  LOGS(*session.session_logger_,INFO)<<"M0_NATIVE_INIT phase=kernel_selection_done selected="<<p.selected.size();
+  LOGS(*session.session_logger_,INFO)<<"M0_NATIVE_INIT phase=kernel_selection_done selected="<<p.selected.size()<<" mono_us="<<M0MonotonicMicrosecondsV1();
   ValidateExecutionModel();p.module->ValidateCurrent();
   p.state=std::make_unique<SessionState>(execution_model_->MainGraph(),p.module->Providers(),nullptr,nullptr,
    p.transfers,p.external_loaders,*session.session_logger_,p.profiler,p.options,nullptr,&p.allocators,&p.initializer_allocators);
@@ -93,21 +94,21 @@ common::Status M0FullGpuNativeLoweringOwnerV1::CreateExecutionPlan(InferenceSess
   ORT_ENFORCE(session.session_options_.load_cancellation_flag==cancellation&&!cancellation->load(),"RW07_NATIVE_PLAN_CANCELLED");
   // Preserve all initializer protobufs for the immutable source receipt. The
   // owned post-plan gate must complete its checks before any tensor conversion/constructor.
-  LOGS(*session.session_logger_,INFO)<<"M0_NATIVE_INIT phase=finalize_begin epoch="<<p.epoch;
+  LOGS(*session.session_logger_,INFO)<<"M0_NATIVE_INIT phase=finalize_begin epoch="<<p.epoch<<" mono_us="<<M0MonotonicMicrosecondsV1();
   const auto status=p.state->FinalizeSessionState(PathString(),p.registry_manager,false,false);
   if(intent==ExecutionIntent::ObservePlan){
    ORT_ENFORCE(!status.IsOK()&&status.ErrorMessage()=="RW07_NATIVE_PREINIT_DENY_RESOURCE_CONTRACT"&&
      p.stage==ExecutionPlan::Stage::Planned,"RW07_NATIVE_PLAN_UNEXPECTED_FINALIZATION");
   }else{
    ORT_THROW_IF_ERROR(status);
-   LOGS(*session.session_logger_,INFO)<<"M0_NATIVE_INIT phase=finalize_done epoch="<<p.epoch;
+   LOGS(*session.session_logger_,INFO)<<"M0_NATIVE_INIT phase=finalize_done epoch="<<p.epoch<<" mono_us="<<M0MonotonicMicrosecondsV1();
    FinishInitialization(*p.state);
   }
   ORT_THROW_IF_ERROR(session.M0ValidateOriginalSelectionOptionsV1());
   ORT_ENFORCE(session.session_options_.load_cancellation_flag==cancellation&&!cancellation->load(),"RW07_NATIVE_PLAN_CANCELLED");
   return status;
- }catch(...){LOGS(*session.session_logger_,ERROR)<<"M0_NATIVE_INIT phase=abort_begin";AbortInitialization();
-  LOGS(*session.session_logger_,ERROR)<<"M0_NATIVE_INIT phase=abort_done";if(execution_plan_)execution_plan_->stage=ExecutionPlan::Stage::Poisoned;phase_=Phase::Poisoned;throw;}
+ }catch(...){LOGS(*session.session_logger_,ERROR)<<"M0_NATIVE_INIT phase=abort_begin"<<" mono_us="<<M0MonotonicMicrosecondsV1();AbortInitialization();
+  LOGS(*session.session_logger_,ERROR)<<"M0_NATIVE_INIT phase=abort_done"<<" mono_us="<<M0MonotonicMicrosecondsV1();if(execution_plan_)execution_plan_->stage=ExecutionPlan::Stage::Poisoned;phase_=Phase::Poisoned;throw;}
 #else
  ORT_UNUSED_PARAMETER(session);ORT_UNUSED_PARAMETER(intent);
  return ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_PRELOAD_DENY_UNREVIEWED_CONTRACT");
@@ -161,9 +162,9 @@ common::Status M0FullGpuNativeLoweringOwnerV1::CaptureExecutionPlan(SessionState
       plan->allocation_plan[size_t(index)].location==device,"RW07_NATIVE_PLAN_FOREIGN_OUTPUT_DEVICE");
    }
   }
-  LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=plan_validation_begin epoch="<<p.epoch;
+  LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=plan_validation_begin epoch="<<p.epoch<<" mono_us="<<M0MonotonicMicrosecondsV1();
   ValidateInitializerPlan(state);ValidateResourcePlan(state);p.module->ValidateCurrent();
-  LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=plan_validation_done epoch="<<p.epoch;
+  LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=plan_validation_done epoch="<<p.epoch<<" mono_us="<<M0MonotonicMicrosecondsV1();
   const auto fingerprint=ExecutionPlanFingerprint(state);
   ORT_ENFORCE(p.plan_sha256.empty()||p.plan_sha256==fingerprint,"RW07_NATIVE_PLAN_LIVE_METADATA_MUTATION");
   p.plan_sha256=fingerprint;p.plan=plan;p.stage=ExecutionPlan::Stage::Planned;

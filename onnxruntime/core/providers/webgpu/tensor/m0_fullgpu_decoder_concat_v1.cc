@@ -14,20 +14,7 @@ bool Gpu(const Tensor* t) { return t && t->Location().device.Type() == OrtDevice
 Status Binding(ComputeContext& c, const Tensor* t) {
   return m0_residual_stages::PhysicalBuffer(c,t);
 }
-void ValidOutput(ShaderHelper& s, const ShaderVariableHelper& e) {
-  auto& f = s.AdditionalImplementation();
-  f << "fn valid_output()->bool {if(" << e.GetByOffset("0u") << "!=2u||" << e.GetByOffset("1u")
-    << "!=3u||" << e.GetByOffset("20u") << "!=0u||" << e.GetByOffset("21u") << "!=63u){return false;}"
-    << "for(var i=0u;i<10u;i++){if(" << e.GetByOffset("22u+i") << "!="
-    << GetElementAt("uniforms.identity", "i", 10) << "){return false;}}"
-    << "if(" << e.GetByOffset("2u") << "!=1u||" << e.GetByOffset("3u") << "!=0u||"
-    << e.GetByOffset("4u") << "!=1090u||" << e.GetByOffset("5u") << "!=0u||"
-    << e.GetByOffset("7u") << "!=0u||" << e.GetByOffset("19u") << "!=0u){return false;}"
-    << "for(var i=8u;i<18u;i++){if(" << e.GetByOffset("i") << "!=0u){return false;}}"
-    << "let d=" << e.GetByOffset("6u") << ";return d>0u&&d<=102400u&&d<=uniforms.capacity&&"
-    << "d<=uniforms.text_capacity&&d<=uniforms.f0_capacity&&d<=uniforms.n_capacity&&"
-    << e.GetByOffset("18u") << "==1090u*d;}\n";
-}
+using m0_decoder_concat_stages::ValidOutput;
 class Guard final : public Program<Guard> {
  public:
   Guard() : Program{"RW07DecoderConcatGuardV1"} {}
@@ -86,30 +73,7 @@ class Guard final : public Program<Guard> {
     return Status::OK();
   }
 };
-class Concat final : public Program<Concat> {
- public:
-  Concat() : Program{"RW07OriginalDecoderConcatV1"} {}
-  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
-      {"text_capacity", ProgramUniformVariableDataType::Uint32}, {"f0_capacity", ProgramUniformVariableDataType::Uint32},
-      {"n_capacity", ProgramUniformVariableDataType::Uint32}, {"capacity", ProgramUniformVariableDataType::Uint32},
-      {"identity", ProgramUniformVariableDataType::Uint32});
-  Status GenerateShaderCode(ShaderHelper& s) const override {
-    const auto& x = s.AddInput("aligned_text", ShaderUsage::UseValueTypeAlias);
-    const auto& f0 = s.AddInput("f0_projection", ShaderUsage::UseValueTypeAlias);
-    const auto& n = s.AddInput("n_projection", ShaderUsage::UseValueTypeAlias);
-    const auto& e = s.AddInput("extent", ShaderUsage::UseValueTypeAlias);
-    const auto& y = s.AddOutput("decoder_input", ShaderUsage::UseValueTypeAlias);
-    ValidOutput(s, e);
-    auto& f = s.MainFunctionBody();
-    f << "if(global_idx>=1090u*uniforms.capacity){return;}" << y.SetByOffset("global_idx", "0.0")
-      << "if(!valid_output()){return;}let t=global_idx%uniforms.capacity;let ch=global_idx/uniforms.capacity;"
-      << "if(t>=" << e.GetByOffset("6u") << "){return;}if(ch<1024u){"
-      << y.SetByOffset("global_idx",x.GetByOffset("ch*uniforms.text_capacity+t")) << "}else if(ch<1088u){"
-      << y.SetByOffset("global_idx",f0.GetByOffset("(ch-1024u)*uniforms.f0_capacity+t")) << "}else{"
-      << y.SetByOffset("global_idx",n.GetByOffset("(ch-576u)*uniforms.n_capacity+t")) << "}";
-    return Status::OK();
-  }
-};
+using m0_decoder_concat_stages::Concat;
 class DecoderConcat final : public WebGpuKernel {
  public:
   explicit DecoderConcat(const OpKernelInfo& i) : WebGpuKernel{i}, capacity_(i.GetAttrOrDefault<int64_t>("physical_capacity", 0)), stage_(i.GetAttrOrDefault<int64_t>("stage", -1)) {}

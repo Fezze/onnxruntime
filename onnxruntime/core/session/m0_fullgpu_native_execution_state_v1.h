@@ -4,6 +4,7 @@
 #if !defined(ORT_MINIMAL_BUILD)
 #include "core/graph/m0_fullgpu_native_lowering_owner_v1.h"
 #include "core/framework/session_state.h"
+#include "core/common/m0_first_run_profile_v1.h"
 #include "core/framework/run_options.h"
 #include "core/session/m0_native_gpu_module_v2.h"
 namespace onnxruntime {
@@ -34,6 +35,7 @@ struct M0FullGpuNativeLoweringOwnerV1::ExecutionPlan {
  DataTransferManager transfers;
  ExternalDataLoaderManager external_loaders;
  profiling::Profiler profiler;
+ M0FirstRunProfileV1 first_run_profile;
  // Initially empty parent maps prevent allocator callbacks in SessionState's
  // constructor. The reviewed initialization phase populates them; they outlive state.
  AllocatorMap allocators,initializer_allocators;

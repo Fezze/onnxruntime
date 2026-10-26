@@ -4,6 +4,8 @@
 #include <fcntl.h>
 #include <fstream>
 #include <memory>
+#include <thread>
+#include <stdexcept>
 #include "gtest/gtest.h"
 #include "core/session/m0_module_file_lease_v1.h"
 #include "test/util/include/temp_dir.h"
@@ -33,6 +35,78 @@ class M0ModuleAudit : public testing::Test {
   std::filesystem::path path_;
   std::string digest_;
 };
+
+struct AuditResident {
+  AuditResident(std::unique_ptr<M0ModuleFileLeaseV1> lease,std::shared_ptr<int> counter)
+      :file(std::move(lease)),destroyed(std::move(counter)){}
+  std::unique_ptr<M0ModuleFileLeaseV1> file;
+  std::shared_ptr<int> destroyed;
+  ~AuditResident(){++*destroyed;}
+};
+TEST_F(M0ModuleAudit, RetainedResidencyReusesExactFileLeaseAndRefusesConcurrentOrForeignReturn){
+  M0ExclusiveModuleResidencyV1<AuditResident> slot;
+  const auto destroyed=std::make_shared<int>(0);size_t creates=0,verifies=0;
+  const auto create=[&](){++creates;return std::make_unique<AuditResident>(Open(),destroyed);};
+  const auto verify=[&](const AuditResident& resident){++verifies;EXPECT_TRUE(resident.file->Verify(true));};
+  auto first=slot.Acquire(create,verify);const auto* identity=first.get();const int fd=first->file->fd;
+  // Only the borrowing owner can return the lease. A concurrent request never
+  // invokes a second loader/factory, and must not poison the rightful owner.
+  bool concurrent_refused=false;
+  std::thread competing([&](){try{auto other=slot.Acquire(create,verify);}catch(const OnnxRuntimeException&){concurrent_refused=true;}});
+  competing.join();EXPECT_TRUE(concurrent_refused);EXPECT_EQ(creates,1u);
+  auto foreign=create();EXPECT_THROW(slot.Release(foreign,true),OnnxRuntimeException);EXPECT_TRUE(foreign);
+  slot.Release(first,true);EXPECT_FALSE(first);
+  auto second=slot.Acquire(create,verify);EXPECT_EQ(second.get(),identity);EXPECT_EQ(second->file->fd,fd);
+  EXPECT_EQ(creates,2u);EXPECT_EQ(verifies,2u);slot.Release(second,true);
+}
+TEST_F(M0ModuleAudit, RetainedResidencyRechecksOriginalInodeAndCannotReviveAfterReplacement){
+  M0ExclusiveModuleResidencyV1<AuditResident> slot;
+  const auto destroyed=std::make_shared<int>(0);size_t creates=0;
+  const auto create=[&](){++creates;return std::make_unique<AuditResident>(Open(),destroyed);};
+  const auto verify=[](const AuditResident& resident){resident.file->Verify(true);};
+  auto first=slot.Acquire(create,verify);slot.Release(first,true);
+  std::filesystem::rename(path_,path_.string()+".retired");
+  {std::ofstream replacement(path_,std::ios::binary);replacement<<"authenticated provider fixture";}
+  EXPECT_THROW((void)slot.Acquire(create,verify),OnnxRuntimeException);
+  EXPECT_EQ(creates,1u);
+  std::filesystem::remove(path_);std::filesystem::rename(path_.string()+".retired",path_);
+  EXPECT_THROW((void)slot.Acquire(create,verify),OnnxRuntimeException);
+  EXPECT_EQ(creates,1u);
+}
+TEST_F(M0ModuleAudit, PoisonedOrIncompleteResidencyRemainsOwnedAndNeverReturnsToService){
+  const auto destroyed=std::make_shared<int>(0);size_t creates=0,verifies=0;
+  const auto create=[&](){++creates;return std::make_unique<AuditResident>(Open(),destroyed);};
+  const auto verify=[&](const AuditResident& resident){++verifies;resident.file->Verify(true);};
+  M0ExclusiveModuleResidencyV1<AuditResident> slot;
+  auto first=slot.Acquire(create,verify);const int before=*destroyed;
+  slot.Release(first,false);EXPECT_FALSE(first);EXPECT_EQ(*destroyed,before);
+  EXPECT_THROW((void)slot.Acquire(create,verify),OnnxRuntimeException);
+  EXPECT_EQ(creates,1u);EXPECT_EQ(verifies,1u);EXPECT_EQ(*destroyed,before);
+  M0ExclusiveModuleResidencyV1<AuditResident> partial;
+  EXPECT_THROW((void)partial.Acquire([]()->std::unique_ptr<AuditResident>{throw std::runtime_error("partial loader failure");},verify),std::runtime_error);
+  EXPECT_THROW((void)partial.Acquire(create,verify),OnnxRuntimeException);
+  EXPECT_EQ(creates,1u);
+}
+
+TEST_F(M0ModuleAudit, ForeignAdmissionRefusalBeforeCreationCanRetryAfterOwnerRetires){
+  M0ExclusiveModuleResidencyV1<AuditResident> slot;
+  const auto destroyed=std::make_shared<int>(0);size_t creates=0,verifies=0,admissions=0;
+  bool foreign_owner=true;
+  const auto create=[&](){++creates;return std::make_unique<AuditResident>(Open(),destroyed);};
+  const auto verify=[&](const AuditResident& resident){++verifies;resident.file->Verify(true);};
+  const auto preflight=[&](){++admissions;ORT_ENFORCE(!foreign_owner,"foreign owner");};
+  EXPECT_THROW((void)slot.Acquire(create,verify,preflight),OnnxRuntimeException);
+  EXPECT_THROW((void)slot.Acquire(create,verify,preflight),OnnxRuntimeException);
+  EXPECT_EQ(creates,0u);EXPECT_EQ(verifies,0u);EXPECT_EQ(admissions,2u);
+  foreign_owner=false;
+  auto first=slot.Acquire(create,verify,preflight);const auto* identity=first.get();
+  slot.Release(first,true);
+  // Our own retained module is not a new foreign admission. Reverify it instead.
+  foreign_owner=true;
+  auto second=slot.Acquire(create,verify,preflight);
+  EXPECT_EQ(second.get(),identity);EXPECT_EQ(creates,1u);EXPECT_EQ(verifies,2u);EXPECT_EQ(admissions,3u);
+  slot.Release(second,true);
+}
 
 TEST_F(M0ModuleAudit, DefaultAuthenticatesOnceAndKeepsBoundaryRegistryAudit) {
   auto lease = Open();

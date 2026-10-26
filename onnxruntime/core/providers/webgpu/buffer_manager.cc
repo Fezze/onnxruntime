@@ -18,7 +18,6 @@ void EnforceM0MemoryReserve(WebGpuContext& context, const BufferManager& manager
                             CommandRecordingState& recording, uint64_t additional_bytes) {
   if (context.M0BoundedSubmissionsActiveV1()) {
     ORT_THROW_IF_ERROR(context.M0DrainOnMemoryPressureV1(manager, recording, additional_bytes));
-    ORT_THROW_IF_ERROR(M0CheckMemoryReserveV1(additional_bytes));
   }
 }
 

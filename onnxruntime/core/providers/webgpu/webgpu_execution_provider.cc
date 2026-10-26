@@ -1027,6 +1027,7 @@ WebGpuExecutionProvider::~WebGpuExecutionProvider() {
 
   prepack_allocator_.reset();
   session_buffer_pool_.reset();
+  recording_->M0ReleaseUniformUploadsV1();
   if (context_.Device()) {
     // A failed Run may leave an unsubmitted recording in the context-shared pools.
     context_.BufferManager().DiscardPendingBuffers(*recording_);
@@ -1055,19 +1056,28 @@ Status WebGpuExecutionProvider::OnRunStart(const onnxruntime::RunOptions& run_op
   const bool strict_ownership = run_options.config_options.GetConfigOrDefault("m0.fullgpu.extent_ownership_v2", "0") == "1";
   const auto bounded=run_options.config_options.GetConfigOrDefault("m0.fullgpu.bounded_submissions_v1","0");
   ORT_RETURN_IF_NOT(bounded=="0"||bounded=="1","RW07 invalid native submission profile");
+  const auto operator_profile = run_options.config_options.GetConfigOrDefault(
+      "m0.fullgpu.operator_profile_v1", "0");
+  ORT_RETURN_IF_NOT(operator_profile == "0" || operator_profile == "1", "RW07 invalid operator profile");
+  const bool session_profiling = session_profiler_ && session_profiler_->Enabled();
+  // Only the closed native owner issues this diagnostic callback option. Public
+  // Run options remain rejected by the native entry point; execution checks stay live.
+  ORT_RETURN_IF_NOT(operator_profile == "0" ||
+      (bounded == "1" && strict_ownership && session_profiling),
+      "RW07 operator profile requires a bounded native session profiler");
   uint64_t submission_budget=0;
   if(bounded=="1"){
     ORT_RETURN_IF_NOT(strict_ownership&&!IsGraphCaptureEnabled()&&
-        !(session_profiler_&&session_profiler_->Enabled())&&!run_options.enable_profiling&&
+        (!session_profiling || operator_profile == "1")&&!run_options.enable_profiling&&
         !context_.M0ProfilingActiveV2()&&context_.ValidationMode()>=webgpu::ValidationMode::Basic&&
         run_options.config_options.GetConfigOrDefault("m0.fullgpu.fault_authorized_v2","0")=="0",
-        "RW07 native submission profile requires unprofiled strict execution");
+        "RW07 native submission profile requires strict execution and authorized session profiling");
     ORT_RETURN_IF_NOT(BufferManager().M0NonRetainingCachesV1()&&
         context_.InitializerBufferManager().M0NonRetainingCachesV1(),"RW07 native submission cache profile");
     ORT_RETURN_IF_NOT(!recording_->command_encoder&&!recording_->compute_pass_encoder&&
         !recording_->has_unsubmitted_work.load(std::memory_order_relaxed)&&
         !recording_->num_pending_dispatches&&recording_->deferred_dispatches.empty()&&
-        !recording_->m0_submission_budget_bytes&&!recording_->m0_queued_reference_bytes,
+        !recording_->m0_submission_budget_bytes&&!recording_->m0_queued_scheduled_products&&!recording_->m0_queued_reference_bytes&&recording_->m0_unique_queued_buffers.Empty()&&!recording_->m0_uniform_current&&recording_->m0_uniform_batches.empty(),
         "RW07 native submission recording not idle");
     submission_budget=context_.DeviceLimits().maxBufferSize;
 #if defined(__ANDROID__)
@@ -1079,14 +1089,11 @@ Status WebGpuExecutionProvider::OnRunStart(const onnxruntime::RunOptions& run_op
     }
     if(kM0EnforceMemoryReserveV1)ORT_RETURN_IF_ERROR(reading);
     ORT_RETURN_IF_NOT(!kM0EnforceMemoryReserveV1||available_bytes>kM0MemoryReserveBytesV1,"RW07 native submission memory reserve");
-    // Leave the other half of current headroom for live allocations/scratch.
-    // The capacity planner budgets both halves; allocation guards remain live.
-    submission_budget=std::min(submission_budget,available_bytes>kM0MemoryReserveBytesV1
-        ? std::max<uint64_t>(1,(available_bytes-kM0MemoryReserveBytesV1)/2) : 64*1024);
+    submission_budget=M0SubmissionBudgetV1(submission_budget,available_bytes,reading.IsOK());
 #endif
     ORT_RETURN_IF_NOT(submission_budget,"RW07 native submission zero budget");
   }else{
-    ORT_RETURN_IF_NOT(!recording_->m0_submission_budget_bytes&&!recording_->m0_queued_reference_bytes,
+    ORT_RETURN_IF_NOT(!recording_->m0_submission_budget_bytes&&!recording_->m0_queued_scheduled_products&&!recording_->m0_queued_reference_bytes&&recording_->m0_unique_queued_buffers.Empty()&&!recording_->m0_uniform_current&&recording_->m0_uniform_batches.empty(),
         "RW07 native submission profile cannot be abandoned");
   }
   if (strict_ownership) {
@@ -1129,7 +1136,7 @@ Status WebGpuExecutionProvider::OnRunStart(const onnxruntime::RunOptions& run_op
         !recording_->command_encoder&&!recording_->compute_pass_encoder&&
         !recording_->has_unsubmitted_work.load(std::memory_order_relaxed)&&
         !recording_->num_pending_dispatches&&recording_->deferred_dispatches.empty()&&
-        !recording_->m0_queued_reference_bytes){
+        !recording_->m0_queued_scheduled_products&&!recording_->m0_queued_reference_bytes){
       if(!context_.M0EndBoundedSubmissionsV1())context_.M0OwnershipV2().Poison();
     }
     try { LOGS_DEFAULT(INFO) << "M0_RW07_RUN_START_ROLLBACK context_poisoned=" << context_.M0OwnershipV2().Poisoned(); }
@@ -1223,6 +1230,8 @@ Status WebGpuExecutionProvider::OnRunStart(const onnxruntime::RunOptions& run_op
       << " peak_live_requested_bytes=" << stats.peak_live_requested_bytes << " acquisitions=" << stats.acquisitions
       << " retirements=" << stats.retirements << " includes_cache=0 includes_driver=0"
       << " bounded_submissions=" << (submission_budget != 0)
+      << " submission_window=" << context_.M0DispatchWindowV1()
+      << " scheduled_product_window=" << webgpu::kM0ScheduledProductsPerWindowV1
       << " submission_budget_bytes=" << submission_budget
       << " bounded_scope_active=" << context_.M0BoundedSubmissionsActiveV1();
   }
@@ -1294,7 +1303,9 @@ Status WebGpuExecutionProvider::OnRunEnd(bool sync_stream, const onnxruntime::Ru
       ? context_.FlushAndWaitChecked(BufferManager(), *recording_, m0_fault_mode_v2_ == 22)
       : context_.Flush(BufferManager(), *recording_);
   if (strict_ownership && flush_status.IsOK()) {
-    LOGS_DEFAULT(INFO) << "M0_RW07_RUN_QUEUE_COMPLETE timeline=" << recording_.get();
+    LOGS_DEFAULT(INFO) << "M0_RW07_RUN_QUEUE_COMPLETE timeline=" << recording_.get()
+      << " uniform_arena_uploads=" << recording_->m0_uniform_arena_uploads
+      << " uniform_arena_bytes=" << recording_->m0_uniform_arena_bytes;
     context_.M0OwnershipV2().LogWorkload("checked_run_end");
     const auto stats = context_.M0OwnershipV2().Statistics();
     LOGS_DEFAULT(INFO) << "M0_RW07_RESOURCE_REQUESTS phase=checked_end session="

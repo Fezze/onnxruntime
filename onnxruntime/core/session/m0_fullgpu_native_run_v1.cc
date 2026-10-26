@@ -4,6 +4,7 @@
 #if !defined(ORT_MINIMAL_BUILD)
 #include <cstring>
 #include <set>
+#include "core/common/m0_observation_options_v1.h"
 #include "core/session/m0_fullgpu_native_execution_state_v1.h"
 #include "core/session/m0_native_terminal_result_v1.h"
 #include "core/session/inference_session.h"
@@ -90,6 +91,10 @@ common::Status M0FullGpuNativeLoweringOwnerV1::RunExecution(
   configure("m0.fullgpu.actual_session_v2",std::to_string(p.epoch));
   configure("m0.fullgpu.actual_run_v2",std::to_string(scope->Id()));
   configure("m0.fullgpu.fault_authorized_v2","0");configure("m0.fullgpu.diagnostic_fault_mode_v2","0");
+  const char* profile_file=std::getenv("M0_GPU_OPERATOR_PROFILE_FILE");
+  p.first_run_profile.Start(M0GpuOperatorProfileV1(),p.profiler,session.session_logger_,
+      profile_file?profile_file:"",[&](){return p.provider->GetProfiler();});
+  configure("m0.fullgpu.operator_profile_v1",p.first_run_profile.Active()?"1":"0");
   ORT_THROW_IF_ERROR(p.module->Provider().OnRunStart(callbacks));started=true;
   LOGS(*session.session_logger_,INFO)<<"M0_RW07_NATIVE_RUN_BEGIN epoch="<<p.epoch<<" run="<<scope->Id()
    <<" selected_nodes="<<p.selected.size()<<" source_model_retained=1";
@@ -128,7 +133,9 @@ common::Status M0FullGpuNativeLoweringOwnerV1::RunExecution(
   // Completion uses the already authenticated retained provider. A new
   // metadata/device validation failure must not suppress the cleanup callback.
   const auto completion=p.provider->OnRunEnd(true,callbacks);
-  ORT_THROW_IF_ERROR(completion);ORT_THROW_IF_ERROR(execution);
+  ORT_THROW_IF_ERROR(completion);
+  p.first_run_profile.Finish(p.profiler);
+  ORT_THROW_IF_ERROR(execution);
   LOGS(*session.session_logger_,INFO)<<"M0_RW07_NATIVE_RUN_CHECKED_COMPLETION run="<<scope->Id();
   ORT_ENFORCE(!options.terminate&&gpu_fetches.size()==4,"RW07_NATIVE_RUN_COMPLETED_OUTPUTS");
   for(const auto& value:gpu_fetches){
@@ -189,6 +196,7 @@ common::Status M0FullGpuNativeLoweringOwnerV1::RunExecution(
    if(started&&!end_attempted&&p.provider){end_attempted=true;
     try{ORT_IGNORE_RETURN_VALUE(p.provider->OnRunEnd(true,callbacks));}catch(...){}
    }
+   try{p.first_run_profile.Finish(p.profiler);}catch(...){}
    p.stage=ExecutionPlan::Stage::Poisoned;
   }
   phase_=Phase::Poisoned;throw;

@@ -15,9 +15,11 @@
 
 namespace onnxruntime {
 namespace webgpu {
+class ComputeContext;
 namespace ep {
 
 class Factory;
+class M0NumericTraceV1;
 
 /// <summary>
 /// A bridge class between the EP API and the WebGPU EP implementation.
@@ -31,6 +33,8 @@ class Ep : public onnxruntime::ep::adapter::Ep {
   };
 
   Ep(std::unique_ptr<IExecutionProvider> impl, Factory& factory, const OrtLogger& logger, const Config& config);
+  ~Ep();
+  Status TraceNumericOutputs(onnxruntime::webgpu::ComputeContext& context) const;
 
 #if defined(__ANDROID__) && defined(ORT_USE_EP_API_ADAPTERS) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
   static bool M0NativeDescribeDeviceLimitsV1(const OrtEp* ep,uint64_t storage_bytes,uint64_t initializer_bytes,
@@ -43,6 +47,8 @@ class Ep : public onnxruntime::ep::adapter::Ep {
   }
 
  private:
+  static OrtStatus* ORT_API_CALL CreateProfilerImpl(OrtEp* self,OrtEpProfilerImpl** profiler) noexcept;
+
   static const char* ORT_API_CALL GetNameImpl(const OrtEp* this_ptr) noexcept;
 
   static OrtStatus* ORT_API_CALL GetCapabilityImpl(OrtEp* this_ptr, const OrtGraph* graph,
@@ -98,6 +104,7 @@ class Ep : public onnxruntime::ep::adapter::Ep {
   Factory& factory_;
   const OrtLogger& logger_;
   Config config_{};
+  std::unique_ptr<M0NumericTraceV1> numeric_trace_;
 };
 
 }  // namespace ep

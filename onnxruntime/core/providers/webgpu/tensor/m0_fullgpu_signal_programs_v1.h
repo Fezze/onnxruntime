@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 #pragma once
 #include "core/providers/webgpu/webgpu_kernel.h"
+#include "core/common/m0_observation_options_v1.h"
 #include "core/providers/webgpu/shader_helper.h"
 #include "m0_duration_exact_fp32.h"
 #include "m0_fullgpu_trig_v1.h"
@@ -70,7 +71,9 @@ class Prefix final : public Program<Prefix> {
 
 class Signal final : public Program<Signal> {
  public:
-  Signal() : Program{"RW07SignalOriginal1528Through1571V1"} {}
+  explicit Signal(bool reuse_coefficients=M0BatchHeavyProgramsV1())
+      : Program{reuse_coefficients?"RW07SignalOriginal1528Through1571CoefficientsV2":"RW07SignalOriginal1528Through1571V1"},
+        reuse_coefficients_(reuse_coefficients) {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"input_capacity", ProgramUniformVariableDataType::Uint32},
       {"output_capacity", ProgramUniformVariableDataType::Uint32},
@@ -94,7 +97,18 @@ class Signal final : public Program<Signal> {
       << "let coord=rw07_add(rw07_div(rw07_add(f32(sample),0.5),300.0),-0.5);"
       << "let pos=max(0.0,min(coord,f32(len-1u)));let lo=min(u32(pos),len-1u);let hi=min(lo+1u,len-1u);"
       << "var dx1=abs(pos-f32(lo));var dx2=abs(pos-f32(hi));if(lo==hi){dx1=0.5;dx2=0.5;}"
-      << "let fi=min(u32(floor(rw07_div(f32(sample),300.0))),len-1u);"
+      ;
+    if(reuse_coefficients_){
+      // The same two time weights recur for all nine harmonics. Preserve both
+      // original multiplication boundaries, including zero-corner signs.
+      f<<"let regular_coefficients=vec4<f32>("
+        <<"rw07_mul(rw07_mul(dx2,1.0),0.5),rw07_mul(rw07_mul(dx1,1.0),0.5),"
+        <<"rw07_mul(rw07_mul(dx2,0.0),0.5),rw07_mul(rw07_mul(dx1,0.0),0.5));"
+        <<"let final_coefficients=vec4<f32>("
+        <<"rw07_mul(rw07_mul(dx2,0.5),0.5),rw07_mul(rw07_mul(dx1,0.5),0.5),"
+        <<"rw07_mul(rw07_mul(dx2,0.5),0.5),rw07_mul(rw07_mul(dx1,0.5),0.5));";
+    }
+    f << "let fi=min(u32(floor(rw07_div(f32(sample),300.0))),len-1u);"
       << "let uv=select(0.0,1.0," << x.GetByOffset("fi") << ">10.0);var sum:f32=0.0;"
       << "for(var h=0u;h<9u;h++){let nh=min(h+1u,8u);let dy1=select(0.0,0.5,h==nh);"
       << "let dy2=select(1.0,0.5,h==nh);let a=" << phase.GetByOffset("h*uniforms.input_capacity+lo") << ";"
@@ -106,10 +120,18 @@ class Signal final : public Program<Signal> {
       << "(bitcast<u32>(c)&0x7fffffffu)<0x7f800000u&&(bitcast<u32>(d)&0x7fffffffu)<0x7f800000u){"
       // Original rank-three Resize visits all eight corners in this order.
       // Reassociation of its large phase values changes the following sine.
-      << "let p0=rw07_mul(rw07_mul(rw07_mul(dx2,dy2),0.5),a);"
-      << "let p1=rw07_mul(rw07_mul(rw07_mul(dx1,dy2),0.5),b);"
-      << "let p2=rw07_mul(rw07_mul(rw07_mul(dx2,dy1),0.5),c);"
-      << "let p3=rw07_mul(rw07_mul(rw07_mul(dx1,dy1),0.5),d);"
+      ;
+    if(reuse_coefficients_){
+      f<<"let coefficients=select(regular_coefficients,final_coefficients,h==8u);"
+        <<"let p0=rw07_mul(coefficients.x,a);let p1=rw07_mul(coefficients.y,b);"
+        <<"let p2=rw07_mul(coefficients.z,c);let p3=rw07_mul(coefficients.w,d);";
+    }else{
+      f<<"let p0=rw07_mul(rw07_mul(rw07_mul(dx2,dy2),0.5),a);"
+        <<"let p1=rw07_mul(rw07_mul(rw07_mul(dx1,dy2),0.5),b);"
+        <<"let p2=rw07_mul(rw07_mul(rw07_mul(dx2,dy1),0.5),c);"
+        <<"let p3=rw07_mul(rw07_mul(rw07_mul(dx1,dy1),0.5),d);";
+    }
+    f
       << "value=rw07_add(rw07_add(rw07_add(p0,p1),p2),p3);"
       << "value=rw07_add(rw07_add(rw07_add(rw07_add(value,p0),p1),p2),p3);"
       << "}else{value=dx2*dy2*0.5*a;value=value+dx1*dy2*0.5*b;"
@@ -122,6 +144,8 @@ class Signal final : public Program<Signal> {
       << out.SetByOffset("global_idx", "tanh(shifted)");
     return Status::OK();
   }
+ private:
+  const bool reuse_coefficients_;
 };
 
 }  // namespace onnxruntime::webgpu::m0_signal_detail

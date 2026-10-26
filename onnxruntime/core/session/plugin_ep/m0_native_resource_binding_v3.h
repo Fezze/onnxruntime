@@ -3,6 +3,7 @@
 #pragma once
 #include <cstdint>
 #include <type_traits>
+#include <utility>
 #include "core/session/onnxruntime_c_api.h"
 namespace onnxruntime {
 // Source-private, payload-free metadata from the authenticated retained EP.
@@ -29,4 +30,20 @@ static_assert(std::is_trivially_copyable_v<M0NativeResourceBindingV3>);
 // authenticated SAME retained module handle/factory as its ABI2 registry.
 using M0WebGpuNativeResourceQueryV3=int(ORT_API_CALL*)(uint32_t abi,const OrtEp* ep,
     uintptr_t handle,uint64_t required_bytes,M0NativeResourceBindingV3* output) noexcept;
+// Collect while the caller holds one authenticated module/factory lease. Each
+// backend query still performs its own device and live-allocation validation.
+// Commit only the complete bounded observation; no output changes on refusal.
+template<class Queries,class Query,class Rows>
+bool M0CollectNativeResourcesV3(const OrtEp* ep,const Queries& queries,Query&& query,Rows& output){
+  if(!ep||queries.empty()||queries.size()>556)return false;
+  Rows pending;pending.reserve(queries.size());
+  for(const auto& request:queries){
+    if((request.first==0)!=(request.second==0))return false;
+    M0NativeResourceBindingV3 row;
+    if(query(3,ep,request.first,request.second,&row)!=1||row.abi!=3||row.structure_bytes!=sizeof(row)||
+        row.ep!=reinterpret_cast<uintptr_t>(ep)||!row.context||!row.device||!row.queue||row.handle!=request.first)return false;
+    pending.push_back(row);
+  }
+  output=std::move(pending);return true;
+}
 }  // namespace onnxruntime

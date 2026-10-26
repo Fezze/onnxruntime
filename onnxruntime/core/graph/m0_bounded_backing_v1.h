@@ -14,6 +14,7 @@
 #include "core/common/inlined_containers.h"
 #include "core/graph/onnx_protobuf.h"
 #include "google/protobuf/io/zero_copy_stream.h"
+#include "google/protobuf/io/coded_stream.h"
 
 namespace onnxruntime::m0_internal {
 
@@ -42,6 +43,17 @@ class M0BackingProjectionV1 final : public google::protobuf::io::ZeroCopyOutputS
     byte_count_ -= count;
     Flush();
   }
+  bool AllowsAliasing()const override{return true;}
+  bool WriteAliasedRaw(const void* data,int size)override{
+    ORT_ENFORCE(size>=0&&(data||size==0)&&byte_count_<=std::numeric_limits<int64_t>::max()-size,
+                "RW07_WHOLE_PROJECTION_ALIASED_RANGE");
+    Flush();
+    if(size)Consume(static_cast<const char*>(data),size_t(size));
+    byte_count_+=size;
+    aliased_bytes_+=uint64_t(size);
+    return true;
+  }
+  uint64_t AliasedBytes()const{return aliased_bytes_;}
   int64_t ByteCount() const override { return byte_count_; }
 
   std::string Finish() {
@@ -150,7 +162,7 @@ class M0BackingProjectionV1 final : public google::protobuf::io::ZeroCopyOutputS
   Mode mode_ = Mode::Tag;
   size_t pending_ = 0, varint_size_ = 0, tag_size_ = 0;
   int64_t byte_count_ = 0;
-  uint64_t value_ = 0, remaining_ = 0;
+  uint64_t value_ = 0, remaining_ = 0, aliased_bytes_ = 0;
   uint32_t field_ = 0;
   bool discard_ = false;
 };
@@ -159,7 +171,14 @@ inline std::string M0ProjectedBackingBytesV1(
     const google::protobuf::MessageLite& message,
     std::initializer_list<std::pair<uint32_t, size_t>> omissions) {
   M0BackingProjectionV1 output(omissions);
-  ORT_ENFORCE(message.SerializeToZeroCopyStream(&output), "RW07_WHOLE_PROJECTION_SERIALIZE");
+  {
+    // Generated protobuf serializers can expose large raw strings directly.
+    // Consume skips omitted payloads by length, preserving the same wire parser
+    // and unknown-field checks without copying model weights through4096-byte buffers.
+    google::protobuf::io::CodedOutputStream coded(&output);
+    coded.EnableAliasing(true);
+    ORT_ENFORCE(message.SerializeToCodedStream(&coded),"RW07_WHOLE_PROJECTION_SERIALIZE");
+  }
   return output.Finish();
 }
 

@@ -2,18 +2,39 @@
 // Licensed under the MIT License.
 #pragma once
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include "core/common/m0_observation_options_v1.h"
 #include <cstdint>
 #include <initializer_list>
+#include <string>
 #include "core/providers/webgpu/webgpu_kernel.h"
 #include "core/providers/webgpu/shader_helper.h"
 #include "m0_fullgpu_trig_v1.h"
+#include "core/providers/webgpu/math/gemm_utils.h"
 
 // Both original generator and noise residual paths use the same scalar stage
 // ordering. Roles, extents, parameters and capacities remain caller supplied.
 namespace onnxruntime::webgpu::m0_residual_stages {
-inline void ValidOutput(ShaderHelper& s, const ShaderVariableHelper& e) {
+inline Status RunHeavyProgram(ComputeContextBase& context,const ProgramBase& program){
+  // The native recording still fences each bounded dispatch/resource window and
+  // final publication. Keep the legacy per-program isolation available.
+  // Each heavy path is already bounded per dispatch; charge its conservative
+  // maximum so a larger command count cannot create an unbounded work window.
+  return M0BatchHeavyProgramsV1()?context.RunProgram(program,uint64_t{1}<<25):context.RunProgramWithCheckedCompletion(program);
+}
+
+// One immutable sidecar predicate per shader. Insert before any lane-specific
+// return; all lanes must participate in this initialization barrier.
+inline void ShareOutputValidityV1(ShaderHelper& s){
+  s.AdditionalImplementation()<<"var<workgroup> m0_shared_extent_valid:u32;"
+    <<"fn valid_output()->bool{return m0_shared_extent_valid!=0u;}\n";
+  s.MainFunctionBody()<<"if(local_idx==0u){m0_shared_extent_valid=select(0u,1u,validate_output_descriptor());}workgroupBarrier();";
+}
+inline void ValidOutput(ShaderHelper& s, const ShaderVariableHelper& e,bool share_workgroup=false) {
+  const bool shared=share_workgroup&&M0BatchHeavyProgramsV1();
   auto& f = s.AdditionalImplementation();
-  f << "fn valid_output()->bool {if(" << e.GetByOffset("0u") << "!=2u||"
+  f << "fn " << (shared?"validate_output_descriptor":"valid_output") << "()->bool {if(" << e.GetByOffset("0u") << "!=2u||"
     << e.GetByOffset("1u") << "!=3u||" << e.GetByOffset("20u") << "!=0u||"
     << e.GetByOffset("21u") << "!=63u){return false;}"
     << "for(var i=0u;i<10u;i++){if(" << e.GetByOffset("22u+i") << "!="
@@ -25,6 +46,11 @@ inline void ValidOutput(ShaderHelper& s, const ShaderVariableHelper& e) {
     << "let n=" << e.GetByOffset("6u") << ";return n>=uniforms.minimum&&n<=uniforms.maximum&&"
     << "n%uniforms.modulus==uniforms.remainder&&n<=uniforms.output_capacity&&"
     << e.GetByOffset("18u") << "==uniforms.channels*n;}\n";
+  if(shared){
+    // All lanes enter before any payload tail return. The read-only sidecar
+    // cannot change within a dispatch; validate all words once per workgroup.
+    ShareOutputValidityV1(s);
+  }
 }
 // Preserve the original scalar operation order across the staged GPU programs.
 inline void OriginalArithmetic(ShaderHelper& s) {
@@ -79,21 +105,43 @@ inline Status StorageBudget(ComputeContext& c, std::initializer_list<const Tenso
       "RW07 residual stage segmented storage binding budget");
   return Status::OK();
 }
-inline Status ResidualTileChannels(ComputeContext& c, uint32_t input_capacity, uint32_t output_capacity,
-                                   uint32_t channels, uint32_t& tile_channels) {
-  const auto& limits=c.DeviceLimits();
+// The activation window is a scheduling policy, not an assumed device size.
+// Larger windows remove repeated input-channel passes while each convolution
+// dispatch still obeys its independent product and aggregate submission bounds.
+inline uint32_t ResidualTileChannelCountV1(const wgpu::Limits& limits,uint32_t input_capacity,
+    uint32_t output_capacity,uint32_t channels,bool batched,uint64_t queue_budget=0,uint64_t fixed_references=0){
   const uint64_t alignment=limits.minStorageBufferOffsetAlignment;
   const uint64_t capacity=std::max(input_capacity,output_capacity);
-  ORT_RETURN_IF_NOT(alignment>0&&alignment%sizeof(float)==0&&capacity>0&&channels>0&&
-      capacity*channels<=UINT32_MAX,"RW07 residual tile descriptor/index limit");
+  if(!alignment||alignment%sizeof(float)||!capacity||!channels||capacity*channels>UINT32_MAX)return 0;
   const uint64_t row_bytes=capacity*sizeof(float),prefix=alignment-sizeof(float);
-  ORT_RETURN_IF_NOT(row_bytes+prefix<=limits.maxStorageBufferBindingSize,
-      "RW07 residual channel row exceeds a physical binding window");
-  const uint64_t target=std::min<uint64_t>(limits.maxStorageBufferBindingSize,
-      std::max<uint64_t>(8ull*1024*1024,row_bytes+prefix));
-  const uint64_t count=std::min<uint64_t>(std::min<uint32_t>(32,channels),(target-prefix)/row_bytes);
-  ORT_RETURN_IF_NOT(count>0,"RW07 residual empty channel tile");
-  tile_channels=static_cast<uint32_t>(count);
+  const uint64_t physical=std::min(limits.maxStorageBufferBindingSize,limits.maxBufferSize);
+  if(row_bytes>physical||prefix>physical-row_bytes)return 0;
+  uint64_t preferred=(batched?32ull:8ull)*1024*1024;
+  if(batched&&queue_budget){
+    // Do not enlarge an activation until every command exceeds the queue byte
+    // budget. Leave a quarter of remaining references for adjacent preparation.
+    const uint64_t remaining=queue_budget>fixed_references?queue_budget-fixed_references:0;
+    preferred=std::min(preferred,remaining/4*3);
+  }
+  const uint64_t target=std::min(physical,std::max(preferred,row_bytes+prefix));
+  return static_cast<uint32_t>(std::min({uint64_t(channels),uint64_t(batched?256u:32u),
+    uint64_t(limits.maxComputeWorkgroupsPerDimension),(target-prefix)/row_bytes}));
+}
+inline uint64_t ResidualFixedReferencesV1(uint32_t input_capacity,uint32_t output_capacity,uint32_t channels,
+    uint64_t weight_bytes,uint64_t bias_bytes){
+  // Unique backing bytes, not just the bound window. Covers norm/conv commands,
+  // the maximum packed scratch, coefficients, extent, uniforms and alignment.
+  const uint64_t carrier=uint64_t(std::max(input_capacity,output_capacity))*channels*sizeof(float);
+  return carrier+weight_bytes+bias_bytes+uint64_t(channels)*6*sizeof(float)+128+
+    kM0ResidualPackedScratchBytesV1+kM0ResidualPackedFlagWordsV1*sizeof(uint32_t)+kM0UniformArenaBytesV1+8*15;
+}
+inline Status ResidualTileChannels(ComputeContext& c,uint32_t input_capacity,uint32_t output_capacity,
+    uint32_t channels,uint32_t& tile_channels,bool wide_residual=false,uint64_t fixed_references=0){
+  const auto count=ResidualTileChannelCountV1(c.DeviceLimits(),input_capacity,output_capacity,channels,
+    wide_residual&&M0BatchHeavyProgramsV1()&&M0OutputChannelTiledConvV1(),
+    wide_residual?c.M0SubmissionBudgetBytesV1():0,fixed_references);
+  ORT_RETURN_IF_NOT(count>0,"RW07 residual channel window descriptor/device/index limit");
+  tile_channels=count;
   return Status::OK();
 }
 template <typename View>
@@ -203,7 +251,9 @@ class GeneratorStyleParameters final : public Program<GeneratorStyleParameters> 
 // The coefficient allocation also holds mean/denominator; no carrier copy.
 class GeneratorNormStatistics final : public Program<GeneratorNormStatistics> {
  public:
-  GeneratorNormStatistics() : Program{"RW07ResidualNormStatisticsCompensatedV2"} {}
+  explicit GeneratorNormStatistics(bool parallel=M0ParallelNormV1())
+    : Program{parallel?"RW07ResidualNormStatisticsParallelCompensatedV3":"RW07ResidualNormStatisticsCompensatedV2"},parallel_(parallel) {}
+  uint32_t Workgroups(uint32_t channels) const {return parallel_?channels:(channels+63)/64;}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"input_capacity", ProgramUniformVariableDataType::Uint32},
       {"output_capacity", ProgramUniformVariableDataType::Uint32},
@@ -237,6 +287,43 @@ fn residual_accumulate(state:vec2<f32>,value:f32)->vec2<f32> {
  return vec2<f32>(next,original_sub(original_sub(next,state.x),adjusted));
 }
 )WGSL";
+    if(parallel_){
+      s.AdditionalImplementation()<<"var<workgroup> norm_partial:array<f32,64>;var<workgroup> norm_unsafe:array<u32,64>;var<workgroup> norm_mean:f32;var<workgroup> norm_count:u32;";
+      auto& f=s.MainFunctionBody();
+      // All lanes execute every barrier, including invalid extents. Each group
+      // owns one channel; no global atomics or cross-group coordination.
+      f << "let local_channel=workgroup_idx;let channel=uniforms.channel_offset+local_channel;"
+        << "let channel_valid=local_channel<uniforms.channel_count&&uniforms.channel_offset<uniforms.channels&&"
+        << "uniforms.channel_count<=uniforms.channels-uniforms.channel_offset;"
+        << "if(local_idx==0u){norm_count=0u;norm_mean=0.0;if(channel_valid){"
+        << y.SetByOffset("channel*6u+4u","0.0") << y.SetByOffset("channel*6u+5u","0.0")
+        << "let count=" << e.GetByOffset("6u") << ";if(valid_output()&&count<=uniforms.input_capacity){norm_count=count;}}}"
+        << "workgroupBarrier();var sum=vec2<f32>(0.0);var row_requires_serial=0u;"
+        // A conservative finite bound excludes overflow in both the sum and
+        // squared-deviation reduction. Exceptional rows retain serial order.
+        << "let safe_abs=sqrt(bitcast<f32>(0x7f7fffffu)/f32(max(1u,norm_count)))*0.25;"
+        << "for(var t=local_idx;t<norm_count;t+=64u){let value=" << x.GetByOffset("local_channel*uniforms.input_capacity+t") << ";"
+        << "if((bitcast<u32>(value)&0x7fffffffu)>=0x7f800000u||abs(value)>safe_abs){row_requires_serial=1u;}sum=residual_accumulate(sum,value);}"
+        << "norm_partial[local_idx]=sum.x;norm_unsafe[local_idx]=row_requires_serial;workgroupBarrier();"
+        << "if(local_idx==0u&&norm_count>0u){var serial=false;for(var lane=0u;lane<64u;lane++){serial=serial||norm_unsafe[lane]!=0u;}"
+        << "if(serial){var exact_sum=vec2<f32>(0.0);for(var t=0u;t<norm_count;t++){exact_sum=residual_accumulate(exact_sum,"
+        << x.GetByOffset("local_channel*uniforms.input_capacity+t") << ");}let mean=original_div(exact_sum.x,f32(norm_count));"
+        << "var exact_squares=vec2<f32>(0.0);for(var t=0u;t<norm_count;t++){let delta=original_sub("
+        << x.GetByOffset("local_channel*uniforms.input_capacity+t") << ",mean);exact_squares=residual_accumulate(exact_squares,original_mul(delta,delta));}"
+        << "let variance=original_div(exact_squares.x,f32(norm_count));let denominator=original_sqrt(original_add(variance,bitcast<f32>(0x3727c5acu)));"
+        << y.SetByOffset("channel*6u+4u","mean") << y.SetByOffset("channel*6u+5u","denominator")
+        << "norm_count=0u;}else{var combined=vec2<f32>(0.0);for(var lane=0u;lane<64u;lane++){"
+        << "combined=residual_accumulate(combined,norm_partial[lane]);}norm_mean=original_div(combined.x,f32(norm_count));}}"
+        << "workgroupBarrier();var squares=vec2<f32>(0.0);"
+        << "for(var t=local_idx;t<norm_count;t+=64u){let delta=original_sub(" << x.GetByOffset("local_channel*uniforms.input_capacity+t") << ",norm_mean);"
+        << "squares=residual_accumulate(squares,original_mul(delta,delta));}"
+        << "norm_partial[local_idx]=squares.x;workgroupBarrier();"
+        << "if(local_idx==0u&&norm_count>0u){var combined=vec2<f32>(0.0);for(var lane=0u;lane<64u;lane++){"
+        << "combined=residual_accumulate(combined,norm_partial[lane]);}let variance=original_div(combined.x,f32(norm_count));"
+        << "let denominator=original_sqrt(original_add(variance,bitcast<f32>(0x3727c5acu)));"
+        << y.SetByOffset("channel*6u+4u","norm_mean") << y.SetByOffset("channel*6u+5u","denominator") << "}";
+      return Status::OK();
+    }
     auto& f=s.MainFunctionBody();
     f << "if(global_idx>=uniforms.channel_count||uniforms.channel_offset>=uniforms.channels||"
       << "uniforms.channel_count>uniforms.channels-uniforms.channel_offset){return;}"
@@ -252,12 +339,19 @@ fn residual_accumulate(state:vec2<f32>,value:f32)->vec2<f32> {
       << y.SetByOffset("channel*6u+4u","mean") << y.SetByOffset("channel*6u+5u","denominator");
     return Status::OK();
   }
+ private:
+  const bool parallel_;
 };
 // Each invocation evaluates at most one sample; cap the number per dispatch.
 inline constexpr uint32_t kResidualSnakeElementsPerDispatchV1 = 16384;
-class GeneratorNormSnake final : public Program<GeneratorNormSnake> {
+inline uint32_t ResidualSnakeElementsPerDispatchV1(bool batched=M0BatchHeavyProgramsV1()) {
+  return batched ? 131072u : kResidualSnakeElementsPerDispatchV1;
+}
+class GeneratorNormAffine final : public Program<GeneratorNormAffine> {
  public:
-  GeneratorNormSnake() : Program{"RW07ResidualNormSnakeElementChunksV3"} {}
+  explicit GeneratorNormAffine(bool fused=M0FusedNormSnakeV1())
+    : Program{fused?"RW07ResidualNormAffineSnakeFusedV5":"RW07ResidualNormAffineElementChunksV4"},fused_(fused) {}
+  bool FusedSnake() const {return fused_;}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"input_capacity", ProgramUniformVariableDataType::Uint32},
       {"output_capacity", ProgramUniformVariableDataType::Uint32},
@@ -280,9 +374,9 @@ class GeneratorNormSnake final : public Program<GeneratorNormSnake> {
     const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
     const auto& coefficients=s.AddInput("coefficients",ShaderUsage::UseValueTypeAlias);
     const auto& y=s.AddOutput("activated",ShaderUsage::UseValueTypeAlias);
-    ValidOutput(s,e);
+    ValidOutput(s,e,true);
     OriginalArithmetic(s);
-    s.AdditionalImplementation() << m0_trig_detail::Trig;
+    if(fused_)s.AdditionalImplementation()<<m0_trig_detail::Trig;
     auto& f=s.MainFunctionBody();
     f << "let elements=uniforms.tile_channels*uniforms.output_capacity;"
       << "if(uniforms.element_begin>=elements||uniforms.element_count>elements-uniforms.element_begin||"
@@ -297,10 +391,64 @@ class GeneratorNormSnake final : public Program<GeneratorNormSnake> {
       << "let denominator=" << coefficients.GetByOffset("channel*6u+5u") << ";"
       << "let gamma=" << coefficients.GetByOffset("channel*6u") << ";"
       << "let beta=" << coefficients.GetByOffset("channel*6u+1u") << ";"
-      << "let a=" << coefficients.GetByOffset("channel*6u+2u") << ";"
-      << "let reciprocal_a=" << coefficients.GetByOffset("channel*6u+3u") << ";"
       << "let centered=original_sub(" << x.GetByOffset("local_channel*uniforms.input_capacity+t") << ",mean);"
       << "let normalized=original_div(centered,denominator);let affine=original_add(original_mul(gamma,normalized),beta);"
+      ;
+    if(fused_){
+      f << "let a=" << coefficients.GetByOffset("channel*6u+2u") << ";"
+        << "let reciprocal_a=" << coefficients.GetByOffset("channel*6u+3u") << ";"
+        << "let angle=original_mul(a,affine);let bits=bitcast<u32>(angle)&0x7fffffffu;var sine:f32=original_f32_from_bits(0x7fc00000u);"
+        << "if(bits<0x7f800000u){sine=rw07_sin(angle);}let square=original_mul(sine,sine);"
+        << "let result=original_add(affine,original_mul(reciprocal_a,square));" << y.SetByOffset("at","result");
+    }else{f << y.SetByOffset("at","affine");}
+
+    return Status::OK();
+  }
+ private:
+  const bool fused_;
+};
+// Keep only affine/a/reciprocal live around the trig calculation. Each
+// invocation reads and overwrites its own element in the existing tile.
+class GeneratorSnakeInPlace final : public Program<GeneratorSnakeInPlace> {
+ public:
+  GeneratorSnakeInPlace() : Program{"RW07ResidualSnakeInPlaceElementChunksV1"} {}
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+      {"input_capacity", ProgramUniformVariableDataType::Uint32},
+      {"output_capacity", ProgramUniformVariableDataType::Uint32},
+      {"channels", ProgramUniformVariableDataType::Uint32},
+      {"minimum", ProgramUniformVariableDataType::Uint32},
+      {"maximum", ProgramUniformVariableDataType::Uint32},
+      {"modulus", ProgramUniformVariableDataType::Uint32},
+      {"remainder", ProgramUniformVariableDataType::Uint32},
+      {"kernel", ProgramUniformVariableDataType::Uint32},
+      {"dilation", ProgramUniformVariableDataType::Uint32},
+      {"residual_capacity", ProgramUniformVariableDataType::Uint32},
+      {"channel_offset", ProgramUniformVariableDataType::Uint32},
+      {"channel_count", ProgramUniformVariableDataType::Uint32},
+      {"tile_channels", ProgramUniformVariableDataType::Uint32},
+      {"element_begin", ProgramUniformVariableDataType::Uint32},
+      {"element_count", ProgramUniformVariableDataType::Uint32},
+      {"identity", ProgramUniformVariableDataType::Uint32});
+  Status GenerateShaderCode(ShaderHelper& s) const override {
+    const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
+    const auto& coefficients=s.AddInput("coefficients",ShaderUsage::UseValueTypeAlias);
+    const auto& y=s.AddOutput("activated",ShaderUsage::UseValueTypeAlias);
+    ValidOutput(s,e,true);
+    OriginalArithmetic(s);
+    s.AdditionalImplementation() << m0_trig_detail::Trig;
+    auto& f=s.MainFunctionBody();
+    f << "let elements=uniforms.tile_channels*uniforms.output_capacity;"
+      << "if(uniforms.element_begin>=elements||uniforms.element_count>elements-uniforms.element_begin||"
+      << "global_idx>=uniforms.element_count){return;}let at=uniforms.element_begin+global_idx;"
+      << "if(!valid_output()){ " << y.SetByOffset("at","0.0") << "return;}"
+      << "let local_channel=at/uniforms.output_capacity;let t=at%uniforms.output_capacity;"
+      << "let count=" << e.GetByOffset("6u") << ";"
+      << "if(local_channel>=uniforms.channel_count||uniforms.channel_offset>=uniforms.channels||"
+      << "uniforms.channel_count>uniforms.channels-uniforms.channel_offset||"
+      << "count>uniforms.input_capacity||t>=count){" << y.SetByOffset("at","0.0") << "return;}"
+      << "let channel=uniforms.channel_offset+local_channel;let affine=" << y.GetByOffset("at") << ";"
+      << "let a=" << coefficients.GetByOffset("channel*6u+2u") << ";"
+      << "let reciprocal_a=" << coefficients.GetByOffset("channel*6u+3u") << ";"
       << "let angle=original_mul(a,affine);let bits=bitcast<u32>(angle)&0x7fffffffu;var sine:f32=original_f32_from_bits(0x7fc00000u);"
       << "if(bits<0x7f800000u){sine=rw07_sin(angle);}let square=original_mul(sine,sine);"
       << "let result=original_add(affine,original_mul(reciprocal_a,square));"
@@ -311,15 +459,281 @@ class GeneratorNormSnake final : public Program<GeneratorNormSnake> {
 // Bound scalar products encoded by one residual convolution dispatch. This
 // is a scheduling upper bound, not measured GPU instructions, FLOPs or time.
 inline constexpr uint32_t kResidualProductsPerDispatchV1 = 1u << 22;
-inline uint32_t ResidualConvElementsPerDispatchV1(uint32_t input_channels, uint32_t kernel) {
+inline uint32_t ResidualProductsPerDispatchV1(bool batched=M0BatchHeavyProgramsV1()) {
+  return batched ? 8u*kResidualProductsPerDispatchV1 : kResidualProductsPerDispatchV1;
+}
+inline uint32_t ResidualConvElementsPerDispatchV1(uint32_t input_channels, uint32_t kernel,
+                                                bool batched=M0BatchHeavyProgramsV1()) {
   const uint64_t products_per_element = uint64_t(input_channels) * kernel;
-  if (products_per_element == 0 || products_per_element > kResidualProductsPerDispatchV1) return 0;
-  const auto elements = static_cast<uint32_t>(kResidualProductsPerDispatchV1 / products_per_element);
+  const uint32_t budget=ResidualProductsPerDispatchV1(batched);
+  if (products_per_element == 0 || products_per_element > budget) return 0;
+  const auto elements = static_cast<uint32_t>(budget / products_per_element);
   return elements >= 64 ? elements / 64 * 64 : elements;
 }
+inline constexpr uint64_t ResidualChannelTileStorageV1(uint32_t block) {
+  return uint64_t(block)*680+320;  // includes shared descriptor validity and alignment slack
+}
+inline uint32_t ResidualChannelBlockV1(uint64_t workgroup_bytes) {
+  for(uint32_t block:{8u,4u,2u,1u})if(ResidualChannelTileStorageV1(block)<=workgroup_bytes)return block;
+  return 0;
+}
+inline uint32_t ResidualBestBlockV1(const std::array<double,5>& scores,uint32_t maximum) {
+  uint32_t chosen=1;
+  double best=scores[0];
+  for(size_t i=1;i<scores.size();++i){
+    const uint32_t block=1u<<i;
+    if(block<=maximum&&scores[i]>0&&scores[i]<best*0.95){chosen=block;best=scores[i];}
+  }
+  return chosen;
+}
+// Only an initial input-channel pass overwrites its output. Trials must never
+// repeat a pass that reads a preceding partial sum from that output.
+template <typename Run>
+inline Status ResidualAutotunedBlockV1(ComputeContextBase& context,const std::string& key,
+    uint32_t maximum,bool overwrite_pass,Run&& run,uint32_t& chosen) {
+  ORT_RETURN_IF_NOT(maximum==1||maximum==2||maximum==4||maximum==8||maximum==16,"RW07 residual tuning capacity");
+  chosen=context.M0ResidualBlockChoiceV1(key);
+  if(chosen>maximum)chosen=0;
+  if(chosen)return Status::OK();
+  chosen=1;
+  if(!overwrite_pass||maximum==1)return Status::OK();
+  // Compile/warm all candidates outside the measured intervals. Reverse the
+  // second round so one candidate does not always receive the warmest device.
+  for(uint32_t block=1;block<=maximum;block*=2)ORT_RETURN_IF_ERROR(run(block));
+  std::array<double,5> scores{};
+  for(uint32_t round=0;round<2;++round){
+    for(uint32_t i=0;i<5;++i){
+      const uint32_t index=round?4u-i:i,block=1u<<index;
+      if(block>maximum)continue;
+      const auto start=std::chrono::steady_clock::now();
+      ORT_RETURN_IF_ERROR(run(block));
+      scores[index]+=std::chrono::duration<double,std::nano>(std::chrono::steady_clock::now()-start).count();
+    }
+  }
+  chosen=ResidualBestBlockV1(scores,maximum);
+  context.M0RememberResidualBlockV1(key,chosen);
+  LOGS(context.Logger(),INFO)<<"M0_RW07_RESIDUAL_BLOCK_TUNING key="<<key<<" selected="<<chosen
+    <<" max_supported="<<maximum<<" samples_ns="<<scores[0]<<","<<scores[1]<<","<<scores[2]<<","<<scores[3]<<","<<scores[4];
+  return Status::OK();
+}
+inline constexpr uint64_t kResidualMatrixStorageV1=5760;
+inline uint32_t ResidualVariantLimitV1(uint64_t bytes) {
+  return bytes>=kResidualMatrixStorageV1?16u:ResidualChannelBlockV1(bytes);
+}
+inline bool ResidualMatrixSupportedV1(const wgpu::Limits& limits) {
+  return limits.maxComputeWorkgroupStorageSize>=kResidualMatrixStorageV1&&
+    limits.maxComputeWorkgroupSizeX>=8&&limits.maxComputeWorkgroupSizeY>=8&&
+    limits.maxComputeWorkgroupSizeZ>=1&&limits.maxComputeInvocationsPerWorkgroup>=64;
+}
+// Private uniform ABI shared by packing, matrix compute and baseline slices.
+#define M0_RESIDUAL_TILE_UNIFORMS_V1 \
+ {"input_capacity",ProgramUniformVariableDataType::Uint32}, \
+ {"output_capacity",ProgramUniformVariableDataType::Uint32}, \
+ {"channels",ProgramUniformVariableDataType::Uint32}, \
+ {"minimum",ProgramUniformVariableDataType::Uint32}, \
+ {"maximum",ProgramUniformVariableDataType::Uint32}, \
+ {"modulus",ProgramUniformVariableDataType::Uint32}, \
+ {"remainder",ProgramUniformVariableDataType::Uint32}, \
+ {"kernel",ProgramUniformVariableDataType::Uint32}, \
+ {"dilation",ProgramUniformVariableDataType::Uint32}, \
+ {"residual_capacity",ProgramUniformVariableDataType::Uint32}, \
+ {"channel_offset",ProgramUniformVariableDataType::Uint32}, \
+ {"channel_count",ProgramUniformVariableDataType::Uint32}, \
+ {"output_channel_offset",ProgramUniformVariableDataType::Uint32}, \
+ {"output_channel_count",ProgramUniformVariableDataType::Uint32}, \
+ {"element_begin",ProgramUniformVariableDataType::Uint32}, \
+ {"element_count",ProgramUniformVariableDataType::Uint32}, \
+ {"identity",ProgramUniformVariableDataType::Uint32}, \
+ {"time_begin",ProgramUniformVariableDataType::Uint32}, \
+ {"time_count",ProgramUniformVariableDataType::Uint32}
+
+struct ResidualConvSpecV1 {
+  uint32_t input_capacity,output_capacity,channels,minimum,maximum,modulus,remainder,kernel,dilation,residual_capacity;
+  uint32_t channel_offset,channel_count,output_channel_offset,output_channel_count;
+  gsl::span<const uint32_t> identity;
+  template <typename P> void Apply(P& p,uint32_t t,uint32_t n,uint32_t first,uint32_t count)const {
+    p.AddUniformVariables({input_capacity,output_capacity,channels,minimum,maximum,modulus,remainder,kernel,dilation,
+      residual_capacity,channel_offset,channel_count,output_channel_offset,output_channel_count,first,count,identity,t,n});
+  }
+  template <typename P> void ApplyPacked(P& p,uint32_t t,uint32_t n,uint32_t row,uint32_t rows)const {
+    p.AddUniformVariables({input_capacity,output_capacity,channels,minimum,maximum,modulus,remainder,kernel,dilation,
+      residual_capacity,channel_offset,channel_count,output_channel_offset,output_channel_count,0u,0u,identity,t,n,row,rows});
+  }
+};
+inline constexpr uint32_t kResidualPackedTimeV1=2048;
+inline constexpr uint64_t kResidualPackedScratchBytesV1=kM0ResidualPackedScratchBytesV1;
+inline uint32_t ResidualPackedProductsPerDispatchV1(bool batched=M0BatchHeavyProgramsV1()) {
+  return batched?(1u<<28):ResidualProductsPerDispatchV1(false);
+}
+inline uint64_t ResidualPackedElementsV1(uint32_t channels,uint32_t kernel) {
+  if(channels==0||channels>256||kernel==0||kernel>11)return 0;
+  return std::min(uint64_t(channels)*kernel*kResidualPackedTimeV1,kResidualPackedScratchBytesV1/4);
+}
+// Eight inner rows by32 time positions per flag. Padding at most seven
+// inner rows adds at most56 words across the bounded2048-position window.
+inline uint64_t ResidualPackedFlagCapacityV1(uint64_t column_elements){
+  if(!column_elements||column_elements>kResidualPackedScratchBytesV1/sizeof(float))return 0;
+  return (column_elements+255)/256+kResidualPackedTimeV1/32;
+}
+inline uint64_t ResidualPackedFlagCountV1(uint32_t channels,uint32_t kernel,uint32_t time_count){
+  if(!channels||channels>256||!kernel||kernel>11||!time_count||time_count>kResidualPackedTimeV1||time_count%32)return 0;
+  return ((uint64_t(channels)*kernel+7)/8)*(time_count/32);
+}
+inline constexpr uint64_t kResidualPackedStorageV1=8512;
+inline uint32_t ResidualPackedTimeV1(uint32_t channels,uint32_t kernel,uint32_t budget=ResidualPackedProductsPerDispatchV1()) {
+  const uint64_t inner=uint64_t(channels)*kernel;
+  if(!inner||channels>256||kernel>11)return 0;
+  const uint64_t rounded=(inner+31)/32*32;
+  const auto count=std::min({uint64_t(kResidualPackedTimeV1),uint64_t(budget)/(rounded*32),kResidualPackedScratchBytesV1/(inner*4)});
+  return static_cast<uint32_t>(count/32*32);
+}
+inline bool ResidualPackedSupportedV1(const wgpu::Limits& limits) {
+  return limits.maxComputeWorkgroupStorageSize>=kResidualPackedStorageV1&&limits.maxComputeWorkgroupSizeX>=8&&
+    limits.maxComputeWorkgroupSizeY>=8&&limits.maxComputeInvocationsPerWorkgroup>=64&&
+    limits.maxStorageBuffersPerShaderStage>=7&&limits.maxBindingsPerBindGroup>=8;
+}
+class ResidualPackColumnsV1 final : public Program<ResidualPackColumnsV1> {
+ public:
+  ResidualPackColumnsV1():Program{"RW07ResidualPackColumnsV1"}{}
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(M0_RESIDUAL_TILE_UNIFORMS_V1,
+    {"row_begin",ProgramUniformVariableDataType::Uint32},{"row_count",ProgramUniformVariableDataType::Uint32});
+  Status GenerateShaderCode(ShaderHelper& s)const override {
+    const auto& x=s.AddInput("source",ShaderUsage::UseValueTypeAlias);
+    const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
+    const auto& col=s.AddOutput("columns",ShaderUsage::UseValueTypeAlias);
+    const auto& flag=s.AddOutput("flags",ShaderUsage::UseValueTypeAlias);
+    ValidOutput(s,e,true);s.AdditionalImplementation()<<"var<workgroup> pack_flags:array<u32,64>;";
+    auto& f=s.MainFunctionBody();
+    f<<"if(uniforms.time_count<32u||uniforms.time_count>2048u||uniforms.time_count%32u!=0u||"
+      <<"uniforms.channel_count==0u||uniforms.channel_count>256u||uniforms.kernel==0u||uniforms.kernel>11u){return;}"
+      <<"let inner_count=uniforms.channel_count*uniforms.kernel;let time_tiles=uniforms.time_count/32u;"
+      <<"let group_count=((inner_count+7u)/8u)*time_tiles;"
+      <<"if(workgroup_idx>=group_count){return;}var value=vec4<f32>(0.0);"
+      <<"let row=(workgroup_idx/time_tiles)*8u+local_idx/8u;"
+      <<"let local_t=(workgroup_idx%time_tiles)*32u+(local_idx%8u)*4u;"
+      <<"let valid=valid_output()&&uniforms.dilation>=1u&&uniforms.dilation<=5u;"
+      <<"if(row<inner_count){if(valid){let ic=row/uniforms.kernel;let k=row%uniforms.kernel;"
+      <<"let n="<<e.GetByOffset("6u")<<";let pad=i32((uniforms.kernel-1u)*uniforms.dilation/2u);"
+      <<"for(var lane=0u;lane<4u;lane++){let t=uniforms.time_begin+local_t+lane;let pos=i32(t+k*uniforms.dilation)-pad;"
+      <<"if(t<n&&pos>=0&&pos<i32(n)&&pos<i32(uniforms.input_capacity)){value[lane]="
+      <<x.GetByOffset("ic*uniforms.input_capacity+u32(pos)")<<";}}}"
+      <<col.SetByOffset("row*(uniforms.time_count/4u)+local_t/4u","value")<<"}"
+      <<"pack_flags[local_idx]=select(0u,1u,any((bitcast<vec4<u32>>(value)&vec4u(0x7fffffffu))>vec4u(0x58800000u)));"
+      <<"workgroupBarrier();if(local_idx==0u){var bad=0u;for(var i=0u;i<64u;i++){bad|=pack_flags[i];}"
+      <<flag.SetByOffset("workgroup_idx","bad")<<"}";
+    return Status::OK();
+  }
+};
+class ResidualPackedMatrixV1 final : public Program<ResidualPackedMatrixV1> {
+ public:
+  ResidualPackedMatrixV1():Program{"RW07ResidualPackedMatrixV1"}{}
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(M0_RESIDUAL_TILE_UNIFORMS_V1,
+    {"row_begin",ProgramUniformVariableDataType::Uint32},{"row_count",ProgramUniformVariableDataType::Uint32});
+  Status GenerateShaderCode(ShaderHelper& s)const override {
+    const auto& x=s.AddInput("source",ShaderUsage::UseValueTypeAlias);
+    const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
+    const auto& w=s.AddInput("weight",ShaderUsage::UseValueTypeAlias);
+    const auto& b=s.AddInput("bias",ShaderUsage::UseValueTypeAlias);
+    const auto& col=s.AddInput("columns",ShaderUsage::UseValueTypeAlias);
+    const auto& flags=s.AddInput("flags",ShaderUsage::UseValueTypeAlias);
+    const auto& y=s.AddOutput("output",ShaderUsage::UseValueTypeAlias);
+    ValidOutput(s,e);OriginalArithmetic(s);auto& a=s.AdditionalImplementation();
+    a<<"var<workgroup> matrix_flags:array<u32,64>;var<workgroup> matrix_enabled:u32;var<workgroup> matrix_safe:u32;"
+      <<"fn scalar_weight(at:u32)->f32{return "<<w.GetByOffset("at/4u")<<"[at%4u];}"
+      <<"fn mm_readA(batch:i32,row:i32,c:i32)->vec4<f32>{var result=vec4<f32>(0.0);"
+      <<"if(row<0||u32(row)>=uniforms.row_count){return result;}"
+      <<"let inner=u32(c)*4u;let count=uniforms.channel_count*uniforms.kernel;if(inner>=count){return result;}"
+      <<"let base=((uniforms.output_channel_offset+uniforms.row_begin+u32(row))*uniforms.channels+uniforms.channel_offset)*uniforms.kernel+inner;"
+      <<"let shift=base%4u;let first="<<w.GetByOffset("base/4u")<<";"
+      <<"if(shift==0u){result=first;}else{var second=vec4<f32>(0.0);"
+      <<"if(base/4u+1u<uniforms.channels*uniforms.channels*uniforms.kernel/4u){second="<<w.GetByOffset("base/4u+1u")<<";}"
+      <<"for(var lane=0u;lane<4u;lane++){let index=shift+lane;if(index<4u){result[lane]=first[index];}else{result[lane]=second[index-4u];}}}"
+      <<"if(inner+4u>count){for(var lane=0u;lane<4u;lane++){if(inner+lane>=count){result[lane]=0.0;}}}return result;}"
+      <<"fn mm_readB(batch:i32,row:i32,c:i32)->vec4<f32>{if(row<0||u32(row)>=uniforms.channel_count*uniforms.kernel){return vec4<f32>(0.0);}return "
+      <<col.GetByOffset("u32(row)*(uniforms.time_count/4u)+u32(c)")<<";}"
+      <<"fn serial_sample(row:u32,t:u32)->f32 {let n="<<e.GetByOffset("6u")<<";if(t>=n){return 0.0;}"
+      <<"var total=0.0;if(uniforms.channel_offset!=0u){total="<<y.GetByOffset("row*uniforms.output_capacity+t")<<";}"
+      <<"let pad=i32((uniforms.kernel-1u)*uniforms.dilation/2u);"
+      <<"for(var ic=0u;ic<uniforms.channel_count;ic++){for(var k=0u;k<uniforms.kernel;k++){let pos=i32(t+k*uniforms.dilation)-pad;"
+      <<"var value=0.0;if(pos>=0&&pos<i32(n)){value="<<x.GetByOffset("ic*uniforms.input_capacity+u32(pos)")<<";}"
+      <<"let weight=scalar_weight(((uniforms.output_channel_offset+row)*uniforms.channels+uniforms.channel_offset+ic)*uniforms.kernel+k);"
+      <<"total=original_add(total,original_mul(value,weight));}}"
+      <<"if(uniforms.channel_offset+uniforms.channel_count==uniforms.channels){total=original_add(total,"<<b.GetByOffset("uniforms.output_channel_offset+row")<<");}return total;}"
+      <<"fn mm_write(batch:i32,row:i32,c:i32,value:vec4<f32>){if(row<0||u32(row)>=uniforms.row_count){return;}"
+      <<"let r=uniforms.row_begin+u32(row);let n="<<e.GetByOffset("6u")<<";"
+      <<"for(var lane=0u;lane<4u;lane++){let t=uniforms.time_begin+u32(c)*4u+lane;if(t<uniforms.output_capacity){var result=0.0;"
+      <<"if(t<n){result=value[lane];if(uniforms.channel_offset+uniforms.channel_count==uniforms.channels){result=original_add(result,"
+      <<b.GetByOffset("uniforms.output_channel_offset+r")<<");}}"<<y.SetByOffset("r*uniforms.output_capacity+t","result")<<"}}}";
+    auto& f=s.MainFunctionBody();
+    f<<"let tile_columns=uniforms.time_count/32u;if(tile_columns==0u||workgroup_idx>=tile_columns*((uniforms.row_count+31u)/32u)){return;}"
+      <<"let tile_t=uniforms.time_begin+(workgroup_idx%tile_columns)*32u;let tile_row=uniforms.row_begin+(workgroup_idx/tile_columns)*32u;"
+      <<"if(local_idx==0u){matrix_enabled=0u;let n="<<e.GetByOffset("6u")<<";"
+      <<"if(valid_output()&&n<=uniforms.input_capacity&&uniforms.time_count<=2048u&&uniforms.time_count%32u==0u&&"
+      <<"uniforms.row_begin<uniforms.output_channel_count&&uniforms.row_count>0u&&uniforms.row_count<=uniforms.output_channel_count-uniforms.row_begin&&"
+      <<"uniforms.channel_count>0u&&uniforms.channel_count<=256u&&uniforms.channel_offset<uniforms.channels&&"
+      <<"uniforms.channel_count<=uniforms.channels-uniforms.channel_offset&&uniforms.output_channel_offset<uniforms.channels&&"
+      <<"uniforms.output_channel_count<=uniforms.channels-uniforms.output_channel_offset&&"
+      <<"uniforms.kernel>=1u&&uniforms.kernel<=11u&&uniforms.dilation>=1u&&uniforms.dilation<=5u&&tile_t<n){matrix_enabled=1u;}}"
+      <<"let enabled=workgroupUniformLoad(&matrix_enabled);"
+      <<"if(enabled==0u){for(var index=local_idx;index<1024u;index+=64u){let r=tile_row+index/32u;let t=tile_t+index%32u;"
+      <<"if(r<uniforms.row_begin+uniforms.row_count&&t<uniforms.output_capacity){"<<y.SetByOffset("r*uniforms.output_capacity+t","0.0")<<"}}return;}"
+      <<"let n="<<e.GetByOffset("6u")<<";var bad=0u;"
+      <<"let flag_rows=(uniforms.channel_count*uniforms.kernel+7u)/8u;"
+      <<"let flag_time=(tile_t-uniforms.time_begin)/32u;"
+      <<"for(var i=local_idx;i<flag_rows;i+=64u){bad|="<<flags.GetByOffset("i*tile_columns+flag_time")<<";}"
+      <<"let inner_vectors=(uniforms.channel_count*uniforms.kernel+3u)/4u;"
+      <<"for(var index=local_idx;index<32u*inner_vectors;index+=64u){let r=tile_row+index/inner_vectors;"
+      <<"if(r<uniforms.row_begin+uniforms.row_count){let values=mm_readA(0,i32(r-uniforms.row_begin),i32(index%inner_vectors));"
+      <<"if(any((bitcast<vec4<u32>>(values)&vec4u(0x7fffffffu))>vec4u(0x58800000u))){bad=1u;}}}"
+      <<"if(uniforms.channel_offset!=0u){for(var index=local_idx;index<1024u;index+=64u){let r=tile_row+index/32u;let t=tile_t+index%32u;"
+      <<"if(r<uniforms.row_begin+uniforms.row_count&&t<n){let value="<<y.GetByOffset("r*uniforms.output_capacity+t")<<";"
+      <<"if((bitcast<u32>(value)&0x7fffffffu)>0x71800000u){bad=1u;}}}}"
+      <<"matrix_flags[local_idx]=bad;workgroupBarrier();if(local_idx==0u){var combined=0u;for(var i=0u;i<64u;i++){combined|=matrix_flags[i];}matrix_safe=1u-min(combined,1u);}"
+      <<"let safe=workgroupUniformLoad(&matrix_safe);if(safe==0u){for(var index=local_idx;index<1024u;index+=64u){let r=tile_row+index/32u;let t=tile_t+index%32u;"
+      <<"if(r<uniforms.row_begin+uniforms.row_count&&t<uniforms.output_capacity){"<<y.SetByOffset("r*uniforms.output_capacity+t","serial_sample(r,t)")<<"}}return;}";
+    std::string prelude=std::move(f).str();f=OStringStream(kStringInitialSizeShaderSourceCodeMain);
+    ORT_RETURN_IF_ERROR(MakeMatMulPackedVec4Source(s,InlinedVector<int64_t>{4,4,1},8,8,"f32",nullptr));
+    std::string body=std::move(f).str();f=OStringStream(kStringInitialSizeShaderSourceCodeMain);
+    const auto start=body.find("  let localRow =");ORT_RETURN_IF_NOT(start!=std::string::npos,"RW07 packed matrix source layout");body=body.substr(start);
+    const std::string decl="  var acc: array<vec4<f32>, rowPerThread>;";const auto at=body.find(decl);
+    ORT_RETURN_IF_NOT(at!=std::string::npos,"RW07 packed accumulator layout");OStringStream seed(512);
+    seed<<"if(uniforms.channel_offset!=0u){for(var r=0u;r<u32(rowPerThread);r++){let row=uniforms.row_begin+u32(globalRow)+r;"
+      <<"for(var lane=0u;lane<4u;lane++){let t=uniforms.time_begin+u32(globalCol)*4u+lane;if(row<uniforms.row_begin+uniforms.row_count&&t<n){acc[r][lane]="
+      <<y.GetByOffset("row*uniforms.output_capacity+t")<<";}}}}";body.insert(at+decl.size(),std::move(seed).str());
+    const std::string needle="uniforms.dim_inner",replace="(uniforms.channel_count*uniforms.kernel)";
+    for(size_t i=0;(i=body.find(needle,i))!=std::string::npos;i+=replace.size())body.replace(i,needle.size(),replace);
+    f<<prelude<<"let logical_workgroup_id=vec3u(workgroup_idx%tile_columns,workgroup_idx/tile_columns,0u);"
+      <<"let logical_global_id=logical_workgroup_id*vec3u(8u,8u,1u)+local_id;"<<body;
+    return Status::OK();
+  }
+};
+
 class GeneratorResidualConv final : public Program<GeneratorResidualConv> {
  public:
-  GeneratorResidualConv() : Program{"RW07ResidualConvChannelElementChunksV4"} {}
+  explicit GeneratorResidualConv(bool vectorized=M0VectorizedConvV1(),bool tiled=M0TiledConvV1(),
+                                 bool channel_tiled=M0OutputChannelTiledConvV1(),uint32_t channel_block=1,
+                                 bool matrix=false,bool wide_grid=false)
+      : Program{matrix?"RW07ResidualImplicitMatMulV10":channel_tiled?(channel_block>1?"RW07ResidualConvOutputChannelBlockV8":"RW07ResidualConvOutputChannelTileV7"):tiled?"RW07ResidualConvSharedInputTileV6":vectorized?"RW07ResidualConvFourTimeSamplesV5":"RW07ResidualConvChannelElementChunksV4"},
+        vectorized_(vectorized||tiled||channel_tiled),tiled_(tiled||channel_tiled),channel_tiled_(channel_tiled),channel_block_(channel_block),matrix_(matrix),wide_grid_(matrix||wide_grid) {
+    ORT_ENFORCE(!matrix||channel_tiled,"RW07 residual matrix requires channel tiling");
+    ORT_ENFORCE(!channel_tiled||(channel_block==1||channel_block==2||channel_block==4||channel_block==8),
+                "RW07 residual channel block");
+    if(channel_tiled)CacheHint(std::to_string(channel_block));
+  }
+  uint64_t WorkItems(uint32_t output_channels,uint32_t capacity) const {
+    if(!channel_tiled_)return uint64_t(output_channels)*capacity;
+    const uint64_t width=8,unit=width*32;
+    const uint64_t columns=(uint64_t(output_channels)+width-1)/width,rows=(uint64_t(capacity)+31)/32;
+    if(columns&&rows>UINT64_MAX/unit/columns)return 0;
+    return columns*rows*unit;
+  }
+  uint32_t ChunkElements(uint32_t inputs,uint32_t kernel) const {
+    const uint64_t inner=uint64_t(inputs)*kernel;
+    const uint32_t count=wide_grid_&&inner?static_cast<uint32_t>(ResidualProductsPerDispatchV1()/((inner+31)/32*32)):
+      ResidualConvElementsPerDispatchV1(inputs,kernel);
+    return channel_tiled_?count/256*256:count;
+  }
+  uint32_t ValuesPerInvocation() const { return vectorized_?4u:1u; }
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"input_capacity", ProgramUniformVariableDataType::Uint32},
       {"output_capacity", ProgramUniformVariableDataType::Uint32},
@@ -337,15 +751,249 @@ class GeneratorResidualConv final : public Program<GeneratorResidualConv> {
       {"output_channel_count", ProgramUniformVariableDataType::Uint32},
       {"element_begin", ProgramUniformVariableDataType::Uint32},
       {"element_count", ProgramUniformVariableDataType::Uint32},
-      {"identity", ProgramUniformVariableDataType::Uint32});
+      {"identity", ProgramUniformVariableDataType::Uint32},
+      {"time_begin",ProgramUniformVariableDataType::Uint32},
+      {"time_count",ProgramUniformVariableDataType::Uint32});
+  Status MatrixShader(ShaderHelper& s,const ShaderVariableHelper& x,const ShaderVariableHelper& e,
+      const ShaderVariableHelper& w,const ShaderVariableHelper& b,const ShaderVariableHelper& y)const {
+    auto& functions=s.AdditionalImplementation();
+    functions<<"var<workgroup> matrix_flags:array<u32,64>;var<workgroup> matrix_active:u32;var<workgroup> matrix_safe:u32;"
+      <<"fn mm_readA(batch:i32,row:i32,col:i32)->vec4<f32>{var result=vec4<f32>(0.0);"
+      <<"if(row<0||u32(row)>=uniforms.output_channel_count){return result;}"
+      <<"for(var lane=0u;lane<4u;lane++){let inner=u32(col)*4u+lane;"
+      <<"if(inner<uniforms.channel_count*uniforms.kernel){let ic=uniforms.channel_offset+inner/uniforms.kernel;"
+      <<"result[lane]="<<w.GetByOffset("((uniforms.output_channel_offset+u32(row))*uniforms.channels+ic)*uniforms.kernel+inner%uniforms.kernel")<<";}}return result;}"
+      <<"fn mm_readB(batch:i32,row:i32,col:i32)->vec4<f32>{var result=vec4<f32>(0.0);"
+      <<"if(row<0||u32(row)>=uniforms.channel_count*uniforms.kernel){return result;}"
+      <<"let count="<<e.GetByOffset("6u")<<";let k=u32(row)%uniforms.kernel;let ic=u32(row)/uniforms.kernel;"
+      <<"let pad=i32((uniforms.kernel-1u)*uniforms.dilation/2u);"
+      <<"for(var lane=0u;lane<4u;lane++){let t=u32(col)*4u+lane;let pos=i32(t+k*uniforms.dilation)-pad;"
+      <<"if(t<count&&pos>=0&&pos<i32(count)){result[lane]="<<x.GetByOffset("ic*uniforms.input_capacity+u32(pos)")<<";}}return result;}"
+      <<"fn mm_write(batch:i32,row:i32,col:i32,value:vec4<f32>){if(row<0||u32(row)>=uniforms.output_channel_count){return;}"
+      <<"let count="<<e.GetByOffset("6u")<<";let oc=uniforms.output_channel_offset+u32(row);"
+      <<"for(var lane=0u;lane<4u;lane++){let t=u32(col)*4u+lane;if(t<uniforms.output_capacity){var result=0.0;"
+      <<"if(t<count){result=value[lane];"
+      <<"if(uniforms.channel_offset+uniforms.channel_count==uniforms.channels){result=original_add(result,"<<b.GetByOffset("oc")<<");}}"
+      <<y.SetByOffset("u32(row)*uniforms.output_capacity+t","result")<<"}}}";
+    auto& f=s.MainFunctionBody();
+    f<<"if(workgroup_idx>=uniforms.element_count/256u){return;}"
+      <<"let row_tiles=(max(select(uniforms.output_capacity,uniforms.time_count,uniforms.time_count!=0u),1u)+31u)/32u;let tile=uniforms.element_begin/256u+workgroup_idx;"
+      <<"let tile_t=(tile%row_tiles)*32u;let tile_oc=(tile/row_tiles)*8u;"
+      <<"if(local_idx==0u){matrix_active=0u;let n="<<e.GetByOffset("6u")<<";"
+      <<"if(valid_output()&&uniforms.element_begin%256u==0u&&uniforms.element_count%256u==0u&&"
+      <<"uniforms.kernel>=1u&&uniforms.kernel<=11u&&uniforms.dilation>=1u&&uniforms.dilation<=5u&&"
+      <<"uniforms.channel_offset<uniforms.channels&&uniforms.channel_count>0u&&uniforms.channel_count<=256u&&"
+      <<"uniforms.channel_count<=uniforms.channels-uniforms.channel_offset&&"
+      <<"uniforms.output_channel_offset<uniforms.channels&&uniforms.output_channel_count>0u&&"
+      <<"uniforms.output_channel_count<=uniforms.channels-uniforms.output_channel_offset&&"
+      <<"n<=uniforms.input_capacity&&tile_t<n&&tile_oc<uniforms.output_channel_count){matrix_active=1u;}}"
+      <<"let matrix_enabled=workgroupUniformLoad(&matrix_active);"
+      <<"if(matrix_enabled==0u){for(var index=local_idx;index<256u;index+=64u){let row=tile_oc+index/32u;let t=tile_t+index%32u;"
+      <<"if(row<uniforms.output_channel_count&&t<uniforms.output_capacity){"<<y.SetByOffset("row*uniforms.output_capacity+t","0.0")<<"}}return;}"
+      <<"let count="<<e.GetByOffset("6u")<<";let span=32u+(uniforms.kernel-1u)*uniforms.dilation;"
+      <<"let pad=i32((uniforms.kernel-1u)*uniforms.dilation/2u);var bad=0u;"
+      <<"for(var index=local_idx;index<uniforms.channel_count*span;index+=64u){let pos=i32(tile_t+index%span)-pad;"
+      <<"if(pos>=0&&pos<i32(count)){let value="<<x.GetByOffset("(index/span)*uniforms.input_capacity+u32(pos)")<<";"
+      <<"if((bitcast<u32>(value)&0x7fffffffu)>0x58800000u){bad=1u;}}}"
+      <<"for(var index=local_idx;index<8u*uniforms.channel_count*uniforms.kernel;index+=64u){"
+      <<"let inner=index%(uniforms.channel_count*uniforms.kernel);let row=tile_oc+index/(uniforms.channel_count*uniforms.kernel);"
+      <<"if(row<uniforms.output_channel_count){let value="<<w.GetByOffset("((uniforms.output_channel_offset+row)*uniforms.channels+uniforms.channel_offset+inner/uniforms.kernel)*uniforms.kernel+inner%uniforms.kernel")<<";"
+      <<"if((bitcast<u32>(value)&0x7fffffffu)>0x58800000u){bad=1u;}}}"
+      <<"if(uniforms.channel_offset!=0u){for(var index=local_idx;index<256u;index+=64u){let row=tile_oc+index/32u;let t=tile_t+index%32u;"
+      <<"if(row<uniforms.output_channel_count&&t<count){let value="<<y.GetByOffset("row*uniforms.output_capacity+t")<<";"
+      <<"if((bitcast<u32>(value)&0x7fffffffu)>0x71800000u){bad=1u;}}}}"
+      <<"matrix_flags[local_idx]=bad;workgroupBarrier();if(local_idx==0u){var combined=0u;for(var i=0u;i<64u;i++){combined|=matrix_flags[i];}matrix_safe=1u-min(combined,1u);}"
+      <<"let safe=workgroupUniformLoad(&matrix_safe);if(safe==0u){for(var index=local_idx;index<256u;index+=64u){let row=tile_oc+index/32u;let t=tile_t+index%32u;"
+      <<"if(row<uniforms.output_channel_count&&t<uniforms.output_capacity){"<<y.SetByOffset("row*uniforms.output_capacity+t","residual_sample(row*uniforms.output_capacity+t)")<<"}}return;}";
+    // Share ORT's packed tile arithmetic with convolution-specific read/write
+    // functions. No im2col allocation or additional storage binding is needed.
+    std::string prelude=std::move(f).str();f=OStringStream(kStringInitialSizeShaderSourceCodeMain);
+    ORT_RETURN_IF_ERROR(MakeMatMulPackedVec4Source(s,InlinedVector<int64_t>{4,1,1},8,8,"f32",nullptr));
+    std::string body=std::move(f).str();f=OStringStream(kStringInitialSizeShaderSourceCodeMain);
+    const auto start=body.find("  let localRow =");
+    ORT_RETURN_IF_NOT(start!=std::string::npos,"RW07 residual packed source layout");
+    body=body.substr(start);
+    const std::string declaration="  var acc: array<vec4<f32>, rowPerThread>;";
+    const auto accumulator=body.find(declaration);
+    ORT_RETURN_IF_NOT(accumulator!=std::string::npos,"RW07 residual packed accumulator layout");
+    OStringStream seed(512);
+    seed<<"if(uniforms.channel_offset!=0u){for(var r=0u;r<u32(rowPerThread);r++){let row=u32(globalRow)+r;"
+      <<"for(var lane=0u;lane<4u;lane++){let t=u32(globalCol)*4u+lane;"
+      <<"if(row<uniforms.output_channel_count&&t<count){acc[r][lane]="
+      <<y.GetByOffset("row*uniforms.output_capacity+t")<<";}}}}";
+    body.insert(accumulator+declaration.size(),std::move(seed).str());
+    const std::string needle="uniforms.dim_inner",replacement="(uniforms.channel_count*uniforms.kernel)";
+    for(size_t at=0;(at=body.find(needle,at))!=std::string::npos;at+=replacement.size())body.replace(at,needle.size(),replacement);
+    f<<prelude<<"let logical_workgroup_id=vec3u(tile%row_tiles,tile/row_tiles,0u);"
+      <<"let logical_global_id=logical_workgroup_id*vec3u(8u,8u,1u)+local_id;"<<body;
+    return Status::OK();
+  }
   Status GenerateShaderCode(ShaderHelper& s) const override {
     const auto& x=s.AddInput("carrier",ShaderUsage::UseValueTypeAlias);
     const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
     const auto& w=s.AddInput("weight",ShaderUsage::UseValueTypeAlias);
     const auto& b=s.AddInput("bias",ShaderUsage::UseValueTypeAlias);
     const auto& y=s.AddOutput("output",ShaderUsage::UseValueTypeAlias);
-    ValidOutput(s,e);
+    ValidOutput(s,e,!matrix_);
     OriginalArithmetic(s);
+    if(vectorized_){
+      auto& functions=s.AdditionalImplementation();
+      functions << R"WGSL(
+fn original_mul4(a:vec4<f32>,b:f32)->vec4<f32>{
+ let aa=bitcast<vec4<u32>>(a)&vec4<u32>(0x7fffffffu);let bb=bitcast<u32>(b)&0x7fffffffu;
+ if(all(aa<vec4<u32>(0x7f800000u))&&bb<0x7f800000u){return a*vec4<f32>(b);}
+ return vec4<f32>(original_mul(a.x,b),original_mul(a.y,b),original_mul(a.z,b),original_mul(a.w,b));
+}
+fn original_add4(a:vec4<f32>,b:vec4<f32>)->vec4<f32>{
+ let aa=bitcast<vec4<u32>>(a)&vec4<u32>(0x7fffffffu);let bb=bitcast<vec4<u32>>(b)&vec4<u32>(0x7fffffffu);
+ if(all(aa<vec4<u32>(0x7f800000u))&&all(bb<vec4<u32>(0x7f800000u))){return a+b;}
+ return vec4<f32>(original_add(a.x,b.x),original_add(a.y,b.y),original_add(a.z,b.z),original_add(a.w,b.w));
+}
+)WGSL";
+      functions << "fn residual_sample(at:u32)->f32 {"
+        << "if(!valid_output()){return 0.0;}let count=" << e.GetByOffset("6u") << ";"
+        << "let t=at%uniforms.output_capacity;let local_oc=at/uniforms.output_capacity;"
+        << "if(uniforms.output_channel_offset>=uniforms.channels||uniforms.output_channel_count==0u||"
+        << "uniforms.output_channel_count>uniforms.channels-uniforms.output_channel_offset||t>=count||"
+        << "uniforms.channel_offset>=uniforms.channels||uniforms.channel_count==0u||"
+        << "uniforms.channel_count>uniforms.channels-uniforms.channel_offset){return 0.0;}"
+        << "let oc=uniforms.output_channel_offset+local_oc;var total:f32=0.0;"
+        << "if(uniforms.channel_offset!=0u){total=" << y.GetByOffset("at") << ";}"
+        << "let pad=i32((uniforms.kernel-1u)*uniforms.dilation/2u);"
+        << "for(var local_ic=0u;local_ic<uniforms.channel_count;local_ic++){let ic=uniforms.channel_offset+local_ic;"
+        << "for(var k=0u;k<uniforms.kernel;k++){let pos=i32(t)+i32(k*uniforms.dilation)-pad;var value:f32=0.0;"
+        << "if(pos>=0&&pos<i32(count)){value=" << x.GetByOffset("local_ic*uniforms.input_capacity+u32(pos)") << ";}"
+        << "total=original_add(total,original_mul(value," << w.GetByOffset("(oc*uniforms.channels+ic)*uniforms.kernel+k") << "));}}"
+        << "if(uniforms.channel_offset+uniforms.channel_count==uniforms.channels){total=original_add(total," << b.GetByOffset("oc") << ");}"
+        << "return total;}";
+      if(matrix_)return MatrixShader(s,x,e,w,b,y);
+      if(channel_tiled_){
+        functions << "var<workgroup> channel_values:array<f32," << 82*channel_block_ << ">;var<workgroup> channel_weights:array<f32,"
+          << 88*channel_block_ << ">;var<workgroup> channel_active:u32;var<workgroup> channel_finite:array<u32,64>;var<workgroup> channel_safe:u32;";
+        auto& f=s.MainFunctionBody();
+        f << "let row_tiles=(max(select(uniforms.output_capacity,uniforms.time_count,uniforms.time_count!=0u),1u)+31u)/32u;"
+          << "let tile_group=uniforms.element_begin/256u+workgroup_idx;let tile_t=uniforms.time_begin+(tile_group%row_tiles)*32u;"
+          << "let tile_oc=(tile_group/row_tiles)*8u;let local_oc=tile_oc+local_idx/8u;let t=tile_t+(local_idx%8u)*4u;"
+          << "let physical=local_oc<uniforms.output_channel_count&&t<uniforms.output_capacity;"
+          << "if(workgroup_idx*256u>=uniforms.element_count){return;}"
+          << "if(local_idx==0u){channel_active=0u;let n=" << e.GetByOffset("6u") << ";"
+          << "if(valid_output()&&uniforms.element_begin%256u==0u&&uniforms.element_count%256u==0u&&"
+          << "uniforms.kernel>=1u&&uniforms.kernel<=11u&&uniforms.dilation>=1u&&uniforms.dilation<=5u&&"
+          << "uniforms.output_channel_offset<uniforms.channels&&uniforms.output_channel_count>0u&&"
+          << "uniforms.output_channel_count<=uniforms.channels-uniforms.output_channel_offset&&"
+          << "uniforms.channel_offset<uniforms.channels&&uniforms.channel_count>0u&&"
+          << "uniforms.channel_count<=uniforms.channels-uniforms.channel_offset&&uniforms.channel_count<=256u&&n<=uniforms.input_capacity&&tile_t<n&&tile_oc<uniforms.output_channel_count){channel_active=1u;}}"
+          << "let active_flag=workgroupUniformLoad(&channel_active);"
+          << "if(active_flag==0u){if(physical){for(var lane=0u;lane<4u;lane++){if(t+lane<uniforms.output_capacity){"
+          << y.SetByOffset("local_oc*uniforms.output_capacity+t+lane","0.0") << "}}}return;}"
+          << "let count=" << e.GetByOffset("6u") << ";let oc=uniforms.output_channel_offset+local_oc;"
+          << "var total=vec4<f32>(0.0);if(physical&&uniforms.channel_offset!=0u){"
+          << "for(var lane=0u;lane<4u;lane++){if(t+lane<uniforms.output_capacity){total[lane]="
+          << y.GetByOffset("local_oc*uniforms.output_capacity+t+lane") << ";}}}"
+          << "let span=32u+(uniforms.kernel-1u)*uniforms.dilation;let pad=i32((uniforms.kernel-1u)*uniforms.dilation/2u);"
+          // Prove each group's magnitudes safe once. The admitted <=256*11
+          // products of <=2^50 operands plus <=2^100 initial sums stay <2^112.
+          // Exceptional or extreme groups retain the original scalar classes.
+          << "var flag_bad=0u;if(physical&&any((bitcast<vec4<u32>>(total)&vec4<u32>(0x7fffffffu))>vec4<u32>(0x71800000u))){flag_bad=1u;}"
+          << "for(var index=local_idx;index<uniforms.channel_count*span;index+=64u){let local_ic=index/span;let pos=i32(tile_t+index%span)-pad;"
+          << "if(pos>=0&&pos<i32(count)){let value=" << x.GetByOffset("local_ic*uniforms.input_capacity+u32(pos)") << ";"
+          << "if((bitcast<u32>(value)&0x7fffffffu)>0x58800000u){flag_bad=1u;}}}"
+          << "for(var index=local_idx;index<uniforms.channel_count*8u*uniforms.kernel;index+=64u){let local_ic=index/(8u*uniforms.kernel);"
+          << "let row=tile_oc+(index/uniforms.kernel)%8u;let k=index%uniforms.kernel;if(row<uniforms.output_channel_count){let value="
+          << w.GetByOffset("((uniforms.output_channel_offset+row)*uniforms.channels+uniforms.channel_offset+local_ic)*uniforms.kernel+k") << ";"
+          << "if((bitcast<u32>(value)&0x7fffffffu)>0x58800000u){flag_bad=1u;}}}"
+          << "channel_finite[local_idx]=flag_bad;workgroupBarrier();if(local_idx==0u){var combined=0u;for(var lane=0u;lane<64u;lane++){combined=combined|channel_finite[lane];}channel_safe=1u-min(combined,1u);}"
+          << "let finite_safe=workgroupUniformLoad(&channel_safe)==1u;"
+          ;
+        const auto dot_loop=[&](bool fast){
+          f
+          << "for(var input_base=0u;input_base<uniforms.channel_count;input_base+=" << channel_block_ << "u){"
+          << "let block_count=min(" << channel_block_ << "u,uniforms.channel_count-input_base);"
+          << "for(var index=local_idx;index<block_count*span;index+=64u){let input_lane=index/span;let within=index%span;"
+          << "let pos=i32(tile_t+within)-pad;var value=0.0;if(pos>=0&&pos<i32(count)){value="
+          << x.GetByOffset("(input_base+input_lane)*uniforms.input_capacity+u32(pos)") << ";}channel_values[input_lane*82u+within]=value;}"
+          << "for(var index=local_idx;index<block_count*8u*uniforms.kernel;index+=64u){let input_lane=index/(8u*uniforms.kernel);"
+          << "let within=index%(8u*uniforms.kernel);let row=tile_oc+within/uniforms.kernel;let k=within%uniforms.kernel;"
+          << "var value=0.0;if(row<uniforms.output_channel_count){value="
+          << w.GetByOffset("((uniforms.output_channel_offset+row)*uniforms.channels+uniforms.channel_offset+input_base+input_lane)*uniforms.kernel+k")
+          << ";}channel_weights[input_lane*88u+within]=value;}"
+          << "workgroupBarrier();if(physical){for(var input_lane=0u;input_lane<block_count;input_lane++){"
+          << "for(var k=0u;k<uniforms.kernel;k++){let index=input_lane*82u+(local_idx%8u)*4u+k*uniforms.dilation;"
+          << "let values=vec4<f32>(channel_values[index],channel_values[index+1u],channel_values[index+2u],channel_values[index+3u]);"
+          << "let weight=channel_weights[input_lane*88u+(local_idx/8u)*uniforms.kernel+k];"
+          ;
+          if(fast)f<<"let product=values*vec4<f32>(weight);total=total+product;";
+          else f<<"total=original_add4(total,original_mul4(values,weight));";
+          f<<"}}}workgroupBarrier();}";
+        };
+        f<<"if(finite_safe){";dot_loop(true);f<<"}else{";dot_loop(false);f<<"}";
+        f
+          << "if(physical){if(uniforms.channel_offset+uniforms.channel_count==uniforms.channels){total=original_add4(total,vec4<f32>("
+          << b.GetByOffset("oc") << "));}for(var lane=0u;lane<4u;lane++){if(t+lane<uniforms.output_capacity){var value=0.0;"
+          << "if(t+lane<count){value=total[lane];}" << y.SetByOffset("local_oc*uniforms.output_capacity+t+lane","value") << "}}}";
+        return Status::OK();
+      }
+      if(tiled_){
+        functions << "var<workgroup> conv_values:array<f32,512>;var<workgroup> conv_weights:array<f32,11>;var<workgroup> conv_tile_active:u32;";
+      }
+      auto& f=s.MainFunctionBody();
+      if(tiled_){
+        // A full group owns 256 adjacent samples of one output channel. Share
+        // overlapping input rows and weights; boundary groups use the exact
+        // four-lane path below. All barrier decisions are workgroup-uniform.
+        f << "let tile_offset=workgroup_idx*256u;let tile_at=uniforms.element_begin+tile_offset;"
+          << "let tile_t=tile_at%uniforms.output_capacity;let tile_count=" << e.GetByOffset("6u") << ";"
+          << "if(local_idx==0u){conv_tile_active=0u;let elements=uniforms.output_channel_count*uniforms.output_capacity;"
+          << "if(valid_output()&&uniforms.element_begin<elements&&uniforms.element_count<=elements-uniforms.element_begin&&"
+          << "tile_offset<uniforms.element_count&&256u<=uniforms.element_count-tile_offset&&"
+          << "tile_t+255u<tile_count&&tile_t+255u<uniforms.output_capacity&&tile_count<=uniforms.input_capacity&&"
+          << "uniforms.kernel>=1u&&uniforms.kernel<=11u&&uniforms.dilation>=1u&&uniforms.dilation<=5u&&"
+          << "uniforms.output_channel_offset<uniforms.channels&&uniforms.output_channel_count>0u&&"
+          << "uniforms.output_channel_count<=uniforms.channels-uniforms.output_channel_offset&&"
+          << "uniforms.channel_offset<uniforms.channels&&uniforms.channel_count>0u&&"
+          << "uniforms.channel_count<=uniforms.channels-uniforms.channel_offset){conv_tile_active=1u;}}"
+          << "let tile_active=workgroupUniformLoad(&conv_tile_active);if(tile_active==1u){"
+          << "let at=tile_at+local_idx*4u;let oc=uniforms.output_channel_offset+tile_at/uniforms.output_capacity;"
+          << "let span=256u+(uniforms.kernel-1u)*uniforms.dilation;let pad=i32((uniforms.kernel-1u)*uniforms.dilation/2u);"
+          << "var total=vec4<f32>(0.0);if(uniforms.channel_offset!=0u){total=vec4<f32>("
+          << y.GetByOffset("at") << "," << y.GetByOffset("at+1u") << "," << y.GetByOffset("at+2u") << "," << y.GetByOffset("at+3u") << ");}"
+          << "for(var local_ic=0u;local_ic<uniforms.channel_count;local_ic++){let ic=uniforms.channel_offset+local_ic;"
+          << "for(var index=local_idx;index<span;index+=64u){let pos=i32(tile_t+index)-pad;var value=0.0;"
+          << "if(pos>=0&&pos<i32(tile_count)){value=" << x.GetByOffset("local_ic*uniforms.input_capacity+u32(pos)") << ";}conv_values[index]=value;}"
+          << "if(local_idx<uniforms.kernel){conv_weights[local_idx]=" << w.GetByOffset("(oc*uniforms.channels+ic)*uniforms.kernel+local_idx") << ";}"
+          << "workgroupBarrier();for(var k=0u;k<uniforms.kernel;k++){let index=local_idx*4u+k*uniforms.dilation;"
+          << "let values=vec4<f32>(conv_values[index],conv_values[index+1u],conv_values[index+2u],conv_values[index+3u]);"
+          << "total=original_add4(total,original_mul4(values,conv_weights[k]));}workgroupBarrier();}"
+          << "if(uniforms.channel_offset+uniforms.channel_count==uniforms.channels){total=original_add4(total,vec4<f32>(" << b.GetByOffset("oc") << "));}"
+          << y.SetByOffset("at","total.x") << y.SetByOffset("at+1u","total.y") << y.SetByOffset("at+2u","total.z") << y.SetByOffset("at+3u","total.w")
+          << "return;}";
+      }
+      f << "let elements=uniforms.output_channel_count*uniforms.output_capacity;"
+        << "if(uniforms.element_begin>=elements||uniforms.element_count>elements-uniforms.element_begin||"
+        << "global_idx>=uniforms.element_count/4u+u32(uniforms.element_count%4u!=0u)){return;}"
+        << "let offset=global_idx*4u;let at=uniforms.element_begin+offset;let lanes=min(4u,uniforms.element_count-offset);"
+        << "let t=at%uniforms.output_capacity;let count=" << e.GetByOffset("6u") << ";"
+        << "if(lanes!=4u||!valid_output()||t+3u>=count||t+3u>=uniforms.output_capacity||"
+        << "uniforms.output_channel_offset>=uniforms.channels||uniforms.output_channel_count==0u||"
+        << "uniforms.output_channel_count>uniforms.channels-uniforms.output_channel_offset||"
+        << "uniforms.channel_offset>=uniforms.channels||uniforms.channel_count==0u||"
+        << "uniforms.channel_count>uniforms.channels-uniforms.channel_offset){"
+        << "for(var lane=0u;lane<lanes;lane++){let index=at+lane;" << y.SetByOffset("index","residual_sample(index)") << "}return;}"
+        << "let oc=uniforms.output_channel_offset+at/uniforms.output_capacity;var total=vec4<f32>(0.0);"
+        << "if(uniforms.channel_offset!=0u){total=vec4<f32>(" << y.GetByOffset("at") << "," << y.GetByOffset("at+1u") << ","
+        << y.GetByOffset("at+2u") << "," << y.GetByOffset("at+3u") << ");}"
+        << "let pad=i32((uniforms.kernel-1u)*uniforms.dilation/2u);"
+        << "for(var local_ic=0u;local_ic<uniforms.channel_count;local_ic++){let ic=uniforms.channel_offset+local_ic;"
+        << "for(var k=0u;k<uniforms.kernel;k++){let pos=i32(t)+i32(k*uniforms.dilation)-pad;var values=vec4<f32>(0.0);"
+        << "if(pos>=0&&pos+3<i32(count)){let index=local_ic*uniforms.input_capacity+u32(pos);values=vec4<f32>("
+        << x.GetByOffset("index") << "," << x.GetByOffset("index+1u") << "," << x.GetByOffset("index+2u") << "," << x.GetByOffset("index+3u") << ");}"
+        << "else{for(var lane=0u;lane<4u;lane++){let p=pos+i32(lane);if(p>=0&&p<i32(count)){values[lane]="
+        << x.GetByOffset("local_ic*uniforms.input_capacity+u32(p)") << ";}}}"
+        << "let weight=" << w.GetByOffset("(oc*uniforms.channels+ic)*uniforms.kernel+k") << ";total=original_add4(total,original_mul4(values,weight));}}"
+        << "if(uniforms.channel_offset+uniforms.channel_count==uniforms.channels){total=original_add4(total,vec4<f32>(" << b.GetByOffset("oc") << "));}"
+        << y.SetByOffset("at","total.x") << y.SetByOffset("at+1u","total.y") << y.SetByOffset("at+2u","total.z") << y.SetByOffset("at+3u","total.w");
+      return Status::OK();
+    }
     auto& f=s.MainFunctionBody();
     f << "let elements=uniforms.output_channel_count*uniforms.output_capacity;"
       << "if(uniforms.element_begin>=elements||uniforms.element_count>elements-uniforms.element_begin||"
@@ -372,7 +1020,109 @@ class GeneratorResidualConv final : public Program<GeneratorResidualConv> {
     f << y.SetByOffset("at","total");
     return Status::OK();
   }
+ private:
+  const bool vectorized_;
+  const bool tiled_;
+  const bool channel_tiled_;
+  const uint32_t channel_block_;
+  const bool matrix_,wide_grid_;
 };
+
+inline Status RunResidualPackedTileV1(ComputeContextBase& c,const ProgramInput& input,const ProgramOutput& output,
+    const Tensor* extent,const Tensor* weight,const Tensor* bias,Tensor* columns,Tensor* flags,
+    const ResidualConvSpecV1& spec,uint32_t time_begin,uint32_t time_count,bool checked,uint64_t& dispatches) {
+  ORT_RETURN_IF_NOT(ResidualPackedSupportedV1(c.DeviceLimits()),"RW07 packed matrix device requirements");
+  ORT_RETURN_IF_NOT(columns&&flags&&columns->IsDataType<float>()&&flags->IsDataType<uint32_t>()&&
+    weight&&weight->IsDataType<float>()&&bias&&bias->IsDataType<float>()&&
+    spec.channel_count>0&&spec.channel_count<=256&&spec.kernel>0&&spec.kernel<=11&&
+    spec.dilation>0&&spec.dilation<=5&&spec.output_channel_count>0&&
+    spec.output_channel_offset<spec.channels&&spec.output_channel_count<=spec.channels-spec.output_channel_offset&&
+    spec.channel_offset<spec.channels&&spec.channel_count<=spec.channels-spec.channel_offset&&
+    time_count>0&&time_count<=kResidualPackedTimeV1&&time_count%32==0&&time_begin<spec.output_capacity&&
+    weight->Shape().Size()==int64_t(spec.channels)*spec.channels*spec.kernel&&weight->Shape().Size()%4==0,
+    "RW07 packed convolution dimensions/types");
+  const uint64_t vectors=uint64_t(spec.channel_count)*spec.kernel*(time_count/4);
+  const uint32_t groups=static_cast<uint32_t>(ResidualPackedFlagCountV1(spec.channel_count,spec.kernel,time_count));
+  ORT_RETURN_IF_NOT(uint64_t(columns->Shape().Size())>=vectors*4&&uint64_t(flags->Shape().Size())>=groups,
+    "RW07 packed convolution scratch extent");
+  ResidualPackColumnsV1 pack;
+  pack.AddInput(ProgramInput(input)).AddInput({extent,ProgramTensorMetadataDependency::None})
+    .AddOutput({columns,ProgramTensorMetadataDependency::None,ProgramOutput::Flatten,4})
+    .AddOutput({flags,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64);
+  const auto limit=c.DeviceLimits().maxComputeWorkgroupsPerDimension;
+  const auto dx=std::min(groups,limit);ORT_RETURN_IF_NOT(dx>0,"RW07 pack workgroup limit");
+  pack.SetDispatchGroupSize(dx,(groups+dx-1)/dx);spec.ApplyPacked(pack,time_begin,time_count,0,spec.output_channel_count);
+  ORT_RETURN_IF_ERROR(c.RunProgram(pack));++dispatches;
+  const uint64_t rounded=(uint64_t(spec.channel_count)*spec.kernel+31)/32*32;
+  const uint32_t row_limit=static_cast<uint32_t>(ResidualPackedProductsPerDispatchV1()/(time_count*rounded)/32*32);
+  ORT_RETURN_IF_NOT(row_limit>=32,"RW07 packed matrix work bound");
+  for(uint32_t row=0;row<spec.output_channel_count;row+=row_limit){
+    const uint32_t count=std::min(row_limit,spec.output_channel_count-row);
+    ResidualPackedMatrixV1 matrix;
+    matrix.AddInput(ProgramInput(input)).AddInput({extent,ProgramTensorMetadataDependency::None})
+      .AddInput({weight,ProgramTensorMetadataDependency::None,ProgramInput::Flatten,4})
+      .AddInput({bias,ProgramTensorMetadataDependency::None})
+      .AddInput({columns,ProgramTensorMetadataDependency::None,ProgramInput::Flatten,4})
+      .AddInput({flags,ProgramTensorMetadataDependency::None}).AddOutput(ProgramOutput(output))
+      .SetWorkgroupSize(8,8).SetDispatchGroupSize(time_count/32,(count+31)/32);
+    spec.ApplyPacked(matrix,time_begin,time_count,row,count);
+    const uint64_t work=uint64_t((count+31)/32*32)*time_count*rounded;
+    ORT_RETURN_IF_NOT(work<=ResidualPackedProductsPerDispatchV1(),"RW07 packed matrix scheduled work");
+    if(!M0BatchHeavyProgramsV1()||(checked&&row+count==spec.output_channel_count))ORT_RETURN_IF_ERROR(c.RunProgramWithCheckedCompletion(matrix));
+    else ORT_RETURN_IF_ERROR(c.RunProgram(matrix,work));
+    ++dispatches;
+  }
+  return Status::OK();
+}
+inline Status RunResidualConvolutionV1(ComputeContextBase& c,const ProgramInput& input,const ProgramOutput& output,
+    const Tensor* extent,const Tensor* weight,const Tensor* bias,Tensor* columns,Tensor* flags,
+    const ResidualConvSpecV1& spec,uint64_t& dispatches,bool checked=false,uint32_t forced=0) {
+  const bool tiled=M0OutputChannelTiledConvV1();
+  const bool packed=tiled&&columns&&flags&&ResidualPackedSupportedV1(c.DeviceLimits());
+  const uint32_t maximum=packed?16u:std::max(1u,ResidualChannelBlockV1(c.DeviceLimits().maxComputeWorkgroupStorageSize));
+  const uint32_t sample_time=ResidualPackedTimeV1(spec.channel_count,spec.kernel);
+  ORT_RETURN_IF_NOT(sample_time>0,"RW07 residual sample work bound");
+  const auto original=[&](uint32_t block,uint32_t begin,uint32_t count,bool finish)->Status {
+    const GeneratorResidualConv scheduling(M0VectorizedConvV1(),M0TiledConvV1(),tiled,block);
+    const uint64_t elements=scheduling.WorkItems(spec.output_channel_count,count?count:spec.output_capacity);
+    const uint32_t chunk=scheduling.ChunkElements(spec.channel_count,spec.kernel);
+    ORT_RETURN_IF_NOT(elements>0&&elements<=UINT32_MAX&&chunk>0,"RW07 residual convolution virtual range");
+    for(uint64_t first=0;first<elements;){
+      const uint32_t n=static_cast<uint32_t>(std::min<uint64_t>(chunk,elements-first));
+      GeneratorResidualConv program(M0VectorizedConvV1(),M0TiledConvV1(),tiled,block);
+      program.AddInput(ProgramInput(input)).AddInputs({{extent,ProgramTensorMetadataDependency::None},
+        {weight,ProgramTensorMetadataDependency::None},{bias,ProgramTensorMetadataDependency::None}})
+        .AddOutput(ProgramOutput(output));spec.Apply(program,begin,count,uint32_t(first),n);
+      const auto groups=(n+64*program.ValuesPerInvocation()-1)/(64*program.ValuesPerInvocation());
+      const auto dx=std::min(groups,c.DeviceLimits().maxComputeWorkgroupsPerDimension);
+      program.SetWorkgroupSize(64).SetDispatchGroupSize(dx,(groups+dx-1)/dx);
+      if(!M0BatchHeavyProgramsV1()||(finish&&first+n==elements))ORT_RETURN_IF_ERROR(c.RunProgramWithCheckedCompletion(program));
+      else ORT_RETURN_IF_ERROR(c.RunProgram(program,uint64_t(n)*spec.channel_count*spec.kernel));
+      ++dispatches;first+=n;
+    }
+    return Status::OK();
+  };
+  uint32_t chosen=forced?forced:1;
+  if(forced){ORT_RETURN_IF_NOT(forced==1||forced==2||forced==4||forced==8||(forced==16&&packed),"RW07 forced convolution variant");}
+  else if(tiled){
+    const std::string key="packed:"+std::to_string(spec.output_capacity)+":"+std::to_string(spec.channels)+":"+
+      std::to_string(spec.channel_count)+":"+std::to_string(spec.output_channel_count)+":"+
+      std::to_string(spec.kernel)+":"+std::to_string(spec.dilation);
+    ORT_RETURN_IF_ERROR(ResidualAutotunedBlockV1(c,key,maximum,spec.channel_offset==0,
+      [&](uint32_t variant)->Status {
+        if(variant==16)return RunResidualPackedTileV1(c,input,output,extent,weight,bias,columns,flags,spec,0,sample_time,true,dispatches);
+        return original(variant,0,sample_time,true);
+      },chosen));
+  }
+  if(chosen!=16)return original(chosen,0,0,checked);
+  for(uint32_t t=0;t<spec.output_capacity;t+=sample_time){
+    ORT_RETURN_IF_ERROR(RunResidualPackedTileV1(c,input,output,extent,weight,bias,columns,flags,spec,t,sample_time,
+      checked&&spec.output_capacity-t<=sample_time,dispatches));
+  }
+  return Status::OK();
+}
+
+#undef M0_RESIDUAL_TILE_UNIFORMS_V1
 // Original noise and final projection convolutions share ic/k ordering.
 class GeneratorChannelConv final : public Program<GeneratorChannelConv> {
  public:
@@ -403,7 +1153,7 @@ class GeneratorChannelConv final : public Program<GeneratorChannelConv> {
     const auto& w=s.AddInput("weight",ShaderUsage::UseValueTypeAlias);
     const auto& b=s.AddInput("bias",ShaderUsage::UseValueTypeAlias);
     const auto& y=s.AddOutput("accumulator",ShaderUsage::UseValueTypeAlias);
-    ValidOutput(s,e);OriginalArithmetic(s);
+    ValidOutput(s,e,true);OriginalArithmetic(s);
     auto& f=s.MainFunctionBody();
     f<<"if(global_idx>=uniforms.output_channel_count*uniforms.output_capacity){return;}"
       <<"if(!valid_output()){ "<<y.SetByOffset("global_idx","0.0")<<"return;}"
@@ -451,7 +1201,7 @@ class GeneratorResidualAdd final : public Program<GeneratorResidualAdd> {
     const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
     const auto& prior=s.AddInput("prior",ShaderUsage::UseValueTypeAlias);
     const auto& y=s.AddOutput("output",ShaderUsage::UseValueTypeAlias);
-    ValidOutput(s,e);
+    ValidOutput(s,e,true);
     OriginalArithmetic(s);
     auto& f=s.MainFunctionBody();
     f << "if(global_idx>=uniforms.tile_channels*uniforms.output_capacity){return;}"
@@ -465,3 +1215,177 @@ class GeneratorResidualAdd final : public Program<GeneratorResidualAdd> {
   }
 };
 }  // namespace onnxruntime::webgpu::m0_residual_stages
+
+// Shared actual decoder payloads used by the native callers and shader tests.
+namespace onnxruntime::webgpu::m0_decoder_stages {
+using m0_residual_stages::OriginalArithmetic;
+inline void PayloadGuard(ShaderHelper& s, const ShaderVariableHelper& e,bool share_workgroup=false) {
+  const bool shared=share_workgroup&&M0BatchHeavyProgramsV1();
+  auto& f = s.AdditionalImplementation();
+  f << "fn " << (shared?"validate_output_descriptor":"valid_output") << "() -> bool {if(" << e.GetByOffset("0u") << "!=2u||"
+    << e.GetByOffset("1u") << "!=3u||" << e.GetByOffset("20u") << "!=0u||"
+    << e.GetByOffset("21u") << "!=63u){return false;}"
+    << "for(var i=0u;i<10u;i++){if(" << e.GetByOffset("22u+i") << "!="
+    << GetElementAt("uniforms.identity", "i", 10) << "){return false;}}"
+    << "if(" << e.GetByOffset("2u") << "!=1u||" << e.GetByOffset("3u") << "!=0u||"
+    << e.GetByOffset("4u") << "!=select(1024u,512u," << GetElementAt("uniforms.identity", "8u", 10) << "==24u)||" << e.GetByOffset("5u") << "!=0u||"
+    << e.GetByOffset("7u") << "!=0u||" << e.GetByOffset("19u") << "!=0u){return false;}"
+    << "for(var i=8u;i<18u;i++){if(" << e.GetByOffset("i") << "!=0u){return false;}}"
+    << "let d=" << e.GetByOffset("6u") << ";return d>0u&&d<=select(102400u,204800u," << GetElementAt("uniforms.identity", "8u", 10) << "==24u)&&d<=uniforms.final_capacity&&"
+    << e.GetByOffset("18u") << "==select(1024u,512u," << GetElementAt("uniforms.identity", "8u", 10) << "==24u)*d&&(" << GetElementAt("uniforms.identity", "8u", 10) << "!=24u||d%2u==0u);}\n";
+  if(shared)m0_residual_stages::ShareOutputValidityV1(s);
+}
+class DecoderPoolTile final : public Program<DecoderPoolTile> {
+ public:
+  DecoderPoolTile() : Program{"RW07DecoderResidualDepthwisePoolLocalChannelTileV2"} {}
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+      {"input_capacity", ProgramUniformVariableDataType::Uint32},
+      {"output_capacity", ProgramUniformVariableDataType::Uint32},
+      {"channels", ProgramUniformVariableDataType::Uint32},
+      {"channel_offset", ProgramUniformVariableDataType::Uint32},
+      {"channel_count", ProgramUniformVariableDataType::Uint32},
+      {"final_capacity", ProgramUniformVariableDataType::Uint32},
+      {"identity", ProgramUniformVariableDataType::Uint32});
+  Status GenerateShaderCode(ShaderHelper& s) const override {
+    const auto& x = s.AddInput("x", ShaderUsage::UseValueTypeAlias);
+    const auto& w = s.AddInput("weight", ShaderUsage::UseValueTypeAlias);
+    const auto& b = s.AddInput("bias", ShaderUsage::UseValueTypeAlias);
+    const auto& e = s.AddInput("extent", ShaderUsage::UseValueTypeAlias);
+    const auto& y = s.AddOutput("y", ShaderUsage::UseValueTypeAlias);
+    PayloadGuard(s, e,true);
+    OriginalArithmetic(s);
+    auto& f = s.MainFunctionBody();
+    f << "if(global_idx>=uniforms.channels*uniforms.output_capacity){return;}"
+      << y.SetByOffset("global_idx", "0.0") << "if(!valid_output()){return;}"
+      << "let d=" << e.GetByOffset("6u") << ";let t=global_idx%uniforms.output_capacity;"
+      << "let local_ch=global_idx/uniforms.output_capacity;"
+      << "if(t>=d||local_ch>=uniforms.channel_count||uniforms.channel_offset>=1090u||"
+      << "uniforms.channel_count>uniforms.channels||uniforms.channel_count>1090u-uniforms.channel_offset){return;}"
+      << "let ch=uniforms.channel_offset+local_ch;var sum:f32=0.0;"
+      // Original CPU Col2im visits kernel taps in ascending order.
+      << "for(var k=0u;k<3u;k++){"
+      << "let numerator=i32(t)+1-i32(k);if(numerator>=0&&numerator%2==0){"
+      << "let source_t=u32(numerator/2);if(source_t<d/2u&&source_t<uniforms.input_capacity){"
+      << "let product:f32=original_mul(" << x.GetByOffset("local_ch*uniforms.input_capacity+source_t") << ","
+      << w.GetByOffset("ch*3u+k") << ");sum=original_add(sum,product);}}}let result:f32=original_add(sum,"
+      << b.GetByOffset("ch") << ");" << y.SetByOffset("global_idx", "result");
+    return Status::OK();
+  }
+};
+class DecoderConvTile final : public Program<DecoderConvTile> {
+ public:
+  explicit DecoderConvTile(bool bias) : Program{"RW07DecoderResidualConvOutputWindowV3"}, bias_(bias) {}
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+      {"input_capacity", ProgramUniformVariableDataType::Uint32},
+      {"output_capacity", ProgramUniformVariableDataType::Uint32},
+      {"input_channels", ProgramUniformVariableDataType::Uint32},
+      {"output_channels", ProgramUniformVariableDataType::Uint32},
+      {"width", ProgramUniformVariableDataType::Uint32},
+      {"channel_offset", ProgramUniformVariableDataType::Uint32},
+      {"channel_count", ProgramUniformVariableDataType::Uint32},
+      {"output_offset", ProgramUniformVariableDataType::Uint32},
+      {"output_count", ProgramUniformVariableDataType::Uint32},
+      {"nearest", ProgramUniformVariableDataType::Uint32},
+      {"final_capacity", ProgramUniformVariableDataType::Uint32},
+      {"identity", ProgramUniformVariableDataType::Uint32});
+  Status GenerateShaderCode(ShaderHelper& s) const override {
+    const auto& x=s.AddInput("pool_tile",ShaderUsage::UseValueTypeAlias);
+    const auto& w=s.AddInput("weight",ShaderUsage::UseValueTypeAlias);
+    const ShaderVariableHelper* b=bias_?&s.AddInput("bias",ShaderUsage::UseValueTypeAlias):nullptr;
+    const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
+    const auto& y=s.AddOutput("accumulator",ShaderUsage::UseValueTypeAlias);
+    PayloadGuard(s,e,true);OriginalArithmetic(s);
+    auto& f=s.MainFunctionBody();
+    f<<"if(global_idx>=uniforms.output_count*uniforms.output_capacity){return;}"
+      <<"if(!valid_output()){ "<<y.SetByOffset("global_idx","0.0")<<"return;}"
+      <<"let d="<<e.GetByOffset("6u")<<";let t=global_idx%uniforms.output_capacity;"
+      <<"let oc=uniforms.output_offset+global_idx/uniforms.output_capacity;"
+      <<"if(t>=d||uniforms.channel_offset>=uniforms.input_channels||uniforms.channel_count==0u||"
+      <<"uniforms.channel_count>64u||uniforms.channel_count>uniforms.input_channels-uniforms.channel_offset){"
+      <<y.SetByOffset("global_idx","0.0")<<"return;}"
+      // Continue the scalar sum; summing independent tile totals would reorder it.
+      <<"var sum:f32=0.0;if(uniforms.channel_offset!=0u){sum="<<y.GetByOffset("global_idx")<<";}"
+      <<"for(var local_ic=0u;local_ic<uniforms.channel_count;local_ic++){"
+      <<"let ic=uniforms.channel_offset+local_ic;for(var k=0u;k<uniforms.width;k++){"
+      <<"let pos=i32(t)+i32(k)-i32(uniforms.width/2u);var value:f32=0.0;"
+      <<"if(pos>=0&&u32(pos)<d){let source_t=select(u32(pos),u32(pos)/2u,uniforms.nearest!=0u);"
+      <<"if(source_t<uniforms.input_capacity){value="
+      <<x.GetByOffset("local_ic*uniforms.input_capacity+source_t")<<";}}"
+      <<"let product:f32=original_mul(value,"<<w.GetByOffset("(oc*uniforms.input_channels+ic)*uniforms.width+k")
+      <<");sum=original_add(sum,product);}}";
+    if(bias_) f<<"if(uniforms.channel_offset+uniforms.channel_count==uniforms.input_channels){sum=original_add(sum,"
+               <<b->GetByOffset("oc")<<");}";
+    f<<y.SetByOffset("global_idx","sum");
+    return Status::OK();
+  }
+ private:
+  const bool bias_;
+};
+class DecoderResidualAdd final : public Program<DecoderResidualAdd> {
+ public:
+  DecoderResidualAdd() : Program{"RW07DecoderResidualInPlaceResidualAddWindowV3"} {}
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+      {"capacity", ProgramUniformVariableDataType::Uint32},
+      {"channels", ProgramUniformVariableDataType::Uint32},
+      {"final_capacity", ProgramUniformVariableDataType::Uint32},
+      {"identity", ProgramUniformVariableDataType::Uint32});
+  Status GenerateShaderCode(ShaderHelper& s) const override {
+    const auto& skip = s.AddInput("skip", ShaderUsage::UseValueTypeAlias);
+    const auto& e = s.AddInput("extent", ShaderUsage::UseValueTypeAlias);
+    const auto& y = s.AddOutput("y", ShaderUsage::UseValueTypeAlias);
+    PayloadGuard(s, e,true);
+    OriginalArithmetic(s);
+    auto& f = s.MainFunctionBody();
+    f << "if(global_idx>=uniforms.channels*uniforms.capacity){return;}"
+      << "if(!valid_output()){ " << y.SetByOffset("global_idx", "0.0") << "return;}"
+      << "if(global_idx%uniforms.capacity>=" << e.GetByOffset("6u") << "){"
+      << y.SetByOffset("global_idx", "0.0") << "return;}"
+      << "let added:f32=original_add(" << y.GetByOffset("global_idx") << "," << skip.GetByOffset("global_idx") << ");"
+      << y.SetByOffset("global_idx", "original_div(added,bitcast<f32>(0x3fb504f3u))");
+    return Status::OK();
+  }
+};
+}  // namespace onnxruntime::webgpu::m0_decoder_stages
+
+namespace onnxruntime::webgpu::m0_decoder_concat_stages {
+inline void ValidOutput(ShaderHelper& s, const ShaderVariableHelper& e,bool share_workgroup=false) {
+  const bool shared=share_workgroup&&M0BatchHeavyProgramsV1();
+  auto& f = s.AdditionalImplementation();
+  f << "fn " << (shared?"validate_output_descriptor":"valid_output") << "()->bool {if(" << e.GetByOffset("0u") << "!=2u||" << e.GetByOffset("1u")
+    << "!=3u||" << e.GetByOffset("20u") << "!=0u||" << e.GetByOffset("21u") << "!=63u){return false;}"
+    << "for(var i=0u;i<10u;i++){if(" << e.GetByOffset("22u+i") << "!="
+    << GetElementAt("uniforms.identity", "i", 10) << "){return false;}}"
+    << "if(" << e.GetByOffset("2u") << "!=1u||" << e.GetByOffset("3u") << "!=0u||"
+    << e.GetByOffset("4u") << "!=1090u||" << e.GetByOffset("5u") << "!=0u||"
+    << e.GetByOffset("7u") << "!=0u||" << e.GetByOffset("19u") << "!=0u){return false;}"
+    << "for(var i=8u;i<18u;i++){if(" << e.GetByOffset("i") << "!=0u){return false;}}"
+    << "let d=" << e.GetByOffset("6u") << ";return d>0u&&d<=102400u&&d<=uniforms.capacity&&"
+    << "d<=uniforms.text_capacity&&d<=uniforms.f0_capacity&&d<=uniforms.n_capacity&&"
+    << e.GetByOffset("18u") << "==1090u*d;}\n";
+  if(shared)m0_residual_stages::ShareOutputValidityV1(s);
+}
+class Concat final : public Program<Concat> {
+ public:
+  Concat() : Program{"RW07OriginalDecoderConcatV1"} {}
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+      {"text_capacity", ProgramUniformVariableDataType::Uint32}, {"f0_capacity", ProgramUniformVariableDataType::Uint32},
+      {"n_capacity", ProgramUniformVariableDataType::Uint32}, {"capacity", ProgramUniformVariableDataType::Uint32},
+      {"identity", ProgramUniformVariableDataType::Uint32});
+  Status GenerateShaderCode(ShaderHelper& s) const override {
+    const auto& x = s.AddInput("aligned_text", ShaderUsage::UseValueTypeAlias);
+    const auto& f0 = s.AddInput("f0_projection", ShaderUsage::UseValueTypeAlias);
+    const auto& n = s.AddInput("n_projection", ShaderUsage::UseValueTypeAlias);
+    const auto& e = s.AddInput("extent", ShaderUsage::UseValueTypeAlias);
+    const auto& y = s.AddOutput("decoder_input", ShaderUsage::UseValueTypeAlias);
+    ValidOutput(s, e,true);
+    auto& f = s.MainFunctionBody();
+    f << "if(global_idx>=1090u*uniforms.capacity){return;}" << y.SetByOffset("global_idx", "0.0")
+      << "if(!valid_output()){return;}let t=global_idx%uniforms.capacity;let ch=global_idx/uniforms.capacity;"
+      << "if(t>=" << e.GetByOffset("6u") << "){return;}if(ch<1024u){"
+      << y.SetByOffset("global_idx",x.GetByOffset("ch*uniforms.text_capacity+t")) << "}else if(ch<1088u){"
+      << y.SetByOffset("global_idx",f0.GetByOffset("(ch-1024u)*uniforms.f0_capacity+t")) << "}else{"
+      << y.SetByOffset("global_idx",n.GetByOffset("(ch-576u)*uniforms.n_capacity+t")) << "}";
+    return Status::OK();
+  }
+};
+}  // namespace onnxruntime::webgpu::m0_decoder_concat_stages

@@ -53,6 +53,8 @@ class ComputeContextBase {
   //
   // Get the node name.
   //
+  const OpKernel& Kernel() const noexcept { return op_kernel_; }
+
   inline decltype(auto) NodeName() const {
     return op_kernel_.Node().Name();
   }
@@ -74,6 +76,12 @@ class ComputeContextBase {
   inline const wgpu::Limits& DeviceLimits() const {
     return webgpu_context_.DeviceLimits();
   }
+  uint32_t M0ResidualBlockChoiceV1(const std::string& key) const {
+    return webgpu_context_.M0ResidualBlockChoiceV1(key);
+  }
+  void M0RememberResidualBlockV1(const std::string& key,uint32_t block) {
+    webgpu_context_.M0RememberResidualBlockV1(key,block);
+  }
   inline bool HasFeature(wgpu::FeatureName feature) const {
     return webgpu_context_.DeviceHasFeature(feature);
   }
@@ -93,6 +101,10 @@ class ComputeContextBase {
   //
   inline bool IsGraphCaptureEnabled() const {
     return ep_.IsGraphCaptureEnabled();
+  }
+  // Stable per-Run admission policy; this grants no allocation or enqueue authority.
+  inline uint64_t M0SubmissionBudgetBytesV1() const {
+    return ep_.Recording().m0_submission_budget_bytes;
   }
 
   //
@@ -139,9 +151,15 @@ class ComputeContextBase {
   //
   // Run a compute shader program.
   //
-  inline Status RunProgram(const ProgramBase& program) {
+  inline Status RunProgram(const ProgramBase& program, uint64_t scheduled_products=0) {
     ORT_RETURN_IF_ERROR(M0CheckCancellationV1());
-    return webgpu_context_.Run(*this, program);
+    return webgpu_context_.Run(*this, program, scheduled_products);
+  }
+
+  // Isolate a costly dispatch from preceding and subsequent submissions.
+  inline Status RunProgramWithCheckedCompletion(const ProgramBase& program) {
+    ORT_RETURN_IF_ERROR(M0CheckCancellationV1());
+    return webgpu_context_.RunWithCheckedCompletion(*this, program);
   }
 
  protected:

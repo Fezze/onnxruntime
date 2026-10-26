@@ -6,23 +6,242 @@
 
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && !defined(ORT_MINIMAL_BUILD)
 #include <cstdlib>
+#include <array>
+#include <cstring>
 #include <fstream>
 #include <filesystem>
 #include <functional>
 #include <string>
+#include <stdexcept>
+#include <vector>
+#include <map>
+#include <nlohmann/json.hpp>
 #include "asserts.h"
 #include "core/common/common.h"
+#include "core/common/path_string.h"
+#include "core/platform/env.h"
 #include "core/graph/model.h"
+#include "core/graph/m0_bounded_backing_v1.h"
+#include "core/session/plugin_ep/m0_native_resource_binding_v3.h"
+#include "core/session/plugin_ep/m0_native_kernel_binding_v2.h"
 #include "sha256.h"
 #include "gtest/gtest.h"
 #include "test/test_environment.h"
 #include "core/session/m0_native_terminal_result_v1.h"
+#include "core/session/m0_native_public_input_fixture_v1.h"
 #if defined(__ANDROID__) && defined(USE_WEBGPU) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
+#include <dlfcn.h>
+#include "core/session/onnxruntime_cxx_api.h"
 #include "test/unittest_util/test_dynamic_plugin_ep.h"
 #endif
 
 namespace onnxruntime::test {
 namespace {
+TEST(M0NativePcmDifference, ReportsExactBitsFiniteErrorAndMismatchedExtentsWithoutTolerance){
+  const std::array<float,4> left{0.0f,-0.0f,1.0f,-2.0f},right{-0.0f,-0.0f,1.0f,-1.0f};
+  const auto same=M0MeasureNativePcmDifferenceV1(left.data(),sizeof(left),left.data(),sizeof(left));
+  EXPECT_TRUE(same.SameBits());EXPECT_EQ(same.maximum_absolute,0);EXPECT_EQ(same.maximum_ulp,0u);
+  const auto diff=M0MeasureNativePcmDifferenceV1(left.data(),sizeof(left),right.data(),sizeof(right));
+  EXPECT_FALSE(diff.SameBits());EXPECT_EQ(diff.unequal_bits,2u);EXPECT_EQ(diff.first_unequal,0u);
+  EXPECT_EQ(diff.first_expected_bits,0u);EXPECT_EQ(diff.first_actual_bits,0x80000000u);
+  EXPECT_EQ(diff.maximum_absolute,1);EXPECT_EQ(diff.root_mean_square,0.5);EXPECT_EQ(diff.nonfinite_actual,0u);
+  EXPECT_FALSE(M0MeasureNativePcmDifferenceV1(left.data(),sizeof(left),left.data(),sizeof(left)-4).SameBits());
+  EXPECT_THROW((void)M0MeasureNativePcmDifferenceV1(nullptr,4,left.data(),4),std::invalid_argument);
+  EXPECT_THROW((void)M0MeasureNativePcmDifferenceV1(left.data(),3,left.data(),4),std::invalid_argument);
+}
+TEST(M0NativePcmDifference, ReportsNonfiniteClassesAndAdjacentFiniteUlps){
+  const std::array<uint32_t,4> left{0x7f800000u,0xff800000u,0x7fc00001u,0x3f800000u};
+  const std::array<uint32_t,4> right{0x7f800000u,0x7f800000u,0x7fc00002u,0x3f800001u};
+  const auto d=M0MeasureNativePcmDifferenceV1(left.data(),sizeof(left),right.data(),sizeof(right));
+  EXPECT_FALSE(d.SameBits());EXPECT_EQ(d.unequal_bits,3u);EXPECT_EQ(d.first_unequal,1u);
+  EXPECT_EQ(d.nonfinite_expected,3u);EXPECT_EQ(d.nonfinite_actual,3u);EXPECT_EQ(d.maximum_ulp,1u);
+  EXPECT_EQ(d.maximum_absolute,double(std::numeric_limits<float>::epsilon()));
+  EXPECT_EQ(d.root_mean_square,d.maximum_absolute);
+}
+#if defined(__ANDROID__) && defined(USE_WEBGPU) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
+TEST(M0NativeBridge, ExecutableContextQueriesBelongToItsActualApiAndRejectMissingContexts){
+  Dl_info api{};
+  ASSERT_NE(dladdr(reinterpret_cast<void*>(Ort::GetApi().KernelContext_GetSyncStream),&api),0);
+  void* main=dlopen(nullptr,RTLD_NOW|RTLD_LOCAL);
+  ASSERT_NE(main,nullptr);
+  struct Close{void* handle;~Close(){dlclose(handle);}} close{main};
+  for(const char* name:{"OrtM0FullGpuExtentOwnerEpochV1","OrtM0FullGpuExtentRunIdV2","OrtM0FullGpuReadCancellationV1"}){
+    SCOPED_TRACE(name);
+    void* symbol=dlsym(main,name);ASSERT_NE(symbol,nullptr);
+    Dl_info actual{};ASSERT_NE(dladdr(symbol,&actual),0);EXPECT_EQ(actual.dli_fbase,api.dli_fbase);
+    if(std::string(name)=="OrtM0FullGpuReadCancellationV1"){
+      using Query=int (ORT_API_CALL*)(const OrtKernelContext*,uint32_t,uint32_t*) noexcept;
+      uint32_t pending=777;
+      EXPECT_EQ(reinterpret_cast<Query>(symbol)(nullptr,1,&pending),0);EXPECT_EQ(pending,777u);
+    }else{
+      using Query=int (ORT_API_CALL*)(const OrtKernelContext*,uint32_t,uint64_t*) noexcept;
+      uint64_t pending=777;
+      EXPECT_EQ(reinterpret_cast<Query>(symbol)(nullptr,0,&pending),0);EXPECT_EQ(pending,0u);
+    }
+  }
+}
+#endif
+TEST(M0BackingProjection, AliasedRawPayloadPreservesCanonicalMetadataAndUnknownTrailer){
+  ONNX_NAMESPACE::TensorProto tensor;
+  tensor.set_name("large_raw_initializer");tensor.set_data_type(ONNX_NAMESPACE::TensorProto::FLOAT);
+  tensor.add_dims(262144);tensor.set_raw_data(std::string(1024*1024,'x'));
+  // Field9 with a different wire type remains an unknown field, not another
+  // omitted known raw_data field. A second unknown field crosses stream buffers.
+  std::string wire=tensor.SerializeAsString();wire.append("\x48\x07",2);
+  google::protobuf::io::StringOutputStream stream(&wire);
+  {
+    google::protobuf::io::CodedOutputStream coded(&stream);
+    coded.WriteTag((190u<<3)|2u);coded.WriteVarint32(9001);
+    coded.WriteRaw(std::string(9001,'u').data(),9001);
+  }
+  ONNX_NAMESPACE::TensorProto parsed;ASSERT_TRUE(parsed.ParseFromString(wire));
+  m0_internal::M0BackingProjectionV1 copying({{9,1}});
+  ASSERT_TRUE(parsed.SerializeToZeroCopyStream(&copying));const auto expected=copying.Finish();
+  m0_internal::M0BackingProjectionV1 aliased({{9,1}});
+  {
+    google::protobuf::io::CodedOutputStream coded(&aliased);coded.EnableAliasing(true);
+    ASSERT_TRUE(parsed.SerializeToCodedStream(&coded));
+  }
+  const auto metadata=aliased.Finish();EXPECT_EQ(metadata,expected);
+  EXPECT_GE(aliased.AliasedBytes(),parsed.raw_data().size());
+  EXPECT_EQ(aliased.ByteCount(),int64_t(parsed.ByteSizeLong()));
+  EXPECT_NE(metadata.find(std::string(9001,'u')),std::string::npos);
+  EXPECT_EQ(m0_internal::M0ProjectedBackingBytesV1(parsed,{{9,1}}),expected);
+  auto changed=parsed;(*changed.mutable_raw_data())[700000]='y';
+  EXPECT_TRUE(m0_internal::M0SameInitializerMetadataV1(parsed,changed));
+  EXPECT_FALSE(m0_internal::M0SameInlineInitializerV1(parsed,changed));
+  changed.set_name("substituted");EXPECT_FALSE(m0_internal::M0SameInitializerMetadataV1(parsed,changed));
+}
+TEST(M0BackingProjection, EmptyKnownRawPresenceRemainsDistinct){
+  for(bool present:{false,true}){
+    ONNX_NAMESPACE::TensorProto tensor;tensor.set_name("empty");if(present)tensor.set_raw_data("");
+    m0_internal::M0BackingProjectionV1 reference({{9,present?size_t{1}:size_t{0}}});
+    ASSERT_TRUE(tensor.SerializeToZeroCopyStream(&reference));
+    EXPECT_EQ(m0_internal::M0ProjectedBackingBytesV1(tensor,{{9,present?size_t{1}:size_t{0}}}),reference.Finish());
+    auto other=tensor;if(present)other.clear_raw_data();else other.set_raw_data("");
+    EXPECT_FALSE(m0_internal::M0SameInitializerMetadataV1(tensor,other));
+  }
+}
+TEST(M0BackingProjection, AliasedNestedGraphUsesTheSameWireProjectionAndMetadataLimit){
+  ONNX_NAMESPACE::ModelProto model;model.set_ir_version(9);model.set_producer_name("nested");
+  auto* graph=model.mutable_graph();graph->set_name("owned");
+  auto* tensor=graph->add_initializer();tensor->set_name("weight");tensor->set_data_type(ONNX_NAMESPACE::TensorProto::FLOAT);
+  tensor->add_dims(262144);tensor->set_raw_data(std::string(1024*1024,'w'));
+  auto* opset=model.add_opset_import();opset->set_domain("");opset->set_version(20);
+  std::string wire=model.SerializeAsString();wire.append("\x38\x05",2); // unknown field7, varint wire type
+  ONNX_NAMESPACE::ModelProto parsed;ASSERT_TRUE(parsed.ParseFromString(wire));
+  m0_internal::M0BackingProjectionV1 reference({{7,1},{8,1}});
+  ASSERT_TRUE(parsed.SerializeToZeroCopyStream(&reference));
+  EXPECT_EQ(m0_internal::M0ProjectedBackingBytesV1(parsed,{{7,1},{8,1}}),reference.Finish());
+  ONNX_NAMESPACE::TensorProto oversized;oversized.set_name("oversized_metadata");
+  oversized.set_doc_string(std::string(8*1024*1024+1,'m'));
+  EXPECT_THROW(m0_internal::M0ProjectedBackingBytesV1(oversized,{}),OnnxRuntimeException);
+}
+OrtStatus* ORT_API_CALL NativeBatchCreator(void*,const OrtKernelInfo*,OrtKernelImpl**){return nullptr;}
+M0NativeProviderKernelBindingV2 NativeBatchRow(uint32_t id){
+  M0NativeProviderKernelBindingV2 row;row.abi=2;row.record_id=id;
+  row.type=M0NativeKernelRecordByIdV2(id)->type;
+  row.registry=reinterpret_cast<const OrtKernelRegistry*>(uintptr_t{0x1234});
+  row.registration_definition=reinterpret_cast<const OrtKernelDef*>(uintptr_t{0x2345});
+  row.creator={NativeBatchCreator,reinterpret_cast<void*>(uintptr_t{0x3456})};return row;
+}
+TEST(M0NativeKernelBatch, EveryRecordAndOriginAreObservedInRequestedOrder){
+  std::vector<uint32_t> records;
+  for(const auto& record:kM0NativeKernelRecordsV2)records.push_back(record.id);
+  InlinedVector<M0NativeProviderKernelBindingV2> rows;std::vector<uint32_t> queried,verified;
+  const auto query=[&](uint32_t abi,uint32_t id,M0NativeProviderKernelBindingV2* out){
+    EXPECT_EQ(abi,2u);queried.push_back(id);*out=NativeBatchRow(id);return 1;
+  };
+  const auto verify=[&](const M0NativeProviderKernelBindingV2& row){verified.push_back(row.record_id);return true;};
+  ASSERT_TRUE(M0CollectNativeKernelsV2(records,query,verify,rows));
+  ASSERT_EQ(rows.size(),42u);EXPECT_EQ(queried,records);EXPECT_EQ(verified,records);
+  for(size_t i=0;i<rows.size();++i){EXPECT_EQ(rows[i].record_id,records[i]);EXPECT_EQ(rows[i].type,kM0NativeKernelRecordsV2[i].type);}
+  records={42,11,1,6};queried.clear();verified.clear();
+  ASSERT_TRUE(M0CollectNativeKernelsV2(records,query,verify,rows));
+  EXPECT_EQ(queried,records);EXPECT_EQ(verified,records);ASSERT_EQ(rows.size(),4u);
+  for(size_t i=0;i<rows.size();++i)EXPECT_EQ(rows[i].record_id,records[i]);
+}
+TEST(M0NativeKernelBatch, InvalidRequestsAreRefusedBeforeAnyProviderQuery){
+  InlinedVector<M0NativeProviderKernelBindingV2> rows{NativeBatchRow(42)};size_t calls=0;
+  const auto query=[&](uint32_t,uint32_t,M0NativeProviderKernelBindingV2*){++calls;return 0;};
+  const auto verify=[](const auto&){return true;};
+  const std::vector<std::vector<uint32_t>> invalid_requests{{},{0},{43},{1,1},std::vector<uint32_t>(43,1)};
+  for(const auto& invalid:invalid_requests){
+    EXPECT_FALSE(M0CollectNativeKernelsV2(invalid,query,verify,rows));
+    EXPECT_EQ(calls,0u);ASSERT_EQ(rows.size(),1u);EXPECT_EQ(rows[0].record_id,42u);
+  }
+}
+TEST(M0NativeKernelBatch, LateRefusalsAndExceptionsNeverPublishPartialSnapshots){
+  const std::vector<uint32_t> records{1,11,42};
+  for(int fault=0;fault<11;++fault){
+    InlinedVector<M0NativeProviderKernelBindingV2> rows{NativeBatchRow(6)};
+    size_t queries=0,origins=0;
+    const auto query=[&](uint32_t,uint32_t id,M0NativeProviderKernelBindingV2* out){
+      ++queries;*out=NativeBatchRow(id);
+      if(id==11){
+        switch(fault){
+        case 0:return 0;case 1:out->abi=1;break;case 2:out->record_id=12;break;
+        case 3:out->type=M0NativeKernelTypeV2::Float32;break;
+        case 4:out->registry=nullptr;break;case 5:out->registration_definition=nullptr;break;
+        case 6:out->creator.callback=nullptr;break;case 7:out->creator.state=nullptr;break;
+        case 9:throw std::runtime_error("provider query failure");default:break;
+        }
+      }
+      return 1;
+    };
+    const auto verify=[&](const auto& row){
+      ++origins;if(row.record_id==11){if(fault==10)throw std::runtime_error("origin failure");if(fault==8)return false;}return true;
+    };
+    if(fault>=9)EXPECT_THROW(M0CollectNativeKernelsV2(records,query,verify,rows),std::runtime_error);
+    else EXPECT_FALSE(M0CollectNativeKernelsV2(records,query,verify,rows));
+    EXPECT_EQ(queries,2u);EXPECT_EQ(origins,(fault>=8&&fault!=9)?2u:1u);
+    ASSERT_EQ(rows.size(),1u);EXPECT_EQ(rows[0].record_id,6u);EXPECT_EQ(rows[0].creator.callback,NativeBatchCreator);
+  }
+}
+
+TEST(M0NativeResourceBatch, BoundedObservationQueriesEveryResourceAndCommitsOnlyCompleteResults){
+  const auto* ep=reinterpret_cast<const OrtEp*>(uintptr_t{0x1234});
+  using Requests=std::vector<std::pair<uintptr_t,uint64_t>>;
+  const Requests requests{{0,0},{10,16},{20,32},{0,0}};
+  InlinedVector<M0NativeResourceBindingV3> rows;size_t calls=0;
+  const auto query=[&](uint32_t abi,const OrtEp* candidate,uintptr_t handle,uint64_t bytes,M0NativeResourceBindingV3* out){
+    EXPECT_EQ(abi,3u);EXPECT_EQ(candidate,ep);++calls;
+    out->abi=3;out->structure_bytes=sizeof(*out);out->ep=reinterpret_cast<uintptr_t>(candidate);
+    out->context=1;out->device=2;out->queue=3;out->handle=handle;out->requested_bytes=bytes;out->generation=handle;
+    return 1;
+  };
+  ASSERT_TRUE(M0CollectNativeResourcesV3(ep,requests,query,rows));ASSERT_EQ(rows.size(),4u);EXPECT_EQ(calls,4u);
+  EXPECT_EQ(rows[1].handle,10u);EXPECT_EQ(rows[2].requested_bytes,32u);
+  Requests maximum(556,{10,16});calls=0;
+  EXPECT_TRUE(M0CollectNativeResourcesV3(ep,maximum,query,rows));EXPECT_EQ(calls,556u);
+  const auto previous=rows.size();maximum.emplace_back(10,16);calls=0;
+  EXPECT_FALSE(M0CollectNativeResourcesV3(ep,maximum,query,rows));EXPECT_EQ(calls,0u);EXPECT_EQ(rows.size(),previous);
+  for(const Requests& invalid:{Requests{},Requests{{0,1}},Requests{{1,0}}}){
+    EXPECT_FALSE(M0CollectNativeResourcesV3(ep,invalid,query,rows));EXPECT_EQ(calls,0u);EXPECT_EQ(rows.size(),previous);
+  }
+  EXPECT_FALSE(M0CollectNativeResourcesV3(nullptr,requests,query,rows));EXPECT_EQ(calls,0u);
+}
+TEST(M0NativeResourceBatch, LateRefusalsForeignRowsAndExceptionsLeaveOutputUnchanged){
+  const auto* ep=reinterpret_cast<const OrtEp*>(uintptr_t{0x1234});
+  const std::vector<std::pair<uintptr_t,uint64_t>> requests{{10,16},{20,32},{30,64}};
+  for(int fault=0;fault<9;++fault){
+    InlinedVector<M0NativeResourceBindingV3> rows(1);rows[0].handle=333;rows[0].generation=987;
+    size_t calls=0;
+    const auto query=[&](uint32_t,const OrtEp*,uintptr_t handle,uint64_t,M0NativeResourceBindingV3* out){
+      out->abi=3;out->structure_bytes=sizeof(*out);out->ep=reinterpret_cast<uintptr_t>(ep);
+      out->context=1;out->device=2;out->queue=3;out->handle=handle;
+      if(++calls==2){switch(fault){
+        case 0:return 0;case 1:out->abi=2;break;case 2:--out->structure_bytes;break;
+        case 3:++out->ep;break;case 4:out->context=0;break;case 5:out->device=0;break;
+        case 6:out->queue=0;break;case 7:++out->handle;break;case 8:throw std::runtime_error("query failure");
+      }}return 1;
+    };
+    if(fault==8)EXPECT_THROW(M0CollectNativeResourcesV3(ep,requests,query,rows),std::runtime_error);
+    else EXPECT_FALSE(M0CollectNativeResourcesV3(ep,requests,query,rows));
+    ASSERT_EQ(rows.size(),1u);EXPECT_EQ(rows[0].handle,333u);EXPECT_EQ(rows[0].generation,987u);EXPECT_EQ(calls,2u);
+  }
+}
+
 SessionOptions NativeLoweringOptions() {
   SessionOptions options;
   options.graph_optimization_level = TransformerLevel::Default;
@@ -64,19 +283,146 @@ class M0NativeLowering : public testing::Test {
     std::ifstream input(path, std::ios::binary | std::ios::ate);
     ASSERT_TRUE(input.is_open());
     ASSERT_EQ(input.tellg(), std::streampos(325532387));
-    original_.resize(325532387);
-    input.seekg(0);
-    input.read(original_.data(), static_cast<std::streamsize>(original_.size()));
-    ASSERT_TRUE(input.good());
+    // Keep the identical original bytes file-backed, like the app's asset map.
+    // A permanent325MB anonymous fixture copy otherwise swaps alongside the
+    // core-owned source snapshot and actual GPU model/work buffers during Run.
+    ASSERT_STATUS_OK(Env::Default().MapFileIntoMemory(ToPathString(path).c_str(),0,325532387,original_));
+    ASSERT_NE(original_.get(),nullptr);
   }
-  static void TearDownTestSuite() { std::string{}.swap(original_); }
+  static void TearDownTestSuite() { original_.reset(); }
   void Load(InferenceSession& session) {
-    ASSERT_STATUS_OK(session.Load(original_.data(), static_cast<int>(original_.size())));
+    ASSERT_STATUS_OK(session.Load(original_.get(),325532387));
   }
-  static std::string original_;
+  static Env::MappedMemoryPtr original_;
+  static void SavePublicPcm(const char* name,const void* data,size_t bytes){
+    const char* directory=std::getenv("TMPDIR");
+    if(!directory||!*directory)return;
+    std::ofstream file(std::filesystem::path(directory)/name,std::ios::binary|std::ios::trunc);
+    ASSERT_TRUE(file.is_open());file.write(static_cast<const char*>(data),static_cast<std::streamsize>(bytes));
+    ASSERT_TRUE(file.good());
+  }
+#if defined(__ANDROID__) && defined(USE_WEBGPU) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
+  void CheckPublicRepeat(M0NativeRepeatInterludeV1 interlude){
+    auto options=NativeLoweringOptions();const char* info=std::getenv("M0_ORT_INFO");
+    if(info&&std::strcmp(info,"1")==0)options.session_log_severity_level=1;
+    InferenceSession session(options,GetEnvironment());ASSERT_NO_FATAL_FAILURE(Load(session));
+    const auto receipt=M0NativeLoweringQualificationV1::RepeatPublicPcm(session,interlude);
+    EXPECT_GT(receipt.physical_capacity,0u);EXPECT_TRUE(receipt.first_retained);
+    EXPECT_TRUE(receipt.checked_idle);EXPECT_TRUE(receipt.interlude_valid);
+    EXPECT_EQ(receipt.difference.nonfinite_expected,0u);EXPECT_EQ(receipt.difference.nonfinite_actual,0u);
+    EXPECT_TRUE(receipt.difference.SameBits())<<receipt.difference;
+    RecordProperty("first_pcm_sha256",model_package::Sha256::HashBytesHex(receipt.first_pcm.data(),receipt.first_pcm.size()));
+    RecordProperty("repeated_pcm_sha256",model_package::Sha256::HashBytesHex(receipt.repeated_pcm.data(),receipt.repeated_pcm.size()));
+    ASSERT_NO_FATAL_FAILURE(SavePublicPcm("gpu-first.f32",receipt.first_pcm.data(),receipt.first_pcm.size()));
+    ASSERT_NO_FATAL_FAILURE(SavePublicPcm("gpu-repeated.f32",receipt.repeated_pcm.data(),receipt.repeated_pcm.size()));
+  }
+#endif
 };
-std::string M0NativeLowering::original_;
+Env::MappedMemoryPtr M0NativeLowering::original_;
+
+#if defined(__ANDROID__) && defined(USE_WEBGPU) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
+class M0NumericTraceIntegration : public M0NativeLowering {};
+TEST_F(M0NumericTraceIntegration, RecordsRealLongShortLongOutputsAfterCheckedQueueCompletion) {
+  ASSERT_NE(std::getenv("M0_GPU_NUMERIC_TRACE"),nullptr);
+  ASSERT_STREQ(std::getenv("M0_GPU_NUMERIC_TRACE"),"1");
+  const char* path=std::getenv("M0_GPU_NUMERIC_TRACE_FILE");ASSERT_NE(path,nullptr);
+  // The controller supplies a fresh process/file. Unrelated previous records
+  // must not be silently accepted as this execution's diagnostics.
+  ASSERT_FALSE(std::filesystem::exists(path));
+  auto options=NativeLoweringOptions();
+  const char* info=std::getenv("M0_ORT_INFO");
+  if(info&&std::strcmp(info,"1")==0)options.session_log_severity_level=1;
+  InferenceSession session(options,GetEnvironment());ASSERT_NO_FATAL_FAILURE(Load(session));
+  const auto receipt=M0NativeLoweringQualificationV1::RepeatPublicPcm(session,M0NativeRepeatInterludeV1::Short);
+  EXPECT_GT(receipt.physical_capacity,0u);EXPECT_TRUE(receipt.first_retained);
+  EXPECT_TRUE(receipt.checked_idle);EXPECT_TRUE(receipt.interlude_valid);
+  ASSERT_NO_FATAL_FAILURE(SavePublicPcm("gpu-first.f32",receipt.first_pcm.data(),receipt.first_pcm.size()));
+  ASSERT_NO_FATAL_FAILURE(SavePublicPcm("gpu-repeated.f32",receipt.repeated_pcm.data(),receipt.repeated_pcm.size()));
+  using Json=nlohmann::json;
+  std::ifstream file(path);ASSERT_TRUE(file.good());
+  std::array<std::map<std::pair<uint64_t,uint64_t>,Json>,3> runs;
+  std::array<size_t,3> starts{},ends{};std::array<uint64_t,3> first_nonfinite{};
+  size_t skipped=0,copy_checks=0;uint64_t first_copy_mismatch=0;std::string line;
+  while(std::getline(file,line)){
+    const auto row=Json::parse(line);const uint64_t run=row.at("run").get<uint64_t>();
+    ASSERT_GE(run,1u);ASSERT_LE(run,3u);const size_t i=run-1;
+    const std::string event=row.at("event").get<std::string>();
+    if(event=="begin"){++starts[i];EXPECT_TRUE(row.at("diagnostic_overhead").get<bool>());continue;}
+    EXPECT_TRUE(row.at("queue_checked").get<bool>());
+    if(event=="end"){
+      ++ends[i];EXPECT_GT(row.at("hashed_outputs").get<size_t>(),0u);
+      EXPECT_LE(row.at("hashed_outputs").get<size_t>(),2048u);
+      EXPECT_EQ(row.at("omitted_outputs").get<size_t>(),0u);continue;
+    }
+    ASSERT_EQ(event,"output");
+    if(row.contains("skip")){++skipped;continue;}
+    if(row.contains("copy_mismatches")){
+      ++copy_checks;
+      if(row.at("copy_mismatches").get<uint64_t>()&&!first_copy_mismatch)
+        first_copy_mismatch=row.at("ordinal").get<uint64_t>();
+      continue;
+    }
+    const auto ordinal=row.at("ordinal").get<uint64_t>(),port=row.at("port").get<uint64_t>();
+    EXPECT_GT(row.at("elements").get<uint64_t>(),0u);
+    if(row.at("nonfinite").get<uint64_t>()&&!first_nonfinite[i])first_nonfinite[i]=ordinal;
+    EXPECT_TRUE(runs[i].emplace(std::make_pair(ordinal,port),row).second);
+  }
+  for(size_t i=0;i<3;++i){EXPECT_EQ(starts[i],1u);EXPECT_EQ(ends[i],1u);EXPECT_FALSE(runs[i].empty());}
+  EXPECT_GT(copy_checks,0u);
+  RecordProperty("first_transpose_copy_mismatch_ordinal",std::to_string(first_copy_mismatch));
+  EXPECT_EQ(first_copy_mismatch,0u)<<"GPU transpose violated exact copy/permutation invariant";
+  EXPECT_GT(skipped,0u); // Non-FP32/extent data must not be interpreted as floats.
+  EXPECT_EQ(runs[0].size(),runs[2].size());
+  uint64_t first_changed=0;
+  for(const auto& [key,left]:runs[0]){
+    const auto found=runs[2].find(key);ASSERT_NE(found,runs[2].end());const auto& right=found->second;
+    EXPECT_EQ(left.at("node_utf8_hex"),right.at("node_utf8_hex"));EXPECT_EQ(left.at("shape"),right.at("shape"));
+    if(!first_changed&&(left.at("xor")!=right.at("xor")||left.at("sum")!=right.at("sum")))first_changed=key.first;
+  }
+  RecordProperty("first_changed_traced_ordinal",std::to_string(first_changed));
+  for(size_t i=0;i<3;++i)RecordProperty("first_nonfinite_traced_run"+std::to_string(i+1),std::to_string(first_nonfinite[i]));
+  RecordProperty("trace_scope","unpaired_fp32_physical_outputs; padding and oversized outputs explicitly skipped");
+  RecordProperty("pcm_difference",receipt.difference.SameBits()?"same_bits":"different_bits_diagnostic_only");
+  // A trace test validates observation. It does not replace the original full
+  // execution/PCM qualification or establish acceptable perceptual quality.
+  EXPECT_EQ(receipt.difference.nonfinite_expected,0u);EXPECT_EQ(receipt.difference.nonfinite_actual,0u);
+}
+#endif
+
 }  // namespace
+
+#if !defined(__ANDROID__)
+TEST_F(M0NativeLowering, OriginalCpuPublicPcmRepeatsAcrossLongShortLong){
+  SessionOptions options;options.execution_mode=ExecutionMode::ORT_SEQUENTIAL;
+  options.intra_op_param.thread_pool_size=1;options.inter_op_param.thread_pool_size=1;
+  InferenceSession session(options,GetEnvironment());ASSERT_NO_FATAL_FAILURE(Load(session));
+  ASSERT_STATUS_OK(session.Initialize());
+  const auto allocator=std::make_shared<CPUAllocator>();
+  const std::array<std::string,3> names{"tokens","style","speed"};
+  const std::array<std::string,1> outputs{"audio"};RunOptions run_options;
+  const auto run=[&](bool short_input){
+    const auto feeds=M0NativePublicInputFixtureV1(allocator,short_input);
+    std::vector<OrtValue> result;
+    ORT_THROW_IF_ERROR(session.Run(run_options,names,feeds,outputs,&result));
+    ORT_ENFORCE(result.size()==1&&result[0].IsTensor()&&result[0].Get<Tensor>().IsDataType<float>(),"CPU original public PCM");
+    return result;
+  };
+  const auto first=run(false);const auto& expected=first[0].Get<Tensor>();
+  ASSERT_GT(expected.SizeInBytes(),0u);
+  const std::string retained(static_cast<const char*>(expected.DataRaw()),expected.SizeInBytes());
+  const auto short_output=run(true);const auto repeated=run(false);const auto& actual=repeated[0].Get<Tensor>();
+  EXPECT_NE(short_output[0].Get<Tensor>().SizeInBytes(),expected.SizeInBytes());
+  const auto difference=M0MeasureNativePcmDifferenceV1(retained.data(),retained.size(),actual.DataRaw(),actual.SizeInBytes());
+  EXPECT_TRUE(difference.SameBits())<<difference;
+  EXPECT_EQ(difference.nonfinite_expected,0u);EXPECT_EQ(difference.nonfinite_actual,0u);
+  EXPECT_EQ(std::memcmp(retained.data(),expected.DataRaw(),retained.size()),0);
+  RecordProperty("cpu_long_samples",std::to_string(expected.Shape().Size()));
+  RecordProperty("cpu_short_samples",std::to_string(short_output[0].Get<Tensor>().Shape().Size()));
+  RecordProperty("first_pcm_sha256",model_package::Sha256::HashBytesHex(retained.data(),retained.size()));
+  ASSERT_NO_FATAL_FAILURE(SavePublicPcm("cpu-first.f32",retained.data(),retained.size()));
+  ASSERT_NO_FATAL_FAILURE(SavePublicPcm("cpu-repeated.f32",actual.DataRaw(),actual.SizeInBytes()));
+}
+#endif
 
 TEST_F(M0NativeLowering, RejectsUnloadedAndOrdinarySessionsWithoutConstructingAReceipt) {
   InferenceSession strict(NativeLoweringOptions(), GetEnvironment());
@@ -299,6 +645,9 @@ TEST_F(M0NativeLowering, AuthenticatedNativeModuleRejectsCoherentMutationOfAllTh
 
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && defined(__ANDROID__) && defined(USE_WEBGPU) && !defined(ORT_MINIMAL_BUILD) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
 namespace onnxruntime::test {
+TEST_F(M0NativeLowering, PublicPcmRepeatsWithoutInterlude){CheckPublicRepeat(M0NativeRepeatInterludeV1::None);}
+TEST_F(M0NativeLowering, PublicPcmRepeatsAcrossShortInterlude){CheckPublicRepeat(M0NativeRepeatInterludeV1::Short);}
+TEST_F(M0NativeLowering, PublicPcmRepeatsAcrossInvalidInterlude){CheckPublicRepeat(M0NativeRepeatInterludeV1::Invalid);}
 TEST_F(M0NativeLowering, ExplicitObservePlanRetainsAuthenticatedPlanAndRefusesBeforeModelAllocationOrKernelConstruction) {
   InferenceSession session(NativeLoweringOptions(), GetEnvironment());
   ASSERT_NO_FATAL_FAILURE(Load(session));
@@ -455,6 +804,22 @@ TEST_F(M0NativeLowering, PrivateInitializationUploadsActualParametersConstructsA
   EXPECT_FALSE(receipt.retired);
 }
 
+TEST_F(M0NativeLowering, SequentialPrivateSessionsRetainAuthenticatedCodeAndRecreateInitializedState){
+  // Same caller thread deliberately remains alive between sessions. Dawn TLS
+  // must not make the next private session look like an unknown foreign load.
+  for(size_t iteration=0;iteration<2;++iteration){
+    SCOPED_TRACE(iteration);
+    InferenceSession session(NativeLoweringOptions(),GetEnvironment());
+    ASSERT_NO_FATAL_FAILURE(Load(session));
+    const auto receipt=M0NativeLoweringQualificationV1::InitializedExecution(session,M0NativeInitializedFaultV1::None);
+    ASSERT_TRUE(receipt.initialized);EXPECT_TRUE(receipt.checked_completion);
+    EXPECT_TRUE(receipt.state_bound);EXPECT_TRUE(receipt.epoch_bound);EXPECT_TRUE(receipt.plan_bound);
+    EXPECT_TRUE(receipt.gpu_parameters);EXPECT_TRUE(receipt.replay_retained);
+    EXPECT_EQ(receipt.uploaded,receipt.expected_initializers);EXPECT_EQ(receipt.unique_resources,receipt.expected_initializers);
+    EXPECT_EQ(receipt.kernels,receipt.nodes);EXPECT_GT(receipt.nodes,0u);EXPECT_FALSE(receipt.retired);
+  }
+}
+
 TEST_F(M0NativeLowering, PrivateInitializedStateRejectsActualParameterPlanAndLateCopyMutationPermanently) {
   for (const auto fault : {M0NativeInitializedFaultV1::InitializerSubstitution,
                            M0NativeInitializedFaultV1::AllocationReuse,
@@ -482,9 +847,14 @@ TEST_F(M0NativeLowering, ObservedPlanCannotBeUpgradedIntoPrivateInitialization) 
 }
 
 TEST_F(M0NativeLowering, ActualNativeRunsRetainLogicalPcmAcrossLongShortFailureLongSequence) {
-  InferenceSession session(NativeLoweringOptions(), GetEnvironment());
+  auto options=NativeLoweringOptions();
+  const char* info=std::getenv("M0_ORT_INFO");
+  if(info&&std::strcmp(info,"1")==0)options.session_log_severity_level=1;
+  InferenceSession session(options, GetEnvironment());
   ASSERT_NO_FATAL_FAILURE(Load(session));
   const auto receipt = M0NativeLoweringQualificationV1::RunSequence(session);
+  EXPECT_TRUE(receipt.device_selected_capacity);
+  EXPECT_GT(receipt.physical_capacity,0u);
   EXPECT_GT(receipt.long_samples, 0u);
   EXPECT_GT(receipt.short_samples, 0u);
   // Distinct token counts alone do not establish that actual GPU D changed.
@@ -519,13 +889,13 @@ TEST_F(M0NativeLowering, ActualNativeRunsRetainLogicalPcmAcrossLongShortFailureL
 #endif
   EXPECT_TRUE(receipt.pointer_output_allocated);
   EXPECT_TRUE(receipt.pointer_empty_wrapper_retained);
-  EXPECT_TRUE(receipt.pointer_empty_wrapper_pcm_equal);
+  EXPECT_TRUE(receipt.pointer_empty_wrapper_pcm_equal)<<receipt.empty_wrapper_difference;
   EXPECT_TRUE(receipt.pointer_refusal_unpublished);
   EXPECT_TRUE(receipt.pointer_preallocated_retained);
-  EXPECT_TRUE(receipt.pointer_preallocated_pcm_equal);
+  EXPECT_TRUE(receipt.pointer_preallocated_pcm_equal)<<receipt.preallocated_difference;
   EXPECT_TRUE(receipt.pointer_preallocated_canaries_retained);
   EXPECT_TRUE(receipt.first_pcm_retained);
-  EXPECT_TRUE(receipt.repeated_pcm_equal);
+  EXPECT_TRUE(receipt.repeated_pcm_equal)<<receipt.repeated_difference;
   EXPECT_TRUE(receipt.original_session_retained);
 }
 }  // namespace onnxruntime::test

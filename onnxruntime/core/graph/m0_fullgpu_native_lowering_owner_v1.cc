@@ -49,7 +49,7 @@ auto CapacityProfile(const M0NativeDeviceLimitsV1& l){
   l.max_workgroup_x,l.max_workgroup_y,l.max_workgroup_z,l.max_invocations,l.max_workgroup_storage,l.max_workgroups);
 }
 constexpr uint64_t kTokenScratchBytes=12ull*512*512*sizeof(float);
-constexpr uint64_t kUniformBytes=512;
+constexpr uint64_t kUniformBytes=kM0NativeUniformBytesV1;
 uint64_t CarrierBytes(uint32_t d){return 128ull*(120ull*d+1)*sizeof(float);}
 // Alignment/recurrence retain whole 640*D inputs. Decoder/tail accumulators
 // use windows; concat and the larger spectral carriers use segmented access.
@@ -134,7 +134,7 @@ uint32_t M0FullGpuNativeLoweringOwnerV1::SelectPhysicalCapacity(M0NativeGpuModul
  LOGS_DEFAULT(INFO)<<"M0_RW07_MEMORY_CAPACITY selected_duration="<<low<<" available_bytes="<<available_bytes
   <<" reserve_bytes="<<kM0MemoryReserveBytesV1<<" future_weight_bytes="<<future_weights
   <<" estimated_live_and_scratch_bytes="<<peak_bytes<<" queued_slack_bytes="<<(queued_slack?peak_bytes:0)
-  <<" planning_budget_bytes="<<planning_budget<<" memory_policy="<<(kM0EnforceMemoryReserveV1?"enforce":"monitor");
+  <<" planning_budget_bytes="<<planning_budget<<" memory_policy="<<(kM0EnforceMemoryReserveV1?"enforce":"monitor")<<" mono_us="<<M0MonotonicMicrosecondsV1();
  return low;
 }
 void M0FullGpuNativeLoweringOwnerV1::ValidatePhysicalCapacity(M0NativeGpuModuleV2& module)const{

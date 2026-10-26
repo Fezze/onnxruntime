@@ -133,6 +133,7 @@ struct OpKernelContext {
     ORT_ENFORCE(input != nullptr, "Required input ", index, " is null");
     return *input;
   }
+  gsl::span<const Tensor> AllocatedOutputs() const { return output_tensors_; }
   Tensor* Output(int index, const TensorShape& shape) {
     if (index < 0 || static_cast<size_t>(index) >= output_tensors_.size()) {
       return nullptr;
@@ -207,68 +208,51 @@ struct OpKernelContext {
   // supplying this context, never from an arbitrary globally visible library.
   // An unavailable/version-mismatched bridge returns zero and denies use.
   uint64_t M0FullGpuExtentOwnerEpochV1() const {
-#if defined(__linux__)
-    if (CurrentOrtApiVersion() < 28) return 0;
-    const auto api_function = Ort::GetApi().KernelContext_GetSyncStream;
-    Dl_info info{};
-    if (!api_function || !dladdr(reinterpret_cast<void*>(api_function), &info) || !info.dli_fname) return 0;
-    void* core = dlopen(info.dli_fname, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
-    if (!core) return 0;
-    using Query = int (ORT_API_CALL*)(const OrtKernelContext*, uint32_t, uint64_t*);
-    auto query = reinterpret_cast<Query>(dlsym(core, "OrtM0FullGpuExtentOwnerEpochV1"));
-    uint64_t epoch = 0;
-    const bool available = query && query(context_.GetOrtKernelContext(), 1, &epoch) == 1;
-    dlclose(core);
-    return available ? epoch : 0;
-#else
-    return 0;
-#endif
+    uint64_t epoch=0;
+    return M0ReadCoreContextValueV1("OrtM0FullGpuExtentOwnerEpochV1",1,epoch)?epoch:0;
   }
 
   uint64_t M0FullGpuExtentRunIdV2() const {
-#if defined(__linux__)
-    if (CurrentOrtApiVersion() < 28) return 0;
-    const auto api_function = Ort::GetApi().KernelContext_GetSyncStream;
-    Dl_info info{};
-    if (!api_function || !dladdr(reinterpret_cast<void*>(api_function), &info) || !info.dli_fname) return 0;
-    void* core = dlopen(info.dli_fname, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
-    if (!core) return 0;
-    using Query = int (ORT_API_CALL*)(const OrtKernelContext*, uint32_t, uint64_t*);
-    auto query = reinterpret_cast<Query>(dlsym(core, "OrtM0FullGpuExtentRunIdV2"));
-    uint64_t run_id = 0;
-    const bool available = query && query(context_.GetOrtKernelContext(), 2, &run_id) == 1;
-    dlclose(core);
-    return available ? run_id : 0;
-#else
-    return 0;
-#endif
+    uint64_t run_id=0;
+    return M0ReadCoreContextValueV1("OrtM0FullGpuExtentRunIdV2",2,run_id)?run_id:0;
   }
 
   bool M0ReadCancellationV1(uint32_t& cancelled) const noexcept {
+    uint32_t pending=0;
+    if(!M0ReadCoreContextValueV1("OrtM0FullGpuReadCancellationV1",1,pending)||pending>1)return false;
+    cancelled=pending;
+    return true;
+  }
+
+ private:
+  template<class Value>
+  bool M0ReadCoreContextValueV1(const char* symbol,uint32_t version,Value& value) const noexcept {
 #if defined(__linux__)
     if(CurrentOrtApiVersion()<28)return false;
     const auto api_function=Ort::GetApi().KernelContext_GetSyncStream;
     Dl_info api_info{};
     if(!api_function||!dladdr(reinterpret_cast<void*>(api_function),&api_info)||!api_info.dli_fname)return false;
     void* core=dlopen(api_info.dli_fname,RTLD_NOW|RTLD_LOCAL|RTLD_NOLOAD);
+    // Qualification links the actual core into a PIE executable. Android does
+    // not reopen that executable by filename; resolve its exported ABI through
+    // the main-program handle, with the same exact API-module origin check.
+    if(!core)core=dlopen(nullptr,RTLD_NOW|RTLD_LOCAL);
     if(!core)return false;
-    using Query=int (ORT_API_CALL*)(const OrtKernelContext*,uint32_t,uint32_t*) noexcept;
-    auto query=reinterpret_cast<Query>(dlsym(core,"OrtM0FullGpuReadCancellationV1"));
-    Dl_info query_info{};uint32_t pending=0;
+    using Query=int (ORT_API_CALL*)(const OrtKernelContext*,uint32_t,Value*) noexcept;
+    auto query=reinterpret_cast<Query>(dlsym(core,symbol));
+    Dl_info query_info{};Value pending=0;
     const bool available=query&&dladdr(reinterpret_cast<void*>(query),&query_info)&&
         query_info.dli_fbase==api_info.dli_fbase&&
-        query(context_.GetOrtKernelContext(),1,&pending)==1&&pending<=1;
+        query(context_.GetOrtKernelContext(),version,&pending)==1;
     dlclose(core);
     if(!available)return false;
-    cancelled=pending;
+    value=pending;
     return true;
 #else
-    (void)cancelled;
+    (void)symbol;(void)version;(void)value;
     return false;
 #endif
   }
-
- private:
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(OpKernelContext);
   Ort::KernelContext context_;
   const OpKernel& op_kernel_;

@@ -4,12 +4,15 @@
 #include "core/providers/webgpu/rnn/lstm.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <limits>
 #include <string>
 #include <vector>
 
 #include "core/providers/webgpu/shader_helper.h"
+#include "core/providers/webgpu/tensor/transpose.h"
+#include "core/common/m0_observation_options_v1.h"
 #include "core/providers/webgpu/webgpu_supported_types.h"
 
 #if defined(__ANDROID__) && defined(ORT_USE_EP_API_ADAPTERS) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
@@ -197,10 +200,14 @@ Status LstmCellProgram::GenerateShaderCode(ShaderHelper& shader) const {
   }
   body << "  for (var k: u32 = 0u; k < I; k++) {\n"
        << "    let xv = f32(x[x_base + k]);\n"
-       << "    gate_i += xv * f32(w[w_base + j * I + k]);\n"
-       << "    gate_o += xv * f32(w[w_base + (H + j) * I + k]);\n"
-       << "    gate_f += xv * f32(w[w_base + (2u * H + j) * I + k]);\n"
-       << "    gate_c += xv * f32(w[w_base + (3u * H + j) * I + k]);\n"
+       << "    gate_i += xv * f32(w["
+       << (coalesced_weights_ ? "w_base + k * 4u * H + j" : "w_base + j * I + k") << "]);\n"
+       << "    gate_o += xv * f32(w["
+       << (coalesced_weights_ ? "w_base + k * 4u * H + (H + j)" : "w_base + (H + j) * I + k") << "]);\n"
+       << "    gate_f += xv * f32(w["
+       << (coalesced_weights_ ? "w_base + k * 4u * H + (2u * H + j)" : "w_base + (2u * H + j) * I + k") << "]);\n"
+       << "    gate_c += xv * f32(w["
+       << (coalesced_weights_ ? "w_base + k * 4u * H + (3u * H + j)" : "w_base + (3u * H + j) * I + k") << "]);\n"
        << "  }\n\n";
 
   // H_prev * R^T  (h_prev always [batch, H] - flat indexing)
@@ -208,10 +215,14 @@ Status LstmCellProgram::GenerateShaderCode(ShaderHelper& shader) const {
        << "  let h_base = batch_idx * H;\n"
        << "  for (var k: u32 = 0u; k < H; k++) {\n"
        << "    let hv = f32(h_prev[h_base + k]);\n"
-       << "    gate_i += hv * f32(r[r_base + j * H + k]);\n"
-       << "    gate_o += hv * f32(r[r_base + (H + j) * H + k]);\n"
-       << "    gate_f += hv * f32(r[r_base + (2u * H + j) * H + k]);\n"
-       << "    gate_c += hv * f32(r[r_base + (3u * H + j) * H + k]);\n"
+       << "    gate_i += hv * f32(r["
+       << (coalesced_weights_ ? "r_base + k * 4u * H + j" : "r_base + j * H + k") << "]);\n"
+       << "    gate_o += hv * f32(r["
+       << (coalesced_weights_ ? "r_base + k * 4u * H + (H + j)" : "r_base + (H + j) * H + k") << "]);\n"
+       << "    gate_f += hv * f32(r["
+       << (coalesced_weights_ ? "r_base + k * 4u * H + (2u * H + j)" : "r_base + (2u * H + j) * H + k") << "]);\n"
+       << "    gate_c += hv * f32(r["
+       << (coalesced_weights_ ? "r_base + k * 4u * H + (3u * H + j)" : "r_base + (3u * H + j) * H + k") << "]);\n"
        << "  }\n\n";
 
   // c_prev (flat [batch, H])
@@ -460,6 +471,20 @@ Status Lstm::ComputeInternal(ComputeContext& context) const {
   bool split_y = static_cast<uint32_t>(cell_bindings) > binding_limit && has_Y;
   bool cell_has_Y = has_Y && !split_y;
 
+  // Neighboring lanes compute neighboring hidden units. The original row-major
+  // gate rows stride I/H between lanes at every dot-product iteration. Transpose
+  // only the immutable GPU weight views; arithmetic and timestep order are unchanged.
+  Tensor coalesced_w, coalesced_r;
+  const bool coalesced_weights=M0CoalescedRecurrenceWeightsV1()&&X->IsDataType<float>()&&seq_length>1;
+  const Tensor* cell_w=W;const Tensor* cell_r=R;
+  if(coalesced_weights){
+    coalesced_w=context.CreateGPUTensor(W->DataType(),TensorShape{num_directions,input_size,4*hidden_size_});
+    coalesced_r=context.CreateGPUTensor(R->DataType(),TensorShape{num_directions,hidden_size_,4*hidden_size_});
+    const std::array<size_t,3> permutation{0,2,1};
+    ORT_RETURN_IF_ERROR(Transpose::DoTranspose(context,permutation,*W,coalesced_w));
+    ORT_RETURN_IF_ERROR(Transpose::DoTranspose(context,permutation,*R,coalesced_r));
+    cell_w=&coalesced_w;cell_r=&coalesced_r;
+  }
   for (int dir = 0; dir < num_directions; dir++) {
     std::string fa = ActivationToWgslFn(activations_[dir * 3 + 0]);
     std::string ga = ActivationToWgslFn(activations_[dir * 3 + 1]);
@@ -508,18 +533,18 @@ Status Lstm::ComputeInternal(ComputeContext& context) const {
 
       LstmCellProgram program{B != nullptr, P != nullptr, cell_has_Y, has_seq_lens,
                               input_forget_ != 0, clip_ > 0.0f,
-                              static_cast<int>(layout_), fa, ga, ha};
+                              static_cast<int>(layout_), fa, ga, ha, coalesced_weights};
 
       program.CacheHint(std::to_string(B != nullptr), std::to_string(P != nullptr),
                         std::to_string(cell_has_Y), std::to_string(has_seq_lens),
                         std::to_string(input_forget_ != 0), std::to_string(clip_ > 0.0f),
-                        std::to_string(layout_), fa, ga, ha);
+                        std::to_string(layout_), fa, ga, ha, std::to_string(coalesced_weights));
 
       program.SetWorkgroupSize(wg_size).SetDispatchGroupSize(num_groups);
 
       program.AddInputs({{X, ProgramTensorMetadataDependency::Type}})
-          .AddInputs({{W, ProgramTensorMetadataDependency::Type}})
-          .AddInputs({{R, ProgramTensorMetadataDependency::Type}})
+          .AddInputs({{cell_w, ProgramTensorMetadataDependency::Type}})
+          .AddInputs({{cell_r, ProgramTensorMetadataDependency::Type}})
           .AddInputs({{h_read, ProgramTensorMetadataDependency::Type}})
           .AddInputs({{c_read, ProgramTensorMetadataDependency::Type}});
       if (B != nullptr) program.AddInputs({{B, ProgramTensorMetadataDependency::Type}});

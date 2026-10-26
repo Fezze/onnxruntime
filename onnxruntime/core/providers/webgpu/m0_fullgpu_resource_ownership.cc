@@ -1,5 +1,6 @@
 #include "core/providers/webgpu/m0_fullgpu_resource_ownership.h"
 #include "core/providers/webgpu/m0_fullgpu_extent_abi2.h"
+#include "core/common/m0_observation_options_v1.h"
 #include <atomic>
 #include <limits>
 #include <stdexcept>
@@ -63,6 +64,7 @@ M0FullGpuResourceStatisticsV1 M0FullGpuResourceOwnership::Statistics() const {
 }
 
 uint64_t M0FullGpuResourceOwnership::RecordWorkload(M0WorkloadEventV1 event,uint64_t value,uint64_t auxiliary) {
+  if (!M0WorkloadObservationsV1()) return 1;
   std::lock_guard<std::mutex> lock{mutex_};
   auto& s=statistics_;
   auto add=[&](uint64_t& field,uint64_t amount){AddObserved(field,amount,s.counters_saturated);};
@@ -78,6 +80,7 @@ uint64_t M0FullGpuResourceOwnership::RecordWorkload(M0WorkloadEventV1 event,uint
   return 0;
 }
 void M0FullGpuResourceOwnership::LogWorkload(const char* phase) const {
+  if (!M0WorkloadObservationsV1()) return;
   const auto s=Statistics();
   LOGS_DEFAULT(INFO)<<"M0_RW07_WORKLOAD phase="<<phase
     <<" live_requested_bytes="<<s.live_requested_bytes<<" peak_live_requested_bytes="<<s.peak_live_requested_bytes

@@ -1364,6 +1364,16 @@ endif()
 
 onnxruntime_apply_test_target_workarounds(onnxruntime_test_all)
 
+if(ANDROID AND onnxruntime_M0_DESCRIPTOR_QUALIFICATION AND onnxruntime_USE_WEBGPU
+    AND NOT onnxruntime_MINIMAL_BUILD AND NOT onnxruntime_WEBGPU_STATIC_PLUGIN)
+  # The plugin receives this executable's actual OrtApi. Its private context ABI
+  # must resolve to that same core, just as it does in the shared-library app.
+  foreach(symbol IN ITEMS OrtM0FullGpuExtentOwnerEpochV1 OrtM0FullGpuExtentRunIdV2 OrtM0FullGpuReadCancellationV1)
+    target_link_options(onnxruntime_test_all PRIVATE
+      "LINKER:--export-dynamic-symbol=${symbol}" "LINKER:--undefined=${symbol}")
+  endforeach()
+endif()
+
 if(NOT onnxruntime_MINIMAL_BUILD AND NOT CMAKE_CROSSCOMPILING
   AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
   foreach(fixture IN ITEMS valid missing_export)

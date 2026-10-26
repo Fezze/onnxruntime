@@ -2,7 +2,9 @@
 // Licensed under the MIT License.
 #pragma once
 
+#include "core/common/m0_observation_options_v1.h"
 #include <array>
+#include <algorithm>
 #include <charconv>
 #include <cstdio>
 #include <cstdint>
@@ -18,8 +20,44 @@ inline constexpr bool kM0EnforceMemoryReserveV1 = true;
 #else
 inline constexpr bool kM0EnforceMemoryReserveV1 = false;
 #endif
+// Monitor mode observes at most one allocation MiB or ten milliseconds apart.
+// Enforced reserve checks bypass this sampler; it grants no allocation authority.
+class M0MemoryProbeWindowV1 final {
+ public:
+  static constexpr uint64_t kBytes = 1024 * 1024;
+  static constexpr uint64_t kNanoseconds = 10 * 1000 * 1000;
+  bool Probe(uint64_t now, uint64_t bytes, bool enforce = kM0EnforceMemoryReserveV1) {
+    if(enforce)return true;
+    const bool due = !initialized_ || now < last_ || now - last_ >= kNanoseconds ||
+        bytes >= kBytes - accumulated_;
+    if (due) { initialized_ = true; last_ = now; accumulated_ = 0; return true; }
+    accumulated_ += bytes;
+    return false;
+  }
+  void Reset() { initialized_ = false; last_ = accumulated_ = 0; }
+ private:
+  bool initialized_ = false;
+  uint64_t last_ = 0, accumulated_ = 0;
+};
 inline bool M0MemoryHeadroomV1(uint64_t available, uint64_t additional) {
   return available >= kM0MemoryReserveBytesV1 && additional <= available - kM0MemoryReserveBytesV1;
+}
+// Monitor mode may use the warning reserve. Waiting for the queue merely
+// because that optional reserve is crossed repeatedly serializes execution;
+// drain only when the upcoming allocation itself exceeds observed free memory.
+inline bool M0MemoryPressureNeedsDrainV1(uint64_t available,uint64_t additional,
+                                        bool enforce=kM0EnforceMemoryReserveV1) {
+  return enforce?!M0MemoryHeadroomV1(available,additional):additional>available;
+}
+// Queue references retain already allocated buffers. A warning reserve must not
+// collapse the monitor queue to less than a normal command's working set.
+inline uint64_t M0SubmissionBudgetV1(uint64_t device_limit,uint64_t available,bool reading_valid,
+                                   bool enforce=kM0EnforceMemoryReserveV1) {
+  if(enforce){
+    if(!reading_valid||available<=kM0MemoryReserveBytesV1)return 0;
+    return std::min(device_limit,std::max<uint64_t>(1,(available-kM0MemoryReserveBytesV1)/2));
+  }
+  return std::min(device_limit,std::max<uint64_t>(64ull*1024*1024,reading_valid?available/8:0));
 }
 // Select a planning target, never an execution permission in monitor mode.
 inline uint64_t M0MemoryPlanningBudgetV1(uint64_t available, uint64_t future, uint64_t minimum,
@@ -84,6 +122,7 @@ inline common::Status M0ReadMemoryAvailableV1(uint64_t& output) {
 // Android shares physical memory with the GPU. This is a current availability
 // observation before allocation, not GPU residency or an OS reservation.
 inline common::Status M0CheckMemoryReserveV1(uint64_t additional_bytes) {
+  if (!kM0EnforceMemoryReserveV1 && !M0MemoryObservationsV1()) return common::Status::OK();
 #if defined(__ANDROID__)
   uint64_t available_bytes = 0;
   const auto reading = M0ReadMemoryAvailableV1(available_bytes);

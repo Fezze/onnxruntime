@@ -660,7 +660,25 @@ Status WebGpuContext::EncodeDeferredDispatches(CommandRecordingState& recording)
   return result;
 }
 
-Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& program) {
+Status WebGpuContext::RunWithCheckedCompletion(ComputeContextBase& context, const ProgramBase& program) {
+  const auto& buffers = ComputeContextBase::BufferManagerAccessor::Get(context);
+  auto& recording = ComputeContextBase::BufferManagerAccessor::GetRecording(context);
+  const auto annotate = [&program](const Status& status, const char* phase) {
+    if (status.IsOK()) return status;
+    return Status(status.Category(), status.Code(),
+                  std::string{"WebGPU checked program "} + phase + " [" + program.Name() + "]: " +
+                      status.ErrorMessage());
+  };
+  // Wait even when the recording is empty: an ordinary automatic Flush may
+  // have submitted prior work without waiting for its queue completion.
+  ORT_RETURN_IF_ERROR(annotate(FlushAndWaitChecked(buffers, recording), "prior work"));
+  // Recheck cancellation after the prior queue wait, through the actual caller.
+  ORT_RETURN_IF_ERROR(annotate(context.RunProgram(program), "enqueue"));
+  return annotate(FlushAndWaitChecked(buffers, recording), "completion");
+}
+
+Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& program, uint64_t scheduled_products) {
+  ORT_RETURN_IF_NOT(scheduled_products<=kM0ScheduledProductsPerWindowV1,"RW07 dispatch scheduled-work limit");
   const auto& inputs = program.Inputs();
   const auto& outputs = program.Outputs();
 
@@ -947,17 +965,42 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
 
   ORT_RETURN_IF_NOT(uniform_buffer_total_size <= device_limits_.maxUniformBufferBindingSize,
                     "WebGPU uniform structure exceeds the device uniform binding limit.");
+  ORT_RETURN_IF_NOT(!recording.m0_submission_budget_bytes||uniform_buffer_total_size<=kM0NativeUniformBytesV1,
+                    "RW07_NATIVE_UNIFORM_ENVELOPE");
   WGPUBuffer uniform_buffer = nullptr;
+  uint64_t uniform_offset=0;
+  std::shared_ptr<webgpu::M0UniformUploadBatchV1> uniform_batch;
   if (uniform_buffer_total_size > 0) {
     std::vector<uint8_t> uniform_data_buffer(uniform_buffer_total_size);
-
     for (auto const& [uniform, offset] : uniform_and_offsets) {
       memcpy(uniform_data_buffer.data() + offset, uniform.data.data(), uniform.data.size());
     }
-
-    uniform_buffer = buffer_mgr.Create(recording, uniform_buffer_total_size,
-                                       wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::Uniform);
-    device_queue_.WriteBuffer(uniform_buffer, 0, uniform_data_buffer.data(), uniform_buffer_total_size);
+    const uint64_t alignment=device_limits_.minUniformBufferOffsetAlignment;
+    const uint64_t arena_capacity=std::min<uint64_t>(webgpu::M0UniformPackingV1::kMaximumBytes,
+        device_limits_.maxBufferSize/16*16);
+    const bool use_arena=recording.m0_submission_budget_bytes&&M0BatchHeavyProgramsV1()&&
+        recording.graph_capture_state==GraphCaptureState::Default && &buffer_mgr==buffer_mgr_.get()&&
+        alignment&&alignment%4==0&&uniform_buffer_total_size<=arena_capacity;
+    if(use_arena){
+      uniform_batch=recording.m0_uniform_current;
+      if(!uniform_batch||!uniform_batch->packing.CanAppend(uniform_buffer_total_size,size_t(alignment))){
+        if(uniform_batch){
+          ORT_RETURN_IF_ERROR(FlushAndWaitChecked(buffer_mgr,recording));
+          uniform_batch.reset();
+        }
+        // Allocation may drain an older window. Publish the new block only afterward.
+        auto raw=buffer_mgr.Create(recording,size_t(arena_capacity),wgpu::BufferUsage::CopyDst|wgpu::BufferUsage::Uniform);
+        auto rollback=gsl::finally([&](){if(raw)buffer_mgr.Release(raw,&recording);});
+        uniform_batch=std::make_shared<webgpu::M0UniformUploadBatchV1>(buffer_mgr,recording,raw,size_t(arena_capacity));
+        raw=nullptr;
+        recording.m0_uniform_current=uniform_batch;
+      }
+      uniform_offset=uniform_batch->packing.Append(uniform_data_buffer.data(),uniform_buffer_total_size,size_t(alignment));
+      uniform_buffer=uniform_batch->buffer;
+    }else{
+      uniform_buffer=buffer_mgr.Create(recording,uniform_buffer_total_size,wgpu::BufferUsage::CopyDst|wgpu::BufferUsage::Uniform);
+      device_queue_.WriteBuffer(uniform_buffer,0,uniform_data_buffer.data(),uniform_buffer_total_size);
+    }
   }
 
   const size_t total_buffer_count =
@@ -993,7 +1036,7 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
   if (uniform_buffer) {
     bind_buffers.push_back(uniform_buffer);
     bind_buffers_segments.push_back(1);  // uniform buffer defaults to 1 segment
-    bind_buffer_offsets.push_back(0);
+    bind_buffer_offsets.push_back(uniform_offset);
     bind_buffer_sizes.push_back(0);
   }
 
@@ -1005,8 +1048,9 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
   command.bind_group = CreateBindGroup(bind_buffers, bind_buffers_segments, bind_buffer_offsets, bind_buffer_sizes, uniform_buffer_total_size,
                                        bind_group_layout, program.Name());
   command.pending_build = std::move(pending_build);
+  command.m0_uniform_upload=uniform_batch;
   recording.has_unsubmitted_work.store(true, std::memory_order_relaxed);
-  if (uniform_buffer) {
+  if (uniform_buffer&&!uniform_batch) {
     // The bind group owns a reference now, so return the allocator's reference immediately.
     buffer_mgr.Release(uniform_buffer, &recording);
   }
@@ -1021,6 +1065,17 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
                                         key, inputs, outputs);
   }
   if(recording.m0_submission_budget_bytes){
+    ORT_RETURN_IF_NOT(recording.m0_queued_scheduled_products<=kM0ScheduledProductsPerWindowV1,
+                      "RW07 queued scheduled-work state");
+    if(scheduled_products>kM0ScheduledProductsPerWindowV1-recording.m0_queued_scheduled_products)
+      ORT_RETURN_IF_ERROR(FlushAndWaitChecked(buffer_mgr,recording));
+    if(M0BatchHeavyProgramsV1()){
+      std::vector<webgpu::M0QueuedBufferBudgetV1::Reference> references;
+      references.reserve(bind_buffers.size()+1);
+      for(const auto buffer:bind_buffers)references.emplace_back(reinterpret_cast<uintptr_t>(buffer),wgpuBufferGetSize(buffer));
+      if(command.indirect_buffer)references.emplace_back(reinterpret_cast<uintptr_t>(command.indirect_buffer),wgpuBufferGetSize(command.indirect_buffer));
+      ORT_RETURN_IF_ERROR(M0BeforeEnqueueUniqueV1(buffer_mgr,recording,references));
+    }else{
     uint64_t reference_bytes=0;
     const auto add_reference=[&](WGPUBuffer buffer){
       const uint64_t bytes=wgpuBufferGetSize(buffer);
@@ -1033,8 +1088,16 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
     // Construct the bind group first: draining earlier pipeline builds may
     // invalidate pointers into their deferred commands.
     ORT_RETURN_IF_ERROR(M0BeforeEnqueueV1(buffer_mgr,recording,reference_bytes));
+    }
+    // Byte admission may itself drain the queue. Charge new work only afterward.
+    recording.m0_queued_scheduled_products+=scheduled_products;
   }
   recording.has_unsubmitted_work.store(true,std::memory_order_relaxed);
+  // Admission above may have sealed/released the recording's current block.
+  // The command's own reference preserves its bytes until its eventual Submit.
+  if(uniform_batch&&(recording.m0_uniform_batches.empty()||recording.m0_uniform_batches.back()!=uniform_batch))
+    recording.m0_uniform_batches.push_back(uniform_batch);
+  ORT_RETURN_IF_NOT(recording.m0_uniform_batches.size()<=2,"RW07 uniform recording block bound");
   recording.deferred_dispatches.push_back(std::move(command));
 
   // Drain and submit a full window to bound both recorded and encoded dispatch state. Partial
@@ -1240,8 +1303,6 @@ void WebGpuContext::StartProfiling() {
   // profiling_start_time_ is supplied separately via SetProfilingStartTime, which is
   // driven by WebGpuProfiler::StartProfiling and carries the ORT profiler's CPU time
   // base for both session-level and run-level profiling.
-  gpu_timestamp_offset_ = 0;
-  profiling_first_submit_cpu_offset_us_ = -1;
 
   const uint32_t query_count = max_num_pending_dispatches_ * 2;
 
@@ -1265,13 +1326,6 @@ void WebGpuContext::StartProfiling() {
 
 void WebGpuContext::CollectProfilingData(profiling::Events& events) {
   if (!pending_queries_.empty()) {
-    // Shift GPU timestamps (which start from 0 at the first submit) onto the ORT
-    // profiler's CPU timeline by adding the CPU elapsed time from profiling_start_time_
-    // to that first submit. This keeps GPU events aligned with ORT CPU events.
-    int64_t cpu_offset_us = profiling_first_submit_cpu_offset_us_ > 0
-                                ? profiling_first_submit_cpu_offset_us_
-                                : 0;
-
     for (const auto& pending_query : pending_queries_) {
       const auto& pending_kernels = pending_query.kernels;
       const auto& query_read_buffer = pending_query.query_buffer;
@@ -1301,6 +1355,8 @@ void WebGpuContext::CollectProfilingData(profiling::Events& events) {
                   static_cast<int>(map_async_result.status), ", message: ", map_async_result.message);
 
       auto mapped_data = static_cast<const uint64_t*>(query_read_buffer.GetConstMappedRange());
+      uint64_t origin=UINT64_MAX;
+      for(size_t i=0;i<pending_kernels.size();++i)origin=std::min(origin,mapped_data[i*2]);
 
       for (size_t i = 0; i < pending_kernels.size(); i++) {
         const PendingKernelInfo& pending_kernel_info = pending_kernels[i];
@@ -1315,23 +1371,24 @@ void WebGpuContext::CollectProfilingData(profiling::Events& events) {
           shapes << "outputs[" << s << "] = " << output_shapes[s].ToString() << " ";
         }
 
-        if (gpu_timestamp_offset_ == 0) {
-          gpu_timestamp_offset_ = mapped_data[i * 2];
-        }
-        uint64_t start_time = mapped_data[i * 2] - gpu_timestamp_offset_;
-        uint64_t end_time = mapped_data[i * 2 + 1] - gpu_timestamp_offset_;
+        int64_t timestamp_us=pending_query.cpu_offset_us,duration_us=0;
+        const bool valid_interval=M0DecodeGpuTimestampIntervalV1(mapped_data[i*2],mapped_data[i*2+1],
+            origin,pending_query.cpu_offset_us,timestamp_us,duration_us);
 
         InlinedHashMap<std::string, std::string> event_args = {
             {"shapes", SS_GET(shapes)},
             {"cache_key", pending_kernel_info.cache_key},
+            {"timing_valid",valid_interval?"true":"false"},
+            {"timestamp_origin","per_submission_gpu_counter"},
+            {"cpu_alignment","submission_invocation_approximation"},
         };
 
         profiling::EventRecord event(profiling::API_EVENT,
                                      -1,
                                      -1,
                                      pending_kernel_info.name,
-                                     static_cast<int64_t>(std::round(start_time / 1000.0)) + cpu_offset_us,
-                                     static_cast<int64_t>(std::round((end_time - start_time) / 1000.0)),
+                                     timestamp_us,
+                                     duration_us,
                                      event_args);
         events.emplace_back(std::move(event));
       }
@@ -1436,20 +1493,22 @@ Status WebGpuContext::CheckDeviceStatus() const {
 Status WebGpuContext::M0DrainOnMemoryPressureV1(const webgpu::BufferManager& buffer_mgr,
                                               CommandRecordingState& recording,
                                               uint64_t allocation_bytes) {
-  if (!recording.m0_submission_budget_bytes ||
-      !recording.has_unsubmitted_work.load(std::memory_order_relaxed)) return Status::OK();
+  if (!recording.m0_submission_budget_bytes) return M0CheckMemoryReserveV1(allocation_bytes);
   ORT_RETURN_IF_NOT(M0BoundedSubmissionsActiveV1() && !M0OwnershipV2().Poisoned(),
                     "RW07 native allocation recording inactive or poisoned");
+  const auto now=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count());
+  if(!m0_memory_probe_window_.Probe(now,allocation_bytes)) return Status::OK();
   uint64_t available=0;
   const auto reading=M0ReadMemoryAvailableV1(available);
-  if(!reading.IsOK())return M0CheckMemoryReserveV1(allocation_bytes);
-  if(M0MemoryHeadroomV1(available,allocation_bytes))return Status::OK();
-  // Drain our own queued references under pressure; monitor mode then continues.
-  LOGS_DEFAULT(INFO) << "M0_RW07_MEMORY_PRESSURE_DRAIN phase=begin allocation_bytes=" << allocation_bytes
-                     << " queued_reference_bytes=" << recording.m0_queued_reference_bytes;
-  ORT_RETURN_IF_ERROR(FlushAndWaitChecked(buffer_mgr, recording));
-  LOGS_DEFAULT(INFO) << "M0_RW07_MEMORY_PRESSURE_DRAIN phase=done allocation_bytes=" << allocation_bytes;
-  return Status::OK();
+  if(reading.IsOK() && M0MemoryPressureNeedsDrainV1(available,allocation_bytes) &&
+      recording.has_unsubmitted_work.load(std::memory_order_relaxed)) {
+    LOGS_DEFAULT(INFO) << "M0_RW07_MEMORY_PRESSURE_DRAIN phase=begin allocation_bytes=" << allocation_bytes
+                       << " queued_reference_bytes=" << recording.m0_queued_reference_bytes;
+    ORT_RETURN_IF_ERROR(FlushAndWaitChecked(buffer_mgr, recording));
+    LOGS_DEFAULT(INFO) << "M0_RW07_MEMORY_PRESSURE_DRAIN phase=done allocation_bytes=" << allocation_bytes;
+  }
+  return M0CheckMemoryReserveV1(allocation_bytes);
 }
 
 Status WebGpuContext::M0BeforeEnqueueV1(const webgpu::BufferManager& buffer_mgr,
@@ -1467,10 +1526,25 @@ Status WebGpuContext::M0BeforeEnqueueV1(const webgpu::BufferManager& buffer_mgr,
   return Status::OK();
 }
 
+Status WebGpuContext::M0BeforeEnqueueUniqueV1(const webgpu::BufferManager& buffer_mgr,
+                                            CommandRecordingState& recording,
+                                            const std::vector<webgpu::M0QueuedBufferBudgetV1::Reference>& references) {
+  ORT_RETURN_IF_NOT(recording.m0_submission_budget_bytes&&M0BoundedSubmissionsActiveV1()&&!M0OwnershipV2().Poisoned(),
+                    "RW07 unique queued buffer profile inactive or poisoned");
+  auto& retained=recording.m0_unique_queued_buffers;
+  if(retained.NeedsDrain(recording.m0_submission_budget_bytes,references)){
+    ORT_RETURN_IF_ERROR(FlushAndWaitChecked(buffer_mgr,recording));
+  }
+  retained.Track(references);
+  recording.m0_queued_reference_bytes=retained.Bytes();
+  return Status::OK();
+}
+
 Status WebGpuContext::M0FlushIfBudgetReachedV1(const webgpu::BufferManager& buffer_mgr,
                                              CommandRecordingState& recording){
   if(recording.m0_submission_budget_bytes&&
-      recording.m0_queued_reference_bytes>=recording.m0_submission_budget_bytes)
+      (recording.m0_queued_reference_bytes>=recording.m0_submission_budget_bytes||
+       recording.m0_queued_scheduled_products>=kM0ScheduledProductsPerWindowV1))
     return FlushAndWaitChecked(buffer_mgr,recording);
   return Status::OK();
 }
@@ -1556,7 +1630,7 @@ Status WebGpuContext::FlushAndWaitChecked(const webgpu::BufferManager& buffer_mg
   record_failure(CheckDeviceStatus());
   if(recording.m0_submission_budget_bytes&&M0OwnershipV2().Poisoned())
     record_failure(ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07 native submission context already poisoned"));
-  if(result.IsOK())recording.m0_queued_reference_bytes=0;
+  if(result.IsOK()){recording.m0_queued_reference_bytes=0;recording.m0_queued_scheduled_products=0;recording.m0_unique_queued_buffers.Reset();}
   else if(recording.m0_submission_budget_bytes)M0OwnershipV2().Poison();
   return result;
 }
@@ -1571,6 +1645,18 @@ Status WebGpuContext::Flush(const webgpu::BufferManager& buffer_mgr,
       buffer_mgr_->RefreshPendingBuffers(recording, GraphCaptureState::Default);
     }
   };
+
+  auto release_uniforms=gsl::finally([&](){recording.M0ReleaseUniformUploadsV1();});
+  for(const auto& batch:recording.m0_uniform_batches){
+    if(!batch->packing.Sealed()){
+      const auto& bytes=batch->packing.Bytes();
+      ORT_RETURN_IF_NOT(!bytes.empty(),"RW07 empty uniform upload block");
+      device_queue_.WriteBuffer(batch->buffer,0,bytes.data(),bytes.size());
+      batch->packing.Seal();
+      ++recording.m0_uniform_arena_uploads;
+      recording.m0_uniform_arena_bytes+=bytes.size();
+    }
+  }
 
   Status status = EncodeDeferredDispatches(recording);
   if (!recording.command_encoder) {
@@ -1593,12 +1679,6 @@ Status WebGpuContext::Flush(const webgpu::BufferManager& buffer_mgr,
                 "Number of pending dispatches (", recording.num_pending_dispatches,
                 ") does not match pending kernels size (", recording.pending_kernels.size(), ")");
 
-    // Capture the CPU elapsed time from the ORT profiler's start to this first submit.
-    // Used in CollectProfilingData to offset GPU timestamps onto the ORT CPU timeline.
-    if (profiling_first_submit_cpu_offset_us_ < 0) {
-      profiling_first_submit_cpu_offset_us_ = TimeDiffMicroSeconds(profiling_start_time_);
-    }
-
     uint32_t query_count = recording.num_pending_dispatches * 2;
     recording.command_encoder.ResolveQuerySet(
         query_set_,
@@ -1619,7 +1699,8 @@ Status WebGpuContext::Flush(const webgpu::BufferManager& buffer_mgr,
         0,
         query_count * sizeof(uint64_t));
 
-    pending_queries_.emplace_back(std::move(recording.pending_kernels), query_read_buffer);
+    pending_queries_.emplace_back(std::move(recording.pending_kernels), query_read_buffer,
+        std::max<int64_t>(0,TimeDiffMicroSeconds(profiling_start_time_)));
     recording.pending_kernels.clear();
   }
   auto command_buffer = recording.command_encoder.Finish();
@@ -1660,6 +1741,14 @@ wgpu::BindGroup WebGpuContext::CreateBindGroup(const std::vector<WGPUBuffer>& bi
     WGPUBuffer buffer = bind_buffers[buffer_idx];
     const uint32_t total_segments = bind_buffers_segments[buffer_idx];
     const uint64_t window_offset = bind_buffer_offsets[buffer_idx], window_bytes = bind_buffer_sizes[buffer_idx];
+    if(uniform_buffer_bytes&&buffer_idx+1==bind_buffers.size()){
+      const uint64_t physical_bytes=wgpuBufferGetSize(buffer),alignment=device_limits_.minUniformBufferOffsetAlignment;
+      ORT_ENFORCE(!window_bytes&&total_segments==1&&alignment&&window_offset%alignment==0&&
+          uniform_buffer_bytes<=device_limits_.maxUniformBufferBindingSize&&window_offset<=physical_bytes&&
+          uniform_buffer_bytes<=physical_bytes-window_offset,"Invalid uniform buffer binding extent/offset.");
+      bind_group_entries.push_back({nullptr,entry_index++,buffer,window_offset,uniform_buffer_bytes,nullptr,nullptr});
+      continue;
+    }
     if (window_bytes) {
       const uint64_t alignment = device_limits_.minStorageBufferOffsetAlignment;
       const uint64_t physical_bytes = wgpuBufferGetSize(buffer);
@@ -1671,12 +1760,6 @@ wgpu::BindGroup WebGpuContext::CreateBindGroup(const std::vector<WGPUBuffer>& bi
       continue;
     }
     ORT_ENFORCE(window_offset == 0, "Storage binding offset without a physical window.");
-    if (uniform_buffer_bytes && buffer_idx + 1 == bind_buffers.size()) {
-      ORT_ENFORCE(total_segments == 1 && uniform_buffer_bytes <= device_limits_.maxUniformBufferBindingSize &&
-                      uniform_buffer_bytes <= wgpuBufferGetSize(buffer), "Invalid uniform buffer binding extent.");
-      bind_group_entries.push_back({nullptr, entry_index++, buffer, 0, uniform_buffer_bytes, nullptr, nullptr});
-      continue;
-    }
     // `total_segments` we used is calculated by tensor size, not actual buffer size. Because for bucketed buffer,
     // the actual buffer size may be larger than the tensor size, an extreme case is that tensor size = 127MB, buffer size = 256MB,
     // maxStorageBufferBindingSize = 128MB, in this case we only need to bind 1 segment instead of 2 segments because

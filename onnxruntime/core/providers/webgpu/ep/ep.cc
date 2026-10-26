@@ -3,6 +3,14 @@
 
 #include "ep.h"
 #include <sstream>
+#include <fstream>
+#include <functional>
+#include "core/common/m0_observation_options_v1.h"
+#include "core/providers/webgpu/m0_numeric_trace_v1.h"
+#include "core/providers/webgpu/compute_context.h"
+#include "core/providers/webgpu/allocator.h"
+#include "core/common/m0_ep_profiler_bridge_v1.h"
+#include "core/common/m0_first_run_profile_v1.h"
 
 #include "allocator.h"
 #include "factory.h"
@@ -22,14 +30,196 @@ namespace ep {
 
 using onnxruntime::ep::Api;
 
+// Each EP owns its diagnostic buffer; no cross-session tensor or address cache.
+// Only unpaired FP32 outputs are covered in V1. Extent-bearing physical carriers
+// are explicitly skipped rather than treating inactive padding as audio data.
+class M0NumericTraceV1 final {
+ public:
+  explicit M0NumericTraceV1(WebGpuExecutionProvider& ep)
+      : ep_(ep), buffer_(nullptr, [&ep](WGPUBuffer value) {
+          if (value) {
+            try { ep.BufferManager().Release(value, &ep.Recording()); }
+            catch (...) { ep.BufferManager().M0OwnershipV2().Poison(); }
+          }
+        }) {
+    const char* path = std::getenv("M0_GPU_NUMERIC_TRACE_FILE");
+    ORT_ENFORCE(path && *path, "M0 numeric trace requires an explicit output file");
+    file_.open(path, std::ios::out | std::ios::app);
+    ORT_ENFORCE(file_.is_open(), "M0 numeric trace output cannot be opened");
+  }
+  void Begin(const std::string& session, const std::string& owner_run) {
+    session_ = session; owner_run_ = owner_run;
+    for (const auto* id : {&session_, &owner_run_}) {
+      ORT_ENFORCE(!id->empty() && id->size() <= 20 && id->find_first_not_of("0123456789") == std::string::npos,
+                  "M0 numeric trace session/run identity");
+    }
+    active_ = run_ < 3 && file_.tellp() < std::streampos(32ull * 1024 * 1024);
+    started_ = false;
+    if (!active_) return;
+    buffer_.reset(); rows_.clear(); hash_rows_ = 0; copy_rows_ = 0; omitted_ = 0; ordinal_ = 0;
+  }
+  Status Observe(ComputeContext& context) {
+    if (!active_) return Status::OK();
+    if (!started_) {
+      // Initializer-transfer scopes use the same callbacks but execute no
+      // kernel; they must not consume a numerical Run or produce empty traces.
+      started_ = true; ++run_;
+      file_ << "{\"event\":\"begin\",\"run\":" << run_
+            << ",\"session\":\"" << session_ << "\",\"owner_run\":\"" << owner_run_
+            << "\",\"name_prefix_limit_bytes\":256,\"diagnostic_overhead\":true,\"scope\":\"unpaired_fp32_physical_outputs\"}\n";
+      file_.flush();
+      ORT_RETURN_IF_NOT(file_.good(), "M0 numeric trace begin write failed");
+    }
+    ++ordinal_;
+    const auto outputs = context.KernelContext().AllocatedOutputs();
+    for (size_t port = 0; port < outputs.size(); ++port) {
+      const auto& tensor = outputs[port];
+      if (rows_.size() >= 8192) { ++omitted_; continue; }
+      Row row;
+      row.ordinal = ordinal_; row.port = port; row.node = Hex(context.NodeName()); row.op = Hex(context.OpType());
+      if (!tensor.DataRaw()) { row.skip = "unallocated"; rows_.push_back(std::move(row)); continue; }
+      row.shape.assign(tensor.Shape().GetDims().begin(), tensor.Shape().GetDims().end());
+      bool paired = false;
+      for (const auto& other : outputs) {
+        if (!other.DataRaw() || !other.IsDataType<uint32_t>() || other.Shape().Size() != 32) continue;
+        M0FullGpuAllocationIdentity identity;
+        if (ep_.BufferManager().M0OwnershipV2().DescribePair(
+              reinterpret_cast<uintptr_t>(other.DataRaw()), reinterpret_cast<uintptr_t>(tensor.DataRaw()), identity)) {
+          paired = true; break;
+        }
+      }
+      const char* skip = M0NumericTraceSkipV1(tensor.Location().device.Type() == OrtDevice::GPU,
+                                             tensor.IsDataType<float>(), paired, tensor.Shape().Size(), hash_rows_);
+      if (skip) { row.skip = skip; rows_.push_back(std::move(row)); continue; }
+      if (!buffer_) {
+        // Actual BufferManager admission/ownership/queue accounting remains active.
+        buffer_.reset(ep_.BufferManager().Create(ep_.Recording(), kM0NumericTraceBytesV1,
+            wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc));
+      }
+      const OrtMemoryInfo memory(WEBGPU_BUFFER, OrtDeviceAllocator, WebGpuDevice(ep_.GetDeviceId()), OrtMemTypeDefault);
+      Tensor digest(DataTypeImpl::GetType<uint32_t>(), {kM0NumericTraceRowsV1 * kM0NumericTraceWordsV1}, buffer_.get(), memory);
+      M0NumericTraceProgramV1 program;
+      program.AddInput({&tensor, ProgramTensorMetadataDependency::None})
+          .AddOutput({&digest, ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64).SetDispatchGroupSize(1)
+          .AddUniformVariables({static_cast<uint32_t>(tensor.Shape().Size()), hash_rows_});
+      // Uses the actual context so cancellation and native dispatch admission are retained.
+      ORT_RETURN_IF_ERROR(context.RunProgram(program));
+      row.hash_row = hash_rows_++; rows_.push_back(std::move(row));
+      if (context.OpType() == "Transpose" && port == 0 && hash_rows_ < kM0NumericTraceRowsV1 && rows_.size() < 8192) {
+        const auto* source = context.KernelContext().Input<Tensor>(0);
+        ORT_RETURN_IF_NOT(source && source->IsDataType<float>() && source->Shape().Size() == tensor.Shape().Size(),
+                          "M0 transpose diagnostic source extent");
+        const auto rank = source->Shape().NumDimensions();
+        if (rank == 0 || rank > 8) continue;
+        TensorShapeVector permutation;
+        if (!context.Kernel().Info().GetAttrs("perm", permutation).IsOK()) {
+          for (size_t axis = rank; axis > 0; --axis) permutation.push_back(static_cast<int64_t>(axis-1));
+        }
+        ORT_RETURN_IF_NOT(permutation.size() == rank, "M0 transpose diagnostic permutation rank");
+        std::array<uint32_t,8> shape{}, axes{};
+        std::array<bool,8> seen{};
+        for (size_t axis = 0; axis < rank; ++axis) {
+          ORT_RETURN_IF_NOT(source->Shape()[axis] > 0 && source->Shape()[axis] <= kM0NumericTraceMaxElementsV1 &&
+                            permutation[axis] >= 0 && static_cast<uint64_t>(permutation[axis]) < rank,
+                            "M0 transpose diagnostic dimensions/permutation");
+          shape[axis] = static_cast<uint32_t>(source->Shape()[axis]);
+          axes[axis] = static_cast<uint32_t>(permutation[axis]);
+          ORT_RETURN_IF_NOT(!seen[axes[axis]], "M0 transpose diagnostic duplicate permutation");
+          seen[axes[axis]] = true;
+        }
+        M0TransposeCopyCheckProgramV1 check;
+        check.AddInputs({{source,ProgramTensorMetadataDependency::None}, {&tensor,ProgramTensorMetadataDependency::None}})
+            .AddOutput({&digest,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64).SetDispatchGroupSize(1)
+            .AddUniformVariables({static_cast<uint32_t>(tensor.Shape().Size()), hash_rows_, static_cast<uint32_t>(rank),
+                                  gsl::span<const uint32_t>(shape), gsl::span<const uint32_t>(axes)});
+        ORT_RETURN_IF_ERROR(context.RunProgram(check));
+        Row copy = rows_.back(); copy.copy_check = true; copy.hash_row = hash_rows_++; ++copy_rows_;
+        copy.copy_alias = source->DataRaw() == tensor.DataRaw();
+        rows_.push_back(std::move(copy));
+      }
+    }
+    return Status::OK();
+  }
+  void End(bool checked) {
+    if (!active_) return;
+    active_ = false;
+    if (!started_) return;
+    std::vector<uint32_t> digests;
+    if (checked && hash_rows_) {
+      digests.resize(hash_rows_ * kM0NumericTraceWordsV1);
+      // Run queue completion has already succeeded. Read only GPU-generated
+      // integer summaries; no model tensor payload crosses the CPU boundary.
+      ep_.BufferManager().Download(ep_.Recording(), buffer_.get(), digests.data(), digests.size() * sizeof(uint32_t));
+    }
+    for (const auto& row : rows_) {
+      file_ << "{\"event\":\"output\",\"run\":" << run_ << ",\"ordinal\":" << row.ordinal
+            << ",\"node_utf8_hex\":\"" << row.node << "\",\"op_utf8_hex\":\"" << row.op
+            << "\",\"port\":" << row.port << ",\"shape\":[";
+      for (size_t i = 0; i < row.shape.size(); ++i) { if (i) file_ << ','; file_ << row.shape[i]; }
+      file_ << "],\"queue_checked\":" << (checked ? "true" : "false");
+      if (!row.skip.empty()) file_ << ",\"skip\":\"" << row.skip << '"';
+      else if (!checked) file_ << ",\"skip\":\"unchecked_queue\"";
+      else if (row.copy_check) {
+        const auto offset = row.hash_row * kM0NumericTraceWordsV1;
+        ORT_ENFORCE(digests[offset+3] == 0x54525031u, "M0 transpose diagnostic marker");
+        file_ << ",\"kind\":\"transpose_copy_check\",\"copy_mismatches\":" << digests[offset]
+              << ",\"first_copy_mismatch\":" << digests[offset+1] << ",\"elements\":" << digests[offset+2]
+              << ",\"input_output_alias\":" << (row.copy_alias ? "true" : "false");
+      }
+      else {
+        const auto offset = row.hash_row * kM0NumericTraceWordsV1;
+        file_ << ",\"xor\":" << digests[offset] << ",\"sum\":" << digests[offset + 1]
+              << ",\"nonfinite\":" << digests[offset + 2] << ",\"elements\":" << digests[offset + 3];
+      }
+      file_ << "}\n";
+    }
+    file_ << "{\"event\":\"end\",\"run\":" << run_ << ",\"queue_checked\":" << (checked ? "true" : "false")
+          << ",\"hashed_outputs\":" << (hash_rows_-copy_rows_) << ",\"copy_checks\":" << copy_rows_ << ",\"reported_outputs\":" << rows_.size()
+          << ",\"omitted_outputs\":" << omitted_ << ",\"diagnostic_overhead\":true}\n";
+    file_.flush(); buffer_.reset();
+    ORT_ENFORCE(file_.good(), "M0 numeric trace end write failed");
+  }
+ private:
+  static std::string Hex(std::string_view value) {
+    constexpr char digits[] = "0123456789abcdef";
+    value = value.substr(0, 256);
+    std::string result; result.reserve(value.size() * 2);
+    for (unsigned char c : value) { result += digits[c >> 4]; result += digits[c & 15]; }
+    return result;
+  }
+  struct Row {
+    uint64_t ordinal = 0; size_t port = 0; uint32_t hash_row = 0; bool copy_check = false, copy_alias = false;
+    std::string node, op, skip; std::vector<int64_t> shape;
+  };
+  WebGpuExecutionProvider& ep_;
+  std::unique_ptr<WGPUBufferImpl, std::function<void(WGPUBuffer)>> buffer_;
+  std::ofstream file_;
+  std::string session_, owner_run_;
+  std::vector<Row> rows_;
+  bool active_ = false, started_ = false;
+  uint32_t hash_rows_ = 0, copy_rows_ = 0;
+  uint64_t run_ = 0, ordinal_ = 0, omitted_ = 0;
+};
+
+Ep::~Ep() = default;
+Status Ep::TraceNumericOutputs(ComputeContext& context) const {
+  ORT_RETURN_IF_NOT(numeric_trace_, "M0 numeric trace observer missing");
+  return numeric_trace_->Observe(context);
+}
+
+
 // Constructor
 Ep::Ep(std::unique_ptr<IExecutionProvider> impl, Factory& factory, const OrtLogger& logger, const Config& config)
     : onnxruntime::ep::adapter::Ep{std::move(impl), config.cpu_allocator, config.device_allocator},
       factory_{factory},
       logger_{logger},
       config_{config} {
+  if (M0GpuNumericTraceV1()) {
+    numeric_trace_ = std::make_unique<M0NumericTraceV1>(*static_cast<WebGpuExecutionProvider*>(EpImpl()));
+  }
   // Initialize the execution provider's function table
   GetName = GetNameImpl;
+  CreateProfiler = CreateProfilerImpl;
   GetCapability = GetCapabilityImpl;
   GetKernelRegistry = GetKernelRegistryImpl;
   Compile = nullptr;  // Per-kernel EP does not use Compile
@@ -49,6 +239,16 @@ Ep::Ep(std::unique_ptr<IExecutionProvider> impl, Factory& factory, const OrtLogg
   ReplayGraph = ReplayGraphImpl;
   ReleaseCapturedGraph = ReleaseCapturedGraphImpl;
   GetGraphCaptureNodeAssignmentPolicy = GetGraphCaptureNodeAssignmentPolicyImpl;
+}
+
+OrtStatus* ORT_API_CALL Ep::CreateProfilerImpl(OrtEp* self,OrtEpProfilerImpl** profiler) noexcept{
+  EXCEPTION_TO_RETURNED_STATUS_BEGIN
+  if(!profiler)return Ort::GetApi().CreateStatus(ORT_INVALID_ARGUMENT,"Profiler output absent");
+  *profiler=nullptr;
+  auto* retained=static_cast<Ep*>(self)->RetainedProfiler();
+  if(retained)*profiler=new M0EpProfilerBridgeV1(*retained);
+  return nullptr;
+  EXCEPTION_TO_RETURNED_STATUS_END
 }
 
 // OrtEp interface implementations
@@ -248,21 +448,21 @@ OrtStatus* ORT_API_CALL Ep::OnRunStartImpl(_In_ OrtEp* this_ptr,
                                     status.ErrorMessage().c_str());
     }
   }
-  for (const char* key : {"m0.fullgpu.bounded_submissions_v1",
-                          "m0.fullgpu.actual_session_v2", "m0.fullgpu.actual_run_v2",
-                          "m0.fullgpu.fault_authorized_v2", "m0.fullgpu.diagnostic_fault_mode_v2"}) {
+  for (const char* key : kM0NativeRunCallbackKeysV1) {
     const char* value = Api().ort.GetRunConfigEntry(run_options, key);
     if (value) {
       auto forwarded = options.config_options.AddConfigEntry(key, value);
       if (!forwarded.IsOK()) return Api().ort.CreateStatus(static_cast<OrtErrorCode>(forwarded.Code()), forwarded.ErrorMessage().c_str());
     }
   }
-  auto ownership = Api().ort.GetRunConfigEntry(run_options, "m0.fullgpu.extent_ownership_v2");
-  if (ownership != nullptr) {
-    auto status = options.config_options.AddConfigEntry("m0.fullgpu.extent_ownership_v2", ownership);
-    if (!status.IsOK()) return Api().ort.CreateStatus(static_cast<OrtErrorCode>(status.Code()), status.ErrorMessage().c_str());
-  }
   auto* ep = static_cast<Ep*>(this_ptr);
+  if (ep->numeric_trace_) {
+    if (options.config_options.GetConfigOrDefault("m0.fullgpu.bounded_submissions_v1", "0") != "1") {
+      return Api().ort.CreateStatus(ORT_INVALID_ARGUMENT, "M0 numeric trace requires bounded native Run");
+    }
+    ep->numeric_trace_->Begin(options.config_options.GetConfigOrDefault("m0.fullgpu.actual_session_v2", ""),
+                              options.config_options.GetConfigOrDefault("m0.fullgpu.actual_run_v2", ""));
+  }
   auto status = ep->EpImpl()->OnRunStart(options);
   if (!status.IsOK()) {
     return Api().ort.CreateStatus(static_cast<OrtErrorCode>(status.Code()),
@@ -278,21 +478,15 @@ OrtStatus* ORT_API_CALL Ep::OnRunEndImpl(_In_ OrtEp* this_ptr,
   EXCEPTION_TO_RETURNED_STATUS_BEGIN
   auto* ep = static_cast<Ep*>(this_ptr);
   onnxruntime::RunOptions options{};
-  for (const char* key : {"m0.fullgpu.bounded_submissions_v1",
-                          "m0.fullgpu.actual_session_v2", "m0.fullgpu.actual_run_v2",
-                          "m0.fullgpu.fault_authorized_v2", "m0.fullgpu.diagnostic_fault_mode_v2"}) {
+  for (const char* key : kM0NativeRunCallbackKeysV1) {
     const char* value = Api().ort.GetRunConfigEntry(run_options, key);
     if (value) {
       auto forwarded = options.config_options.AddConfigEntry(key, value);
       if (!forwarded.IsOK()) return Api().ort.CreateStatus(static_cast<OrtErrorCode>(forwarded.Code()), forwarded.ErrorMessage().c_str());
     }
   }
-  auto ownership = Api().ort.GetRunConfigEntry(run_options, "m0.fullgpu.extent_ownership_v2");
-  if (ownership != nullptr) {
-    auto added = options.config_options.AddConfigEntry("m0.fullgpu.extent_ownership_v2", ownership);
-    if (!added.IsOK()) return Api().ort.CreateStatus(static_cast<OrtErrorCode>(added.Code()), added.ErrorMessage().c_str());
-  }
   auto status = ep->EpImpl()->OnRunEnd(sync_stream, options);
+  if (ep->numeric_trace_) ep->numeric_trace_->End(status.IsOK() && sync_stream);
   if (!status.IsOK()) {
     return Api().ort.CreateStatus(static_cast<OrtErrorCode>(status.Code()),
                                   status.ErrorMessage().c_str());

@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include "core/common/common.h"
+#include "core/common/m0_observation_options_v1.h"
 #include "core/framework/tensorprotoutils.h"
 #include "core/framework/session_options.h"
 #include "core/graph/graph.h"
@@ -158,20 +159,37 @@ class M0NativeMemoryPlanV1 final {
         // or final host publication that is simultaneously retained.
         scratch += tail;
       }
+      if(node.op_type()=="GeneratorResidualExtentV1"||node.op_type()=="NoiseResidualAfter1600ExtentV1"){
+        const auto branch=Attribute(node,"branch");
+        const uint32_t channels=node.op_type()=="GeneratorResidualExtentV1"?(branch<3?256u:128u):(branch==0?256u:128u);
+        // The ordinary input/output scratch bound covers the full convolution
+        // accumulator plus an activation window no larger than that carrier.
+        // Fixed coefficients and packed columns/flags are additional allocations.
+        scratch+=Bytes{M0NativeResidualFixedScratchBytesV1(channels,M0OutputChannelTiledConvV1()),0};
+      }
+      if(node.op_type()=="RecurrenceExtentV2"&&M0LstmInputProjectionV1()){
+        // Four input gates for both directions, retained until recurrence completes.
+        // Budget this even when a device binding limit selects the legacy path.
+        scratch+=CapacityBytes(node,2048*sizeof(float));
+      }
+      if(node.op_type()=="RecurrenceExtentV2"&&M0CoalescedRecurrenceWeightsV1()){
+        // Two exact transpositions retained with all recurrence outputs/projection.
+        scratch+=Bytes{uint64_t(2048)*(640+256)*sizeof(float)+2*15,0};
+      }
       steps_.emplace_back(live, scratch);
       for (const auto& name : releases[pc]) live.Subtract(values_.at(name));
     }
   }
 
   uint64_t PeakBytes(uint32_t duration) const {
-    // Staging chunks and at most sixteen 512-byte pending uniform buffers.
-    uint64_t peak = 8ull * 1024 * 1024 + 16 * 512;
-    for (const auto& step : steps_) {
-      const uint64_t live = step.first.At(duration), scratch = step.second.At(duration);
-      ORT_ENFORCE(live <= std::numeric_limits<uint64_t>::max() - 16 * 512 &&
-                      scratch <= std::numeric_limits<uint64_t>::max() - live - 16 * 512,
-                  "RW07_NATIVE_MEMORY_PLAN_OVERFLOW");
-      peak = std::max(peak, live + scratch + 16 * 512);
+    // Includes current recording and preparation, with actual bounded arena lifetimes.
+    const uint64_t uniforms=M0NativePendingUniformBytesV1()+(M0GpuNumericTraceV1()?64ull*1024:0);
+    uint64_t peak=8ull*1024*1024+uniforms;
+    for(const auto& step:steps_){
+      const uint64_t live=step.first.At(duration),scratch=step.second.At(duration);
+      ORT_ENFORCE(live<=std::numeric_limits<uint64_t>::max()-uniforms&&
+          scratch<=std::numeric_limits<uint64_t>::max()-live-uniforms,"RW07_NATIVE_MEMORY_PLAN_OVERFLOW");
+      peak=std::max(peak,live+scratch+uniforms);
     }
     return peak;
   }

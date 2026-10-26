@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "core/common/span_utils.h"
+#include "core/common/m0_observation_options_v1.h"
 #include "core/common/inlined_containers.h"
 #include "core/providers/cpu/tensor/utils.h"
 #include "core/providers/webgpu/tensor/transpose.h"
@@ -186,6 +187,10 @@ Status Transpose::DoTranspose(onnxruntime::webgpu::ComputeContextBase& context,
                                              {kernel_width},
                                              {input_channel_tiles},
                                              {CeilDiv(kernel_height * kernel_width, 4u)}});
+      if (M0GpuNumericTraceV1()) {
+        LOGS(context.Logger(), INFO) << "M0_TRANSPOSE_COPY_PATH node=" << context.NodeName()
+          << " variant=OIHW2OHWI input_shape=" << input_shape << " output_shape=" << output.Shape();
+      }
       return context.RunProgram(transpose_program);
     }
   }
@@ -195,16 +200,24 @@ Status Transpose::DoTranspose(onnxruntime::webgpu::ComputeContextBase& context,
   SqueezeShape(input_shape.GetDims(), permutations, new_shape, new_perm);
   const bool channels_last = new_perm == TensorShapeVector({2, 3, 1});
   const bool channels_first = new_perm == TensorShapeVector({3, 1, 2});
-  const bool use_shared = (new_shape.size() == 2 && new_perm[0] > new_perm[1]) || channels_last || channels_first;
+  bool use_shared = (new_shape.size() == 2 && new_perm[0] > new_perm[1]) || channels_last || channels_first;
   auto new_input_shape = input_shape;
 
   if (use_shared) {
-    new_input_shape = channels_last
+    const TensorShape matrix = channels_last
                           ? TensorShape({new_shape[0], new_shape[1] * new_shape[2]})
                       : channels_first
                           ? TensorShape({new_shape[0] * new_shape[1], new_shape[2]})
                           : new_shape;
-    output_shape = TensorShape({new_input_shape[1], new_input_shape[0]});
+    // Real-device copy checks found corrupt partial shared tiles. Keep the
+    // coalesced full-tile path, and use scalar indexed copies for boundaries.
+    // The indexed path must retain the original rank/permutation, not the
+    // temporary matrix view used only by the shared shader.
+    use_shared = matrix[0] % TILE_SIZE == 0 && matrix[1] % TILE_SIZE == 0;
+    if (use_shared) {
+      new_input_shape = matrix;
+      output_shape = TensorShape({matrix[1], matrix[0]});
+    }
   }
 
   // A permutation that leaves the innermost dimension innermost moves whole runs of it, so a
@@ -219,6 +232,13 @@ Status Transpose::DoTranspose(onnxruntime::webgpu::ComputeContextBase& context,
     output_shape = ReduceShapeByComponents(output_shape, components);
   }
 
+  if (M0GpuNumericTraceV1()) {
+    LOGS(context.Logger(), INFO) << "M0_TRANSPOSE_COPY_PATH node=" << context.NodeName()
+      << " variant=" << (use_shared ? "shared_tile" : "indexed") << " components=" << components
+      << " input_shape=" << input_shape << " shader_input_shape=" << new_input_shape
+      << " output_shape=" << output.Shape() << " shader_output_shape=" << output_shape
+      << " input_handle=" << input.DataRaw() << " output_handle=" << output.DataRaw();
+  }
   uint32_t output_size = onnxruntime::narrow<uint32_t>(input_shape.Size()) / components;
 
   TransposeProgram program{permutations, use_shared};

@@ -1,9 +1,11 @@
+#include "core/common/m0_observation_options_v1.h"
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 #include "core/session/m0_original_lstm_module_v1.h"
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && defined(__ANDROID__) && defined(USE_WEBGPU) && !defined(ORT_MINIMAL_BUILD) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
 #include "core/session/plugin_ep/ep_plugin_provider_interfaces.h"
 #include <array>
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -29,13 +31,30 @@ namespace {
 void M0OriginalLstmCoreAnchorV1() {}
 }  // namespace
 struct M0OriginalLstmModuleV1::Impl {
+  struct Residency {
 #if defined(ORT_M0_DEEP_MODULE_AUDIT)
-  M0ModuleFileLeaseV1 file{kM0QualifiedWebGpuProviderSha256V1, true};
+    M0ModuleFileLeaseV1 file{kM0QualifiedWebGpuProviderSha256V1,true};
 #else
-  M0ModuleFileLeaseV1 file{kM0QualifiedWebGpuProviderSha256V1};
+    M0ModuleFileLeaseV1 file{kM0QualifiedWebGpuProviderSha256V1};
 #endif
-  OrtEnvPtr env{nullptr, OrtEnv::Release};
-  std::unique_ptr<EpLibraryPlugin> library;
+    std::unique_ptr<EpLibraryPlugin> library;
+    ~Residency(){
+      if(library){
+        const auto status=library->Unload();
+        // An uncertain unload must keep its actual handle/central lease alive.
+        if(!status.IsOK())(void)library.release();
+      }
+    }
+  };
+  static M0ExclusiveModuleResidencyV1<Residency>& ResidentSlot(){
+    // Process lifetime by design. Destroying this before provider TLS callbacks
+    // or core API teardown would reintroduce unsafe unload ordering.
+    static auto* slot=new M0ExclusiveModuleResidencyV1<Residency>;
+    return *slot;
+  }
+  OrtEnvPtr env{nullptr,OrtEnv::Release};
+  std::unique_ptr<Residency> resident;
+  bool ready=false;
   OrtSessionOptions options;
   std::vector<std::unique_ptr<OrtEpDevice>> devices;
   std::unique_ptr<PluginExecutionProviderFactory> factory;
@@ -44,18 +63,24 @@ struct M0OriginalLstmModuleV1::Impl {
   std::shared_ptr<KernelRegistry> registry;
   M0PluginKernelCreatorBindingV1 binding;
   ~Impl() {
+    bool reusable=ready&&resident&&provider;
+    if(reusable){
+      try{
+        resident->file.Verify();
+        M0NativeResourceBindingV3 context;
+        reusable=resident->library->M0QueryNativeResourceV3(provider->GetOrtEp(),0,0,context).IsOK();
+      }catch(...){reusable=false;}
+    }
+    // Reuse only code/factory provenance, never a session's provider, device,
+    // tensors, registry wrapper or selected execution state.
     registry.reset();
     providers.reset();
-    provider = nullptr;
+    provider=nullptr;
     factory.reset();
     devices.clear();
-    if (library) {
-      auto status = library->Unload();
-      if (!status.IsOK()) {
-        // Retain the failed-unload object/central lease rather than revive its inode.
-        LOGS_DEFAULT(ERROR) << "RW07_LSTM_MODULE_UNLOAD: " << status.ErrorMessage();
-        (void)library.release();
-      }
+    if(resident){
+      try{ResidentSlot().Release(resident,reusable);}
+      catch(...){(void)resident.release();} // retain on uncertain retirement
     }
   }
 };
@@ -77,21 +102,40 @@ std::unique_ptr<M0OriginalLstmModuleV1> M0OriginalLstmModuleV1::Open(const loggi
   const auto core_path = std::filesystem::canonical(core.dli_fname);
   ORT_ENFORCE(core_path.filename() == "libonnxruntime.so" || core_path.filename() == "onnxruntime_preinit_tests",
               "RW07_LSTM_MODULE_CORE_NAME");
-  impl->file.path = std::filesystem::canonical(core_path.parent_path() / "libonnxruntime_providers_webgpu.so");
-  ORT_ENFORCE(impl->file.path.parent_path() == core_path.parent_path(), "RW07_LSTM_MODULE_SIBLING");
-  impl->file.fd = open(impl->file.path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-  ORT_ENFORCE(impl->file.fd >= 0 && fstat(impl->file.fd, &impl->file.stamp) == 0 &&
-                  impl->file.stamp.st_size > 0,
-              "RW07_LSTM_MODULE_FILE_OPEN");
-  impl->file.Verify(true);
-  impl->library = std::make_unique<EpLibraryPlugin>("rw07-private-original-lstm449-v1", impl->file.path);
-  ORT_THROW_IF_ERROR(impl->library->M0LoadOriginalLstmV1());
-  impl->file.Verify(true);
-  ORT_THROW_IF_ERROR(impl->library->M0QueryOriginalLstmV1(impl->binding));
-  impl->file.Verify(true);
+  const auto provider_path=std::filesystem::canonical(core_path.parent_path()/"libonnxruntime_providers_webgpu.so");
+  ORT_ENFORCE(provider_path.parent_path()==core_path.parent_path(),"RW07_LSTM_MODULE_SIBLING");
+  bool residency_reused=true;
+  impl->resident=Impl::ResidentSlot().Acquire([&](){
+    residency_reused=false;
+    auto resident=std::make_unique<Impl::Residency>();
+    resident->file.path=provider_path;
+    resident->file.fd=open(provider_path.c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW);
+    ORT_ENFORCE(resident->file.fd>=0&&fstat(resident->file.fd,&resident->file.stamp)==0&&
+      resident->file.stamp.st_size>0,"RW07_LSTM_MODULE_FILE_OPEN");
+    resident->file.Verify(true);
+    resident->library=std::make_unique<EpLibraryPlugin>("rw07-private-original-lstm449-v1",provider_path);
+    // First admission still refuses every pre-existing foreign module.
+    ORT_THROW_IF_ERROR(resident->library->M0LoadOriginalLstmV1());
+    return resident;
+  },[&](const Impl::Residency& resident){
+    ORT_ENFORCE(resident.library&&resident.file.path==provider_path,"RW07_PRIVATE_MODULE_RESIDENCY_ORIGIN");
+    // Retained fd/stamp detect replacement and change-and-restore; every new
+    // session also reauthenticates the actual bytes before using any factory.
+    resident.file.Verify(true);
+  },[&](){
+    // Refuse an existing generic/foreign owner before starting private creation.
+    // Its later explicit shutdown may permit admission; no private handle or
+    // factory has been created yet. M0Load repeats this guard against races.
+    if(void* foreign=dlopen(provider_path.c_str(),RTLD_NOW|RTLD_NOLOAD)){
+      dlclose(foreign);
+      ORT_THROW("RW07_LSTM_MODULE_FOREIGN_LOAD");
+    }
+  });
+  ORT_THROW_IF_ERROR(impl->resident->library->M0QueryOriginalLstmV1(impl->binding));
+  impl->resident->file.Verify(true);
   OrtEpFactory* selected = nullptr;
   size_t factory_count = 0;
-  for (auto* candidate : impl->library->GetFactories()) {
+  for (auto* candidate : impl->resident->library->GetFactories()) {
     ++factory_count;
     ORT_ENFORCE(candidate && candidate->GetName && candidate->GetSupportedDevices && candidate->CreateEp &&
                     candidate->ReleaseEp && std::strcmp(candidate->GetName(candidate), kWebGpuExecutionProvider) == 0,
@@ -131,7 +175,7 @@ std::unique_ptr<M0OriginalLstmModuleV1> M0OriginalLstmModuleV1::Open(const loggi
   for (const auto* key : {"session.disable_cpu_ep_fallback", "session.disable_prepacking", "session.disable_aot_function_inlining"})
     ORT_THROW_IF_ERROR(impl->options.value.config_options.AddConfigEntry(key, "1"));
   ORT_THROW_IF_ERROR(impl->options.AddProviderOptionsToConfigOptions(
-      {{"validationMode", "full"}, {"enableGraphCapture", "0"}, {"enableInt64", "1"}, {"weightLoadAcceleration", "off"},
+      {{"validationMode", M0GpuValidationV1()}, {"maxNumPendingDispatches", std::to_string(M0NativeDispatchWindowV1())}, {"enableGraphCapture", "0"}, {"enableInt64", "1"}, {"weightLoadAcceleration", "off"},
        {"storageBufferCacheMode", "disabled"}, {"uniformBufferCacheMode", "disabled"},
        {"sessionBufferPoolGenerations", "0"}, {"dawnBackendType", "Vulkan"}},
       kWebGpuExecutionProvider));
@@ -146,30 +190,32 @@ std::unique_ptr<M0OriginalLstmModuleV1> M0OriginalLstmModuleV1::Open(const loggi
   ORT_ENFORCE(impl->provider && impl->provider->Type() == kWebGpuExecutionProvider, "RW07_LSTM_MODULE_EP");
   impl->registry = impl->provider->GetKernelRegistry();
   ORT_ENFORCE(impl->registry && impl->binding.callback && impl->binding.state, "RW07_LSTM_MODULE_REGISTRY");
-  impl->file.Verify(true);
-  LOGS(logger, INFO) << "M0_RW07_MODULE_AUDIT deep_audit=" << impl->file.DeepAuditEnabled()
-                     << " load_sha256=1 file_stat=1 resource_registry_audit=" << impl->file.DeepAuditEnabled();
+  impl->resident->file.Verify(true);
+  LOGS(logger, INFO) << "M0_RW07_MODULE_AUDIT deep_audit=" << impl->resident->file.DeepAuditEnabled()
+                     << " code_residency_reused=" << residency_reused << " session_provider_reused=0"
+                     << " load_sha256=1 file_stat=1 resource_registry_audit=" << impl->resident->file.DeepAuditEnabled();
+  impl->ready=true;
   return std::unique_ptr<M0OriginalLstmModuleV1>(new M0OriginalLstmModuleV1(std::move(impl)));
 }
 PluginExecutionProvider& M0OriginalLstmModuleV1::Provider() const {
-  impl_->file.Verify();
+  impl_->resident->file.Verify();
   return *impl_->provider;
 }
 const ExecutionProviders& M0OriginalLstmModuleV1::Providers() const {
-  impl_->file.Verify();
+  impl_->resident->file.Verify();
   return *impl_->providers;
 }
 std::shared_ptr<KernelRegistry> M0OriginalLstmModuleV1::Registry() const {
-  impl_->file.Verify();
+  impl_->resident->file.Verify();
   return impl_->registry;
 }
 bool M0OriginalLstmModuleV1::AuditRegistry(uintptr_t handle) const {
-  return impl_->file.AuditRegistry(handle);
+  return impl_->resident->file.AuditRegistry(handle);
 }
 M0OriginalLstmModuleV1::NativeSnapshotV1 M0OriginalLstmModuleV1::ReadNativeSnapshot(
     uintptr_t handle,uint64_t required_bytes,bool audit_bindings) const {
   // File identity and live context/resource checks remain active in both modes.
-  impl_->file.Verify();
+  impl_->resident->file.Verify();
   NativeSnapshotV1 result;
   ORT_ENFORCE(impl_->provider&&impl_->provider->GetOrtEp()&&impl_->providers&&impl_->registry&&
                   impl_->providers->Get(kWebGpuExecutionProvider)==impl_->provider,
@@ -177,64 +223,68 @@ M0OriginalLstmModuleV1::NativeSnapshotV1 M0OriginalLstmModuleV1::ReadNativeSnaps
   result.registry=impl_->registry;
   result.provider=impl_->provider;
   result.providers=impl_->providers.get();
-  ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeResourceV3(impl_->provider->GetOrtEp(),0,0,result.context));
-  if (audit_bindings) {
-    for(const auto& record:kM0NativeKernelRecordsV2)
-      ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeKernelV2(record.id,result.bindings[record.id-1]));
-  }
+  ORT_THROW_IF_ERROR(impl_->resident->library->M0QueryNativeResourceV3(impl_->provider->GetOrtEp(),0,0,result.context));
+  if(audit_bindings)result.bindings=NativeBindingsV2();
   if(handle||required_bytes)
-    ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeResourceV3(
+    ORT_THROW_IF_ERROR(impl_->resident->library->M0QueryNativeResourceV3(
         impl_->provider->GetOrtEp(),handle,required_bytes,result.resource));
   else result.resource=result.context;
-  impl_->file.Verify();
+  impl_->resident->file.Verify();
   return result;
 }
 std::array<M0NativeProviderKernelBindingV2,42> M0OriginalLstmModuleV1::NativeBindingsV2() const {
-  impl_->file.Verify();
+  impl_->resident->file.Verify();
+  std::array<uint32_t,kM0NativeKernelRecordsV2.size()> records{};
+  for(size_t i=0;i<records.size();++i)records[i]=kM0NativeKernelRecordsV2[i].id;
+  InlinedVector<M0NativeProviderKernelBindingV2> rows;
+  ORT_THROW_IF_ERROR(impl_->resident->library->M0QueryNativeKernelsV2(records,rows));
+  ORT_ENFORCE(rows.size()==records.size(),"RW07_NATIVE_MODULE_QUERY_COUNT");
   std::array<M0NativeProviderKernelBindingV2,42> result;
-  for(const auto& record:kM0NativeKernelRecordsV2)
-    ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeKernelV2(record.id,result[record.id-1]));
-  impl_->file.Verify();return result;
+  std::copy(rows.begin(),rows.end(),result.begin());
+  impl_->resident->file.Verify();return result;
 }
 M0NativeResourceBindingV3 M0OriginalLstmModuleV1::NativeResourceV3(uintptr_t handle,uint64_t required_bytes)const{
- impl_->file.Verify();M0NativeResourceBindingV3 result;
+ impl_->resident->file.Verify();M0NativeResourceBindingV3 result;
  ORT_ENFORCE(impl_->provider&&impl_->provider->GetOrtEp(),"RW07_NATIVE_RESOURCE_OWNED_EP");
- ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeResourceV3(impl_->provider->GetOrtEp(),handle,required_bytes,result));
- impl_->file.Verify();return result;
+ ORT_THROW_IF_ERROR(impl_->resident->library->M0QueryNativeResourceV3(impl_->provider->GetOrtEp(),handle,required_bytes,result));
+ impl_->resident->file.Verify();return result;
 }
 M0OriginalLstmModuleV1::NativeResourceBatchV3 M0OriginalLstmModuleV1::NativeResourcesV3(
  gsl::span<const std::pair<uintptr_t,uint64_t>> queries)const{
  ORT_ENFORCE(!queries.empty()&&queries.size()<=554,"RW07_NATIVE_RESOURCE_BATCH_BOUND");
- impl_->file.Verify();
+ impl_->resident->file.Verify();
  auto* const provider=impl_->provider;
  ORT_ENFORCE(provider&&provider->GetOrtEp()&&impl_->providers&&
   impl_->providers->Get(kWebGpuExecutionProvider)==provider,"RW07_NATIVE_RESOURCE_OWNED_EP");
  auto* const ep=provider->GetOrtEp();
- NativeResourceBatchV3 result;
- result.resources.reserve(queries.size());
- ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeResourceV3(ep,0,0,result.before));
- for(const auto& query:queries){
-  ORT_ENFORCE(query.first&&query.second,"RW07_NATIVE_RESOURCE_BATCH_QUERY");
-  M0NativeResourceBindingV3 resource;
-  ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeResourceV3(ep,query.first,query.second,resource));
-  result.resources.push_back(resource);
+ InlinedVector<std::pair<uintptr_t,uint64_t>> batch;
+ batch.reserve(queries.size()+2);batch.emplace_back(0,0);
+ for(const auto& request:queries){
+  ORT_ENFORCE(request.first&&request.second,"RW07_NATIVE_RESOURCE_BATCH_QUERY");
+  batch.push_back(request);
  }
- ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeResourceV3(ep,0,0,result.after));
+ batch.emplace_back(0,0);
+ InlinedVector<M0NativeResourceBindingV3> observed;
+ ORT_THROW_IF_ERROR(impl_->resident->library->M0QueryNativeResourcesV3(ep,batch,observed));
+ ORT_ENFORCE(observed.size()==batch.size(),"RW07_NATIVE_RESOURCE_BATCH_COUNT");
+ NativeResourceBatchV3 result;
+ result.before=observed.front();result.after=observed.back();
+ result.resources.assign(observed.begin()+1,observed.end()-1);
  ORT_ENFORCE(impl_->provider==provider&&provider->GetOrtEp()==ep&&
   impl_->providers->Get(kWebGpuExecutionProvider)==provider,"RW07_NATIVE_RESOURCE_BATCH_CHANGED_EP");
- impl_->file.Verify();
+ impl_->resident->file.Verify();
  return result;
 }
 M0NativeDeviceLimitsV1 M0OriginalLstmModuleV1::NativeDeviceLimitsV1(
  uint64_t storage_bytes,uint64_t initializer_bytes,uint64_t uniform_bytes)const{
- impl_->file.Verify();M0NativeDeviceLimitsV1 result;
+ impl_->resident->file.Verify();M0NativeDeviceLimitsV1 result;
  ORT_ENFORCE(impl_->provider&&impl_->provider->GetOrtEp(),"RW07_NATIVE_DEVICE_LIMITS_OWNED_EP");
- ORT_THROW_IF_ERROR(impl_->library->M0QueryNativeDeviceLimitsV1(impl_->provider->GetOrtEp(),
+ ORT_THROW_IF_ERROR(impl_->resident->library->M0QueryNativeDeviceLimitsV1(impl_->provider->GetOrtEp(),
    storage_bytes,initializer_bytes,uniform_bytes,result));
- impl_->file.Verify();return result;
+ impl_->resident->file.Verify();return result;
 }
 const M0PluginKernelCreatorBindingV1& M0OriginalLstmModuleV1::Binding() const {
-  impl_->file.Verify();
+  impl_->resident->file.Verify();
   return impl_->binding;
 }
 }  // namespace onnxruntime

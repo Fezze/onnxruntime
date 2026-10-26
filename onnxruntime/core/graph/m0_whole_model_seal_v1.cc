@@ -66,9 +66,11 @@ class M0WholeModelSealV1::Snapshot final {
       ORT_ENFORCE(written > 0, "RW07_ORIGINAL_SNAPSHOT_WRITE errno=", errno);
       offset += static_cast<size_t>(written);
     }
-    int synced;
-    do { synced = fdatasync(write_fd_); } while (synced < 0 && errno == EINTR);
-    ORT_ENFORCE(synced == 0, "RW07_ORIGINAL_SNAPSHOT_SYNC errno=", errno);
+    // This unlinked snapshot is private process-lifetime backing, not a
+    // persistent artifact. Completed writes are visible through the same
+    // inode's read-only mapping without forcing325MB to stable storage.
+    // Closing the sole writable descriptor establishes the ownership boundary;
+    // the mapped bytes are still independently hashed before parsing below.
     const int writable = write_fd_;
     write_fd_ = -1;
     ORT_ENFORCE(close(writable) == 0, "RW07_ORIGINAL_SNAPSHOT_CLOSE");

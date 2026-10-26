@@ -258,6 +258,7 @@ class GeneratorEdge : public WebGpuKernel {
           uint32_t(capacity_),channels,uint32_t(stage_),identity});
     ORT_RETURN_IF_ERROR(c.RunProgram(guard));
     if(windowed_upsample){
+      uint64_t upsample_dispatches=1;
       const uint32_t kernel=stage_==0?20u:12u;
       for(uint32_t o=0;o<channels;o+=upsample_output_channels){
         const uint32_t co=std::min(upsample_output_channels,channels-o);
@@ -266,12 +267,20 @@ class GeneratorEdge : public WebGpuKernel {
         for(uint32_t tap=0;tap<kernel;tap++){
           for(uint32_t i=0;i<source_channels;i+=upsample_input_channels){
             const uint32_t ic=std::min(upsample_input_channels,source_channels-i);
-            UpsampleTapColumn column;
-            column.AddInput(input_window(0,i,ic)).AddInputs({{out,ProgramTensorMetadataDependency::None},{w,ProgramTensorMetadataDependency::None}})
-                .AddOutput(output_window(&*scratch,0u,co)).SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
-                .AddUniformVariables({capacities[0],uint32_t(capacity_),channels,minimum,maximum,modulus,remainder,
-                    uint32_t(stage_),tap,i,ic,o,co,identity});
-            ORT_RETURN_IF_ERROR(c.RunProgram(column));
+            const uint32_t chunk=m0_residual_stages::ResidualConvElementsPerDispatchV1(ic,1);
+            ORT_RETURN_IF_NOT(chunk>0,"RW07 upsample column dispatch work bound");
+            const uint64_t elements=uint64_t(co)*capacity_;
+            for(uint64_t first=0;first<elements;first+=chunk){
+              const uint32_t size=static_cast<uint32_t>(std::min<uint64_t>(chunk,elements-first));
+              const uint64_t cg=(uint64_t(size)+63)/64,cx=std::min(cg,limit),cy=(cg+cx-1)/cx;
+              UpsampleTapColumn column;
+              column.AddInput(input_window(0,i,ic)).AddInputs({{out,ProgramTensorMetadataDependency::None},{w,ProgramTensorMetadataDependency::None}})
+                  .AddOutput(output_window(&*scratch,0u,co)).SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(cx),uint32_t(cy))
+                  .AddUniformVariables({capacities[0],uint32_t(capacity_),channels,minimum,maximum,modulus,remainder,
+                      uint32_t(stage_),tap,i,ic,o,co,uint32_t(first),size,identity});
+              ORT_RETURN_IF_ERROR(m0_residual_stages::RunHeavyProgram(c,column));
+              ++upsample_dispatches;
+            }
           }
           UpsampleTapAdd add;
           add.AddInput(column_input_window(co)).AddInputs({{out,ProgramTensorMetadataDependency::None},{b,ProgramTensorMetadataDependency::None}})
@@ -279,11 +288,12 @@ class GeneratorEdge : public WebGpuKernel {
               .AddUniformVariables({capacities[0],uint32_t(capacity_),channels,minimum,maximum,modulus,remainder,
                   uint32_t(stage_),tap,o,co,identity});
           ORT_RETURN_IF_ERROR(c.RunProgram(add));
+          ++upsample_dispatches;
         }
       }
       LOGS(c.Logger(),INFO)<<"M0_RW07_GENERATOR_EDGE_V1 mode="<<mode_<<" stage="<<stage_<<" role="<<role
-          <<" session="<<session<<" run="<<run<<" GPU_dispatches="<<(1+((channels+upsample_output_channels-1)/upsample_output_channels)*
-              kernel*(1+(source_channels+upsample_input_channels-1)/upsample_input_channels))
+          <<" session="<<session<<" run="<<run<<" GPU_dispatches="<<upsample_dispatches
+          <<" max_upsample_weight_products_per_dispatch="<<m0_residual_stages::kResidualProductsPerDispatchV1
           <<" input_tile_channels="<<upsample_input_channels<<" output_tile_channels="<<upsample_output_channels
           <<" column_scratch_bytes="<<scratch->SizeInBytes()<<" host_payload_reads=0";
       return Status::OK();
@@ -297,7 +307,7 @@ class GeneratorEdge : public WebGpuKernel {
         const uint64_t gx=std::min(window_groups,limit),gy=(window_groups+gx-1)/gx;
         data.AddInput({out,ProgramTensorMetadataDependency::None}).AddOutput(output_window(y,offset,count))
             .SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
-            .AddUniformVariables({capspan,uint32_t(capacity_),channels,minimum,maximum,modulus,remainder,uint32_t(stage_),count,0u,identity});
+            .AddUniformVariables({capspan,uint32_t(capacity_),channels,minimum,maximum,modulus,remainder,uint32_t(stage_),count,0u,0u,0u,identity});
         ORT_RETURN_IF_ERROR(c.RunProgram(data));
       }
       LOGS(c.Logger(),INFO)<<"M0_RW07_GENERATOR_EDGE_V1 mode="<<mode_<<" stage="<<stage_<<" role="<<role
@@ -333,7 +343,7 @@ class GeneratorEdge : public WebGpuKernel {
               {out,ProgramTensorMetadataDependency::None}})
               .AddOutput(output_window(y,component*11u+offset,count)).SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
               .AddUniformVariables({gsl::span<const uint32_t>{scratch_cap.data(),scratch_cap.size()},uint32_t(capacity_),channels,
-                  minimum,maximum,modulus,remainder,uint32_t(stage_),count,component,identity});
+                  minimum,maximum,modulus,remainder,uint32_t(stage_),count,component,0u,0u,identity});
           ORT_RETURN_IF_ERROR(c.RunProgram(spectral));
         }
       }
@@ -343,16 +353,28 @@ class GeneratorEdge : public WebGpuKernel {
           <<" input_tile_channels="<<projection_input_channels<<" output_tile_channels="<<projection_output_channels<<" host_payload_reads=0";
       return Status::OK();
     }
-    EdgeData data{mode_,pairs};data.CacheHint(std::to_string(mode_));
-    for(uint32_t j=0;j<pairs;j++){data.AddInput({x[j],ProgramTensorMetadataDependency::None});}
-    data.AddInput({out,ProgramTensorMetadataDependency::None});
-    if(w){data.AddInputs({{w,ProgramTensorMetadataDependency::None},{b,ProgramTensorMetadataDependency::None}});}
-    const uint64_t gx=std::min(groups,limit),gy=(groups+gx-1)/gx;
-    data.AddOutput({y,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
-        .AddUniformVariables({capspan,uint32_t(capacity_),channels,minimum,maximum,modulus,remainder,uint32_t(stage_),channels,0u,identity});
-    ORT_RETURN_IF_ERROR(c.RunProgram(data));
+    // Bound convolution weight products, excluding activation/index operations.
+    // At most two transposed-convolution taps contribute to one output.
+    const uint32_t chunk=m0_residual_stages::ResidualConvElementsPerDispatchV1(source_channels,2);
+    ORT_RETURN_IF_NOT(chunk>0,"RW07 whole upsample dispatch work bound");
+    const uint64_t elements=uint64_t(channels)*capacity_;
+    uint64_t upsample_dispatches=1;
+    for(uint64_t first=0;first<elements;first+=chunk){
+      const uint32_t size=static_cast<uint32_t>(std::min<uint64_t>(chunk,elements-first));
+      EdgeData data{mode_,pairs,M0VectorizedConvV1()};data.CacheHint(std::to_string(mode_));
+      for(uint32_t j=0;j<pairs;j++){data.AddInput({x[j],ProgramTensorMetadataDependency::None});}
+      data.AddInput({out,ProgramTensorMetadataDependency::None});
+      if(w){data.AddInputs({{w,ProgramTensorMetadataDependency::None},{b,ProgramTensorMetadataDependency::None}});}
+      const uint64_t cg=(uint64_t(size)+63)/64,gx=std::min(cg,limit),gy=(cg+gx-1)/gx;
+      data.AddOutput({y,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
+          .AddUniformVariables({capspan,uint32_t(capacity_),channels,minimum,maximum,modulus,remainder,uint32_t(stage_),channels,0u,
+                                uint32_t(first),size,identity});
+      ORT_RETURN_IF_ERROR(m0_residual_stages::RunHeavyProgram(c,data));
+      ++upsample_dispatches;
+    }
     LOGS(c.Logger(),INFO)<<"M0_RW07_GENERATOR_EDGE_V1 mode="<<mode_<<" stage="<<stage_<<" role="<<role
-      <<" session="<<session<<" run="<<run<<" GPU_dispatches=2 host_payload_reads=0";
+      <<" session="<<session<<" run="<<run<<" GPU_dispatches="<<upsample_dispatches
+      <<" max_upsample_weight_products_per_dispatch="<<m0_residual_stages::kResidualProductsPerDispatchV1<<" host_payload_reads=0";
     return Status::OK();
   }
  private:

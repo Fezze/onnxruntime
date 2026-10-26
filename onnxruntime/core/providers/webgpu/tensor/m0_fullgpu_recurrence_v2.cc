@@ -3,6 +3,9 @@
 // Exact shared1340 state/recurrence/layout/moments region; sidecars stay on GPU.
 #include <algorithm>
 #include <array>
+#include <memory>
+#include "core/common/m0_observation_options_v1.h"
+#include "core/providers/webgpu/tensor/m0_fullgpu_recurrence_programs_v3.h"
 #include "core/providers/webgpu/webgpu_kernel.h"
 #include "core/providers/webgpu/shader_helper.h"
 #include "core/providers/webgpu/m0_fullgpu_extent_abi2.h"
@@ -21,21 +24,10 @@ ProgramOutput Words(Tensor* tensor) {
 }
 bool Gpu(const Tensor* tensor) { return tensor && tensor->Location().device.Type() == OrtDevice::GPU; }
 
-// Each payload program checks the complete successful output descriptor itself.
-void AddValidExtent(ShaderHelper& shader, const ShaderVariableHelper& extent) {
-  auto& f = shader.AdditionalImplementation();
-  f << "fn valid_extent() -> bool {";
-  f << "if(" << extent.GetByOffset("0u") << "!=2u||" << extent.GetByOffset("1u") << "!=3u||"
-    << extent.GetByOffset("20u") << "!=0u||" << extent.GetByOffset("21u") << "!=63u){return false;}";
-  f << "for(var i=0u;i<10u;i++){if(" << extent.GetByOffset("22u+i") << "!="
-    << GetElementAt("uniforms.identity", "i", 10) << "){return false;}}";
-  f << "if(" << extent.GetByOffset("2u") << "!=1u||" << extent.GetByOffset("3u") << "!=0u||"
-    << extent.GetByOffset("4u") << "!=512u||" << extent.GetByOffset("5u") << "!=0u||"
-    << extent.GetByOffset("7u") << "!=0u||" << extent.GetByOffset("19u") << "!=0u){return false;}"
-    << "for(var i=8u;i<18u;i++){if(" << extent.GetByOffset("i") << "!=0u){return false;}}"
-    << "let d=" << extent.GetByOffset("6u") << ";return d>0u&&d<=uniforms.input_capacity&&"
-    << "d<=uniforms.output_capacity&&" << extent.GetByOffset("18u") << "==512u*d;}\n";
-}
+using m0_recurrence_programs::AddValidExtent;
+using m0_recurrence_programs::RecurrenceData;
+using m0_recurrence_programs::RecurrenceInputProjection;
+
 class RecurrenceGuard final : public Program<RecurrenceGuard> {
  public:
   RecurrenceGuard() : Program{"RW07V2RecurrenceOwnedGuard"} {}
@@ -74,110 +66,6 @@ class RecurrenceGuard final : public Program<RecurrenceGuard> {
       << "if(" << e.GetByOffset("18u") << "!=640u*d){" << out.SetByOffset("20u", "103u") << "return;}"
       << out.SetByOffset("2u", "1u") << out.SetByOffset("4u", "512u") << out.SetByOffset("6u", "d")
       << out.SetByOffset("18u", "512u*d") << out.SetByOffset("21u", "63u");
-    return Status::OK();
-  }
-};
-class RecurrenceData final : public Program<RecurrenceData> {
- public:
-  RecurrenceData() : Program{"RW07V2RecurrenceOwnedData"} {}
-  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
-      {"input_capacity", ProgramUniformVariableDataType::Uint32},
-      {"output_capacity", ProgramUniformVariableDataType::Uint32},
-      {"identity", ProgramUniformVariableDataType::Uint32},
-      {"input_size", ProgramUniformVariableDataType::Uint32},
-      {"hidden_size", ProgramUniformVariableDataType::Uint32});
-  Status GenerateShaderCode(ShaderHelper& s) const override {
-    const auto& x = s.AddInput("x", ShaderUsage::UseValueTypeAlias);
-    const auto& w = s.AddInput("w", ShaderUsage::UseValueTypeAlias);
-    const auto& r = s.AddInput("r", ShaderUsage::UseValueTypeAlias);
-    const auto& b = s.AddInput("b", ShaderUsage::UseValueTypeAlias);
-    const auto& e = s.AddInput("extent", ShaderUsage::UseValueTypeAlias);
-    const auto& y = s.AddOutput("y", ShaderUsage::UseValueTypeAlias);
-    const auto& h = s.AddOutput("final_h", ShaderUsage::UseValueTypeAlias);
-    const auto& c = s.AddOutput("final_c", ShaderUsage::UseValueTypeAlias);
-    AddValidExtent(s, e);
-    // Same scalar activation/gate boundary as the qualified default LSTM source.
-    s.AdditionalImplementation()
-        << "fn sigmoid_f(v:f32)->f32 {let bits=bitcast<u32>(v);let magnitude=bits&0x7fffffffu;"
-        << "if(magnitude>0x7f800000u){return v;}if(magnitude==0x7f800000u){return select(0.0,1.0,(bits&0x80000000u)==0u);}"
-        << "if(v>=0.0){return 1.0/(1.0+exp(-v));}let ex=exp(v);return ex/(1.0+ex);}\n"
-        << "fn tanh_f(v:f32)->f32 {let bits=bitcast<u32>(v);let magnitude=bits&0x7fffffffu;"
-        << "if(magnitude>0x7f800000u){return v;}if(magnitude==0x7f800000u){return select(-1.0,1.0,(bits&0x80000000u)==0u);}return tanh(v);}\n"
-        << "fn lstm_gate_input(v:f32)->f32 {let magnitude=bitcast<u32>(v)&0x7fffffffu;let bound=bitcast<f32>(0x7f7fffffu);"
-        << "if(magnitude>0x7f800000u){return bound;}if(v>bound){return bound;}if(v< -bound){return -bound;}return v;}\n"
-        << "var<workgroup> previous_h:array<f32,256>;var<workgroup> previous_c:array<f32,256>;var<workgroup> active_length:u32;\n";
-    auto& f = s.MainFunctionBody();
-    f << "let unit=local_idx;let direction=workgroup_id.x;let channel=direction*256u+unit;"
-      << "previous_h[unit]=0.0;previous_c[unit]=0.0;"
-      << h.SetByOffset("channel", "0.0") << c.SetByOffset("channel", "0.0")
-      << "for(var t=0u;t<uniforms.output_capacity;t++){" << y.SetByOffset("(t*2u+direction)*256u+unit", "0.0") << "}"
-      << "if(unit==0u){active_length=0u;if(valid_extent()){active_length=" << e.GetByOffset("6u") << ";}}"
-      << "let len=workgroupUniformLoad(&active_length);if(len==0u){return;}"
-      << "for(var step=0u;step<len;step++){let t=select(step,len-1u-step,direction==1u);"
-      << "var gate_i:f32=0.0;var gate_o:f32=0.0;var gate_f:f32=0.0;var gate_c:f32=0.0;"
-      << "let w_base=direction*1024u*640u;for(var k=0u;k<uniforms.input_size;k++){let xv=" << x.GetByOffset("k*uniforms.input_capacity+t") << ";"
-      << "gate_i+=xv*" << w.GetByOffset("w_base+unit*640u+k") << ";"
-      << "gate_o+=xv*" << w.GetByOffset("w_base+(256u+unit)*640u+k") << ";"
-      << "gate_f+=xv*" << w.GetByOffset("w_base+(512u+unit)*640u+k") << ";"
-      << "gate_c+=xv*" << w.GetByOffset("w_base+(768u+unit)*640u+k") << ";}"
-      << "let r_base=direction*1024u*256u;for(var k=0u;k<uniforms.hidden_size;k++){let hv=previous_h[k];"
-      << "gate_i+=hv*" << r.GetByOffset("r_base+unit*256u+k") << ";"
-      << "gate_o+=hv*" << r.GetByOffset("r_base+(256u+unit)*256u+k") << ";"
-      << "gate_f+=hv*" << r.GetByOffset("r_base+(512u+unit)*256u+k") << ";"
-      << "gate_c+=hv*" << r.GetByOffset("r_base+(768u+unit)*256u+k") << ";}"
-      << "let bb=direction*2048u;gate_i+=" << b.GetByOffset("bb+unit") << "+" << b.GetByOffset("bb+1024u+unit") << ";"
-      << "gate_f+=" << b.GetByOffset("bb+512u+unit") << "+" << b.GetByOffset("bb+1536u+unit") << ";"
-      << "gate_c+=" << b.GetByOffset("bb+768u+unit") << "+" << b.GetByOffset("bb+1792u+unit") << ";"
-      << "gate_i=sigmoid_f(lstm_gate_input(gate_i));gate_f=sigmoid_f(lstm_gate_input(gate_f));gate_c=tanh_f(lstm_gate_input(gate_c));"
-      << "let cu=gate_f*previous_c[unit]+gate_i*gate_c;"
-      << "gate_o+=" << b.GetByOffset("bb+256u+unit") << "+" << b.GetByOffset("bb+1280u+unit") << ";"
-      << "gate_o=sigmoid_f(lstm_gate_input(gate_o));let hu=gate_o*tanh_f(cu);"
-      << "workgroupBarrier();previous_c[unit]=cu;previous_h[unit]=hu;workgroupBarrier();"
-      << y.SetByOffset("(t*2u+direction)*256u+unit", "hu") << "}"
-      << h.SetByOffset("channel", "previous_h[unit]") << c.SetByOffset("channel", "previous_c[unit]");
-    return Status::OK();
-  }
-};
-class RecurrenceMerged final : public Program<RecurrenceMerged> {
- public:
-  RecurrenceMerged() : Program{"RW07V2RecurrenceMerged"} {}
-  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
-      {"input_capacity", ProgramUniformVariableDataType::Uint32},
-      {"output_capacity", ProgramUniformVariableDataType::Uint32},
-      {"identity", ProgramUniformVariableDataType::Uint32});
-  Status GenerateShaderCode(ShaderHelper& s) const override {
-    const auto& y = s.AddInput("y", ShaderUsage::UseValueTypeAlias);
-    const auto& e = s.AddInput("extent", ShaderUsage::UseValueTypeAlias);
-    const auto& m = s.AddOutput("merged", ShaderUsage::UseValueTypeAlias);
-    AddValidExtent(s, e);
-    auto& f = s.MainFunctionBody();
-    f << "if(global_idx>=512u*uniforms.output_capacity){return;}" << m.SetByOffset("global_idx", "0.0")
-      << "if(!valid_extent()){return;}let channel=global_idx/uniforms.output_capacity;let t=global_idx%uniforms.output_capacity;"
-      << "if(t>=" << e.GetByOffset("6u") << "){return;}"
-      << m.SetByOffset("global_idx", y.GetByOffset("(t*2u+channel/256u)*256u+channel%256u"));
-    return Status::OK();
-  }
-};
-class RecurrenceMoments final : public Program<RecurrenceMoments> {
- public:
-  RecurrenceMoments() : Program{"RW07V2RecurrenceMoments"} {}
-  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
-      {"input_capacity", ProgramUniformVariableDataType::Uint32},
-      {"output_capacity", ProgramUniformVariableDataType::Uint32},
-      {"identity", ProgramUniformVariableDataType::Uint32});
-  Status GenerateShaderCode(ShaderHelper& s) const override {
-    const auto& m = s.AddInput("merged", ShaderUsage::UseValueTypeAlias);
-    const auto& e = s.AddInput("extent", ShaderUsage::UseValueTypeAlias);
-    const auto& mean = s.AddOutput("mean", ShaderUsage::UseValueTypeAlias);
-    const auto& variance = s.AddOutput("variance", ShaderUsage::UseValueTypeAlias);
-    AddValidExtent(s, e);
-    auto& f = s.MainFunctionBody();
-    f << "if(global_idx>=512u){return;}" << mean.SetByOffset("global_idx", "0.0") << variance.SetByOffset("global_idx", "0.0")
-      << "if(!valid_extent()){return;}let len=" << e.GetByOffset("6u") << ";var sum=0.0;"
-      << "for(var t=0u;t<len;t++){sum+=" << m.GetByOffset("global_idx*uniforms.output_capacity+t") << ";}"
-      << "let mu=sum/f32(len);var squares=0.0;for(var t=0u;t<len;t++){let delta="
-      << m.GetByOffset("global_idx*uniforms.output_capacity+t") << "-mu;squares+=delta*delta;}"
-      << mean.SetByOffset("global_idx", "mu") << variance.SetByOffset("global_idx", "squares/f32(len)");
     return Status::OK();
   }
 };
@@ -256,35 +144,45 @@ Status ComputeOwnedRecurrence(ComputeContext& c, const Tensor* x, const Tensor* 
   RecurrenceGuard guard;
   guard.AddInput(Words(e)).AddOutput(Words(out)).SetWorkgroupSize(1).SetDispatchGroupSize(1).AddUniformVariables({input_capacity, output_capacity, uint32_t(valid_pair), gsl::span<const uint32_t>{in.data(), in.size()}, opaque});
   ORT_RETURN_IF_ERROR(c.RunProgram(guard));
-  RecurrenceData data;
-  data.AddInputs({{x, ProgramTensorMetadataDependency::None}, {w, ProgramTensorMetadataDependency::None}, {r, ProgramTensorMetadataDependency::None}, {b, ProgramTensorMetadataDependency::None}, Words(static_cast<const Tensor*>(out))})
+  const uint64_t transpose_groups=(uint64_t(640)*2048u+63u)/64u;
+  const bool coalesced=M0CoalescedRecurrenceWeightsV1()&&transpose_groups<=uint64_t(l.maxComputeWorkgroupsPerDimension)*l.maxComputeWorkgroupsPerDimension;
+  std::unique_ptr<Tensor> transposed_w,transposed_r;
+  const Tensor* active_w=w;const Tensor* active_r=r;
+  if(coalesced){
+    transposed_w=std::make_unique<Tensor>(c.CreateGPUTensor(w->DataType(),TensorShape{2,640,1024}));
+    transposed_r=std::make_unique<Tensor>(c.CreateGPUTensor(r->DataType(),TensorShape{2,256,1024}));
+    ORT_RETURN_IF_ERROR(binding(transposed_w.get()));ORT_RETURN_IF_ERROR(binding(transposed_r.get()));
+    ORT_RETURN_IF_ERROR(m0_recurrence_programs::RunWeightTranspose(c,w,transposed_w.get(),640));
+    ORT_RETURN_IF_ERROR(m0_recurrence_programs::RunWeightTranspose(c,r,transposed_r.get(),256));
+    active_w=transposed_w.get();active_r=transposed_r.get();
+  }
+  const uint64_t projection_bytes=uint64_t(output_capacity)*2048u*sizeof(float);
+  const bool preproject=M0LstmInputProjectionV1()&&projection_bytes<=l.maxBufferSize&&projection_bytes<=l.maxStorageBufferBindingSize;
+  std::unique_ptr<Tensor> projection;
+  const Tensor* recurrence_input=x;
+  if(preproject){
+    projection=std::make_unique<Tensor>(c.CreateGPUTensor(x->DataType(),TensorShape{output_capacity,2,1024}));
+    ORT_RETURN_IF_ERROR(binding(projection.get()));
+    ORT_RETURN_IF_ERROR(m0_recurrence_programs::RunInputProjectionV1(c,x,active_w,out,projection.get(),
+        input_capacity,output_capacity,opaque,coalesced));
+    recurrence_input=projection.get();
+  }
+  RecurrenceData data{preproject,coalesced};
+  data.AddInputs({{recurrence_input, ProgramTensorMetadataDependency::None}, {active_w, ProgramTensorMetadataDependency::None}, {active_r, ProgramTensorMetadataDependency::None}, {b, ProgramTensorMetadataDependency::None}, Words(static_cast<const Tensor*>(out))})
       .AddOutputs({{y, ProgramTensorMetadataDependency::None}, {h, ProgramTensorMetadataDependency::None}, {cell, ProgramTensorMetadataDependency::None}})
       .SetWorkgroupSize(256)
       .SetDispatchGroupSize(2)
       .AddUniformVariables({input_capacity, output_capacity, opaque, uint32_t(x->Shape()[1]), uint32_t(r->Shape()[2])});
   ORT_RETURN_IF_ERROR(c.RunProgram(data));
-  const uint64_t gx = std::min(groups, uint64_t(l.maxComputeWorkgroupsPerDimension));
-  const uint64_t gy = (groups + gx - 1) / gx;
-  RecurrenceMerged copy;
-  copy.AddInputs({{y, ProgramTensorMetadataDependency::None}, Words(static_cast<const Tensor*>(out))})
-      .AddOutput({merged, ProgramTensorMetadataDependency::None})
-      .SetWorkgroupSize(64)
-      .SetDispatchGroupSize(uint32_t(gx), uint32_t(gy))
-      .AddUniformVariables({input_capacity, output_capacity, opaque});
-  ORT_RETURN_IF_ERROR(c.RunProgram(copy));
-  RecurrenceMoments moments;
-  moments.AddInputs({{merged, ProgramTensorMetadataDependency::None}, Words(static_cast<const Tensor*>(out))})
-      .AddOutputs({{mean, ProgramTensorMetadataDependency::None}, {variance, ProgramTensorMetadataDependency::None}})
-      .SetWorkgroupSize(64)
-      .SetDispatchGroupSize(8)
-      .AddUniformVariables({input_capacity, output_capacity, opaque});
-  ORT_RETURN_IF_ERROR(c.RunProgram(moments));
+  const bool fused_moments=M0FusedRecurrenceMomentsV1()&&uint64_t(l.maxComputeWorkgroupsPerDimension)*l.maxComputeWorkgroupsPerDimension>=512u;
+  ORT_RETURN_IF_ERROR(m0_recurrence_programs::RunFinalization(c,y,out,merged,mean,variance,
+      input_capacity,output_capacity,opaque,fused_moments));
   LOGS(c.Logger(), INFO) << "M0_RW07_RECURRENCE_V2 session=" << session << " run=" << run
                          << " source_sidecar=" << e->DataRaw() << " source_generation=" << source.generation
                          << " source_carrier=" << x->DataRaw() << " source_carrier_generation=" << carrier.generation
                          << " source_pair_valid=" << valid_pair << " output_sidecar=" << out->DataRaw()
                          << " output_generation=" << output.generation << " output_carrier=" << merged->DataRaw()
-                         << " output_carrier_generation=" << output.data_generation << " role=5 instance=1006";
+                         << " output_carrier_generation=" << output.data_generation << " role=5 instance=1006 input_projection=" << preproject << " fused_moments=" << fused_moments << " coalesced_weights=" << coalesced;
   for (const auto* t : {y, h, cell, merged, mean, variance, out}) {
     LOGS(c.Logger(), INFO) << "M0_RW07_RECURRENCE_RESOURCE handle=" << t->DataRaw() << " physical_bytes=" << t->SizeInBytes();
   }

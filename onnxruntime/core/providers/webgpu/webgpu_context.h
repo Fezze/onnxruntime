@@ -3,9 +3,11 @@
 
 #pragma once
 #include "core/providers/webgpu/m0_fullgpu_resource_ownership.h"
+#include "core/providers/webgpu/m0_queued_buffer_budget_v1.h"
 #include "core/providers/webgpu/m0_fullgpu_fault_hooks.h"
 
 #include <atomic>
+#include "core/common/inlined_containers.h"
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -18,6 +20,7 @@
 #include "core/providers/webgpu/webgpu_external_header.h"
 
 #include "core/common/common.h"
+#include "core/common/m0_memory_reserve_v1.h"
 #include "core/providers/webgpu/buffer_manager.h"
 #include "core/providers/webgpu/webgpu_provider_options.h"
 #include "core/providers/webgpu/program_manager.h"
@@ -41,6 +44,17 @@ class WebGpuContext;
 class ComputeContextBase;
 class ComputeContext;
 class ProgramBase;
+// GPU counter origins need not stay comparable across submissions. Durations
+// use a single query pair; placement uses that submission's CPU invocation.
+inline bool M0DecodeGpuTimestampIntervalV1(uint64_t begin, uint64_t end, uint64_t origin,
+    int64_t cpu_offset_us, int64_t& timestamp_us, int64_t& duration_us) {
+  if(end<begin || begin<origin || cpu_offset_us<0)return false;
+  const auto micros=[](uint64_t ns){return ns/1000u+uint64_t(ns%1000u>=500u);};
+  const uint64_t offset=micros(begin-origin),duration=micros(end-begin);
+  if(offset>uint64_t(INT64_MAX-cpu_offset_us)||duration>uint64_t(INT64_MAX))return false;
+  timestamp_us=cpu_offset_us+int64_t(offset);duration_us=int64_t(duration);
+  return true;
+}
 // PendingKernelInfo stores profiling information for a kernel execution
 struct PendingKernelInfo {
   PendingKernelInfo(std::string_view kernel_name,
@@ -106,6 +120,21 @@ struct PendingPipelineBuild {
 //
 // A command with both fields empty is therefore valid only in state 3 before deferred pipeline
 // resolution. DispatchCommand() requires compute_pipeline to be set.
+struct CommandRecordingState;
+static_assert(M0UniformPackingV1::kMaximumBytes==kM0UniformArenaBytesV1);
+struct M0UniformUploadBatchV1 {
+  M0UniformUploadBatchV1(const BufferManager& owner,CommandRecordingState& timeline,WGPUBuffer value,size_t capacity)
+      :manager(owner),recording(timeline),buffer(value),packing(capacity){}
+  ~M0UniformUploadBatchV1(){
+    try{manager.Release(buffer,&recording);}catch(...){manager.M0OwnershipV2().Poison();}
+  }
+  ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(M0UniformUploadBatchV1);
+  const BufferManager& manager;
+  CommandRecordingState& recording;
+  WGPUBuffer buffer;
+  M0UniformPackingV1 packing;
+};
+
 struct CapturedCommandInfo {
   std::string program_key;
   std::optional<PendingPipelineBuild> pending_build;
@@ -114,10 +143,13 @@ struct CapturedCommandInfo {
   std::array<uint32_t, 3> dispatch_group{1, 1, 1};
   // WGPUBuffer for indirect dispatch, nullptr if not using indirect dispatch
   WGPUBuffer indirect_buffer = nullptr;
+  std::shared_ptr<M0UniformUploadBatchV1> m0_uniform_upload;
   // Optional profiling data
   std::optional<PendingKernelInfo> pending_kernel_info;
 };
 
+// Conservative scheduling bound, not measured GPU instructions or FLOPs.
+inline constexpr uint64_t kM0ScheduledProductsPerWindowV1=uint64_t{1}<<28;
 // A command recording timeline has one caller at a time. ORT serializes Run on a Session;
 // plugin streamless operations use independent encoders. BufferManager synchronizes buffer
 // releases from concurrent allocator callers separately from command recording.
@@ -131,10 +163,12 @@ struct CommandRecordingState {
   // Concurrent allocator frees inspect only this flag, never the encoders or deferred dispatches.
   // BufferManager clears it under its cache lock after submission or abandonment.
   std::atomic<bool> has_unsubmitted_work{false};
-  // Conservative queued buffer references, including repeats. This bounds the
-  // native original-model submission window, not free or resident GPU memory.
+  // Legacy mode charges repeated buffer references; batched mode charges unique
+  // retained backing buffers. Both bound the recording, not physical residency.
   uint64_t m0_submission_budget_bytes=0;
   uint64_t m0_queued_reference_bytes=0;
+  uint64_t m0_queued_scheduled_products=0;
+  webgpu::M0QueuedBufferBudgetV1 m0_unique_queued_buffers;
 #if defined(_WIN32) && defined(ENABLE_D3D12_FILE_LOADING)
   std::mutex pending_release_callbacks_mutex;
   std::vector<std::function<void()>> pending_release_callbacks;
@@ -143,6 +177,15 @@ struct CommandRecordingState {
   std::vector<PendingKernelInfo> pending_kernels;
   GraphCaptureState graph_capture_state{GraphCaptureState::Default};
   std::vector<CapturedCommandInfo>* external_captured_commands = nullptr;
+  // Keep uploaded blocks alive through Submit, including already encoded commands.
+  std::shared_ptr<M0UniformUploadBatchV1> m0_uniform_current;
+  std::vector<std::shared_ptr<M0UniformUploadBatchV1>> m0_uniform_batches;
+  uint64_t m0_uniform_arena_uploads=0,m0_uniform_arena_bytes=0;
+  void M0ReleaseUniformUploadsV1(){
+    m0_uniform_current.reset();
+    for(auto& command:deferred_dispatches)command.m0_uniform_upload.reset();
+    m0_uniform_batches.clear();
+  }
 };
 
 struct WebGpuBufferCacheConfig {
@@ -270,6 +313,18 @@ class WebGpuContext final {
   static constexpr uint64_t kWebGpuGuaranteedMaxStorageBufferBindingSize =
       128ULL * 1024 * 1024;
 
+  uint32_t M0ResidualBlockChoiceV1(const std::string& key) const {
+    std::lock_guard<std::mutex> lock(m0_residual_block_mutex_);
+    const auto found=m0_residual_blocks_.find(key);
+    return found==m0_residual_blocks_.end()?0u:found->second;
+  }
+  void M0RememberResidualBlockV1(const std::string& key,uint32_t block) {
+    ORT_ENFORCE(block==1||block==2||block==4||block==8||block==16,"RW07 residual tuning block");
+    std::lock_guard<std::mutex> lock(m0_residual_block_mutex_);
+    if(m0_residual_blocks_.size()>=128)m0_residual_blocks_.clear();
+    m0_residual_blocks_[key]=block;
+  }
+
   ~WebGpuContext();
 
   Status Wait(wgpu::Future f);
@@ -341,6 +396,8 @@ class WebGpuContext final {
                             bool diagnostic_zero_deadline = false);
   Status M0BeforeEnqueueV1(const webgpu::BufferManager& buffer_mgr, CommandRecordingState& recording,
                          uint64_t reference_bytes);
+  Status M0BeforeEnqueueUniqueV1(const webgpu::BufferManager& buffer_mgr, CommandRecordingState& recording,
+                                  const std::vector<webgpu::M0QueuedBufferBudgetV1::Reference>& references);
   Status M0DrainOnMemoryPressureV1(const webgpu::BufferManager& buffer_mgr,
                                   CommandRecordingState& recording, uint64_t allocation_bytes);
   Status M0FlushIfBudgetReachedV1(const webgpu::BufferManager& buffer_mgr, CommandRecordingState& recording);
@@ -350,10 +407,13 @@ class WebGpuContext final {
   webgpu::M0FullGpuResourceOwnership& M0OwnershipV2() const { return m0_ownership_v2_; }
   webgpu::M0FullGpuFaultHooksV2& M0FaultHooksV2() const { return m0_fault_hooks_v2_; }
   bool M0ProfilingActiveV2() const { return is_profiling_; }
+  uint32_t M0DispatchWindowV1() const { return max_num_pending_dispatches_; }
   bool M0BoundedSubmissionsActiveV1() const { return m0_bounded_submissions_active_.load(std::memory_order_acquire); }
   bool M0BeginBoundedSubmissionsV1(){
     bool expected=false;
-    return m0_bounded_submissions_active_.compare_exchange_strong(expected,true,std::memory_order_acq_rel);
+    const bool acquired=m0_bounded_submissions_active_.compare_exchange_strong(expected,true,std::memory_order_acq_rel);
+    if(acquired)m0_memory_probe_window_.Reset();
+    return acquired;
   }
   bool M0EndBoundedSubmissionsV1(){
     bool expected=true;
@@ -411,7 +471,8 @@ class WebGpuContext final {
   //
   Status PopErrorScope();
 
-  Status Run(ComputeContextBase& context, const ProgramBase& program);
+  Status Run(ComputeContextBase& context, const ProgramBase& program, uint64_t scheduled_products=0);
+  Status RunWithCheckedCompletion(ComputeContextBase& context, const ProgramBase& program);
 
 #if defined(ENABLE_PIX_FOR_WEBGPU_EP)
   std::unique_ptr<WebGpuPIXFrameGenerator> CreatePIXFrameGenerator() {
@@ -421,6 +482,8 @@ class WebGpuContext final {
 #endif  // ENABLE_PIX_FOR_WEBGPU_EP
 
  private:
+  mutable std::mutex m0_residual_block_mutex_;
+  InlinedHashMap<std::string,uint32_t> m0_residual_blocks_;
   enum class TimestampQueryType {
     None = 0,
     InsidePasses,
@@ -480,8 +543,8 @@ class WebGpuContext final {
   void WriteTimestamp(CommandRecordingState& recording, uint32_t query_index);
 
   struct PendingQueryInfo {
-    PendingQueryInfo(std::vector<PendingKernelInfo>&& kernels, wgpu::Buffer query_buffer)
-        : kernels{std::move(kernels)}, query_buffer{query_buffer} {}
+    PendingQueryInfo(std::vector<PendingKernelInfo>&& kernels, wgpu::Buffer query_buffer, int64_t cpu_offset_us)
+        : kernels{std::move(kernels)}, query_buffer{query_buffer}, cpu_offset_us{cpu_offset_us} {}
 
     PendingQueryInfo(PendingQueryInfo&&) = default;
     PendingQueryInfo& operator=(PendingQueryInfo&&) = default;
@@ -489,6 +552,7 @@ class WebGpuContext final {
 
     std::vector<PendingKernelInfo> kernels;
     wgpu::Buffer query_buffer;
+    int64_t cpu_offset_us;
   };
 
   // Find the build owner for a cache key in the current deferred window.
@@ -531,6 +595,7 @@ class WebGpuContext final {
   std::unique_ptr<ProgramManager> program_mgr_;
 
   uint32_t max_num_pending_dispatches_ = 16;
+  M0MemoryProbeWindowV1 m0_memory_probe_window_;
 
   std::unique_ptr<SplitKConfig> split_k_config_;
 
@@ -542,13 +607,9 @@ class WebGpuContext final {
   // info of queries pending appending to profiling events
   std::vector<PendingQueryInfo> pending_queries_;
 
-  uint64_t gpu_timestamp_offset_ = 0;
   // ORT profiler's CPU time base, set via SetProfilingStartTime; GPU timestamps are
   // aligned to it. See SetProfilingStartTime.
   TimePoint profiling_start_time_;
-  // CPU elapsed time (us) from profiling_start_time_ to the first GPU submit, applied
-  // as an offset to GPU timestamps in CollectProfilingData. -1 until the first submit.
-  int64_t profiling_first_submit_cpu_offset_us_ = -1;
   bool is_profiling_ = false;
   // Shared GPU profiling events for run-level profiling.
   profiling::Events events_;

@@ -52,20 +52,7 @@ fn original_div(a:f32,b:f32)->f32 {
 }
 )WGSL";
 }
-void PayloadGuard(ShaderHelper& s, const ShaderVariableHelper& e) {
-  auto& f = s.AdditionalImplementation();
-  f << "fn valid_output() -> bool {if(" << e.GetByOffset("0u") << "!=2u||"
-    << e.GetByOffset("1u") << "!=3u||" << e.GetByOffset("20u") << "!=0u||"
-    << e.GetByOffset("21u") << "!=63u){return false;}"
-    << "for(var i=0u;i<10u;i++){if(" << e.GetByOffset("22u+i") << "!="
-    << GetElementAt("uniforms.identity", "i", 10) << "){return false;}}"
-    << "if(" << e.GetByOffset("2u") << "!=1u||" << e.GetByOffset("3u") << "!=0u||"
-    << e.GetByOffset("4u") << "!=select(1024u,512u," << GetElementAt("uniforms.identity", "8u", 10) << "==24u)||" << e.GetByOffset("5u") << "!=0u||"
-    << e.GetByOffset("7u") << "!=0u||" << e.GetByOffset("19u") << "!=0u){return false;}"
-    << "for(var i=8u;i<18u;i++){if(" << e.GetByOffset("i") << "!=0u){return false;}}"
-    << "let d=" << e.GetByOffset("6u") << ";return d>0u&&d<=select(102400u,204800u," << GetElementAt("uniforms.identity", "8u", 10) << "==24u)&&d<=uniforms.final_capacity&&"
-    << e.GetByOffset("18u") << "==select(1024u,512u," << GetElementAt("uniforms.identity", "8u", 10) << "==24u)*d&&(" << GetElementAt("uniforms.identity", "8u", 10) << "!=24u||d%2u==0u);}\n";
-}
+using m0_decoder_stages::PayloadGuard;
 class DecoderGuard final : public Program<DecoderGuard> {
  public:
   DecoderGuard() : Program{"RW07DecoderResidualOwnedGuardV1"} {}
@@ -161,116 +148,9 @@ class DecoderNormStyle final : public Program<DecoderNormStyle> {
   }
 };
 constexpr uint32_t kDecoderPoolTileChannels=64;
-class DecoderPoolTile final : public Program<DecoderPoolTile> {
- public:
-  DecoderPoolTile() : Program{"RW07DecoderResidualDepthwisePoolLocalChannelTileV2"} {}
-  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
-      {"input_capacity", ProgramUniformVariableDataType::Uint32},
-      {"output_capacity", ProgramUniformVariableDataType::Uint32},
-      {"channels", ProgramUniformVariableDataType::Uint32},
-      {"channel_offset", ProgramUniformVariableDataType::Uint32},
-      {"channel_count", ProgramUniformVariableDataType::Uint32},
-      {"final_capacity", ProgramUniformVariableDataType::Uint32},
-      {"identity", ProgramUniformVariableDataType::Uint32});
-  Status GenerateShaderCode(ShaderHelper& s) const override {
-    const auto& x = s.AddInput("x", ShaderUsage::UseValueTypeAlias);
-    const auto& w = s.AddInput("weight", ShaderUsage::UseValueTypeAlias);
-    const auto& b = s.AddInput("bias", ShaderUsage::UseValueTypeAlias);
-    const auto& e = s.AddInput("extent", ShaderUsage::UseValueTypeAlias);
-    const auto& y = s.AddOutput("y", ShaderUsage::UseValueTypeAlias);
-    PayloadGuard(s, e);
-    OriginalArithmetic(s);
-    auto& f = s.MainFunctionBody();
-    f << "if(global_idx>=uniforms.channels*uniforms.output_capacity){return;}"
-      << y.SetByOffset("global_idx", "0.0") << "if(!valid_output()){return;}"
-      << "let d=" << e.GetByOffset("6u") << ";let t=global_idx%uniforms.output_capacity;"
-      << "let local_ch=global_idx/uniforms.output_capacity;"
-      << "if(t>=d||local_ch>=uniforms.channel_count||uniforms.channel_offset>=1090u||"
-      << "uniforms.channel_count>uniforms.channels||uniforms.channel_count>1090u-uniforms.channel_offset){return;}"
-      << "let ch=uniforms.channel_offset+local_ch;var sum:f32=0.0;"
-      // Original CPU Col2im visits kernel taps in ascending order.
-      << "for(var k=0u;k<3u;k++){"
-      << "let numerator=i32(t)+1-i32(k);if(numerator>=0&&numerator%2==0){"
-      << "let source_t=u32(numerator/2);if(source_t<d/2u&&source_t<uniforms.input_capacity){"
-      << "let product:f32=original_mul(" << x.GetByOffset("local_ch*uniforms.input_capacity+source_t") << ","
-      << w.GetByOffset("ch*3u+k") << ");sum=original_add(sum,product);}}}let result:f32=original_add(sum,"
-      << b.GetByOffset("ch") << ");" << y.SetByOffset("global_idx", "result");
-    return Status::OK();
-  }
-};
-class DecoderConvTile final : public Program<DecoderConvTile> {
- public:
-  explicit DecoderConvTile(bool bias) : Program{"RW07DecoderResidualConvOutputWindowV3"}, bias_(bias) {}
-  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
-      {"input_capacity", ProgramUniformVariableDataType::Uint32},
-      {"output_capacity", ProgramUniformVariableDataType::Uint32},
-      {"input_channels", ProgramUniformVariableDataType::Uint32},
-      {"output_channels", ProgramUniformVariableDataType::Uint32},
-      {"width", ProgramUniformVariableDataType::Uint32},
-      {"channel_offset", ProgramUniformVariableDataType::Uint32},
-      {"channel_count", ProgramUniformVariableDataType::Uint32},
-      {"output_offset", ProgramUniformVariableDataType::Uint32},
-      {"output_count", ProgramUniformVariableDataType::Uint32},
-      {"nearest", ProgramUniformVariableDataType::Uint32},
-      {"final_capacity", ProgramUniformVariableDataType::Uint32},
-      {"identity", ProgramUniformVariableDataType::Uint32});
-  Status GenerateShaderCode(ShaderHelper& s) const override {
-    const auto& x=s.AddInput("pool_tile",ShaderUsage::UseValueTypeAlias);
-    const auto& w=s.AddInput("weight",ShaderUsage::UseValueTypeAlias);
-    const ShaderVariableHelper* b=bias_?&s.AddInput("bias",ShaderUsage::UseValueTypeAlias):nullptr;
-    const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
-    const auto& y=s.AddOutput("accumulator",ShaderUsage::UseValueTypeAlias);
-    PayloadGuard(s,e);OriginalArithmetic(s);
-    auto& f=s.MainFunctionBody();
-    f<<"if(global_idx>=uniforms.output_count*uniforms.output_capacity){return;}"
-      <<"if(!valid_output()){ "<<y.SetByOffset("global_idx","0.0")<<"return;}"
-      <<"let d="<<e.GetByOffset("6u")<<";let t=global_idx%uniforms.output_capacity;"
-      <<"let oc=uniforms.output_offset+global_idx/uniforms.output_capacity;"
-      <<"if(t>=d||uniforms.channel_offset>=uniforms.input_channels||uniforms.channel_count==0u||"
-      <<"uniforms.channel_count>64u||uniforms.channel_count>uniforms.input_channels-uniforms.channel_offset){"
-      <<y.SetByOffset("global_idx","0.0")<<"return;}"
-      // Continue the scalar sum; summing independent tile totals would reorder it.
-      <<"var sum:f32=0.0;if(uniforms.channel_offset!=0u){sum="<<y.GetByOffset("global_idx")<<";}"
-      <<"for(var local_ic=0u;local_ic<uniforms.channel_count;local_ic++){"
-      <<"let ic=uniforms.channel_offset+local_ic;for(var k=0u;k<uniforms.width;k++){"
-      <<"let pos=i32(t)+i32(k)-i32(uniforms.width/2u);var value:f32=0.0;"
-      <<"if(pos>=0&&u32(pos)<d){let source_t=select(u32(pos),u32(pos)/2u,uniforms.nearest!=0u);"
-      <<"if(source_t<uniforms.input_capacity){value="
-      <<x.GetByOffset("local_ic*uniforms.input_capacity+source_t")<<";}}"
-      <<"let product:f32=original_mul(value,"<<w.GetByOffset("(oc*uniforms.input_channels+ic)*uniforms.width+k")
-      <<");sum=original_add(sum,product);}}";
-    if(bias_) f<<"if(uniforms.channel_offset+uniforms.channel_count==uniforms.input_channels){sum=original_add(sum,"
-               <<b->GetByOffset("oc")<<");}";
-    f<<y.SetByOffset("global_idx","sum");
-    return Status::OK();
-  }
- private:
-  const bool bias_;
-};
-class DecoderResidualAdd final : public Program<DecoderResidualAdd> {
- public:
-  DecoderResidualAdd() : Program{"RW07DecoderResidualInPlaceResidualAddWindowV3"} {}
-  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
-      {"capacity", ProgramUniformVariableDataType::Uint32},
-      {"channels", ProgramUniformVariableDataType::Uint32},
-      {"final_capacity", ProgramUniformVariableDataType::Uint32},
-      {"identity", ProgramUniformVariableDataType::Uint32});
-  Status GenerateShaderCode(ShaderHelper& s) const override {
-    const auto& skip = s.AddInput("skip", ShaderUsage::UseValueTypeAlias);
-    const auto& e = s.AddInput("extent", ShaderUsage::UseValueTypeAlias);
-    const auto& y = s.AddOutput("y", ShaderUsage::UseValueTypeAlias);
-    PayloadGuard(s, e);
-    OriginalArithmetic(s);
-    auto& f = s.MainFunctionBody();
-    f << "if(global_idx>=uniforms.channels*uniforms.capacity){return;}"
-      << "if(!valid_output()){ " << y.SetByOffset("global_idx", "0.0") << "return;}"
-      << "if(global_idx%uniforms.capacity>=" << e.GetByOffset("6u") << "){"
-      << y.SetByOffset("global_idx", "0.0") << "return;}"
-      << "let added:f32=original_add(" << y.GetByOffset("global_idx") << "," << skip.GetByOffset("global_idx") << ");"
-      << y.SetByOffset("global_idx", "original_div(added,bitcast<f32>(0x3fb504f3u))");
-    return Status::OK();
-  }
-};
+using m0_decoder_stages::DecoderPoolTile;
+using m0_decoder_stages::DecoderConvTile;
+using m0_decoder_stages::DecoderResidualAdd;
 Status Binding(ComputeContext& c, const Tensor* t) {
   M0FullGpuStorageAllocationV1 allocation;
   ORT_RETURN_IF_NOT(t&&c.M0FullGpuDescribeStorageV1(*t,allocation),"RW07 live physical storage allocation");

@@ -6,6 +6,8 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include "gsl/span"
+#include "core/common/inlined_containers.h"
 #include "core/session/plugin_ep/m0_kernel_creator_binding_v1.h"
 #include "core/session/plugin_ep/m0_native_kernel_binding_v2.h"
 #include "core/session/plugin_ep/m0_native_resource_binding_v3.h"
@@ -46,9 +48,12 @@ class EpLibraryPlugin : public EpLibrary {
   Status M0LoadOriginalLstmV1();
   Status M0QueryOriginalLstmV1(M0PluginKernelCreatorBindingV1& binding);
   Status M0QueryNativeKernelV2(uint32_t record,M0NativeProviderKernelBindingV2& binding);
+  Status M0QueryNativeKernelsV2(gsl::span<const uint32_t> records,InlinedVector<M0NativeProviderKernelBindingV2>& bindings);
   Status M0QueryNativeDeviceLimitsV1(const OrtEp* ep,uint64_t storage_bytes,uint64_t initializer_bytes,
                                      uint64_t uniform_bytes,M0NativeDeviceLimitsV1& limits);
   Status M0QueryNativeResourceV3(const OrtEp* ep,uintptr_t handle,uint64_t required_bytes,M0NativeResourceBindingV3& binding);
+  Status M0QueryNativeResourcesV3(const OrtEp* ep,gsl::span<const std::pair<uintptr_t,uint64_t>> queries,
+                                  InlinedVector<M0NativeResourceBindingV3>& bindings);
   void* m0_query_v1_ = nullptr;
   std::string m0_module_lease_key_;
   size_t GetFactoryCount() const override {

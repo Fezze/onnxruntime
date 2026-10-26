@@ -5,6 +5,10 @@
 #include "core/providers/webgpu/webgpu_context.h"
 #include "core/providers/webgpu/webgpu_execution_provider.h"
 #include "core/providers/webgpu/program.h"
+#include "core/common/m0_observation_options_v1.h"
+#if defined(ORT_USE_EP_API_ADAPTERS)
+#include "core/providers/webgpu/ep/ep.h"
+#endif
 
 namespace onnxruntime {
 namespace webgpu {
@@ -27,6 +31,12 @@ Status WebGpuKernel::Compute(OpKernelContext* p_op_kernel_context) const {
 
   webgpu_context_.M0OwnershipV2().RecordWorkload(M0WorkloadEventV1::OperatorStarted);
   Status s = ComputeInternal(context);
+#if defined(ORT_USE_EP_API_ADAPTERS)
+  if (s.IsOK() && M0GpuNumericTraceV1()) {
+    const auto* bridge = static_cast<const ep::Ep*>(Info().GetOrtEp());
+    s = bridge->TraceNumericOutputs(context);
+  }
+#endif
 
   if (webgpu_context_.ValidationMode() >= ValidationMode::Full) {
     ORT_RETURN_IF_ERROR(webgpu_context_.PopErrorScope());

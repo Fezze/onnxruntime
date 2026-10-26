@@ -7,6 +7,7 @@
 #include <limits>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include "core/session/onnxruntime_c_api.h"
 #include "core/session/plugin_ep/m0_kernel_creator_binding_v1.h"
 
@@ -97,4 +98,22 @@ static_assert(std::is_trivially_copyable_v<M0NativeProviderKernelBindingV2>);
 // ABI2/refusal returns0 and leaves output unchanged. No execution authority.
 using M0WebGpuNativeCreatorBindingQueryV2 = int(ORT_API_CALL*)(
     uint32_t abi, uint32_t record_id, M0NativeProviderKernelBindingV2* output) noexcept;
+// One bounded read-only registry observation. The caller authenticates the
+// module/factory for the complete transaction and verifies creator origins.
+// No partial result is published when any row or origin check is refused.
+template<class Records,class Query,class Verify,class Rows>
+bool M0CollectNativeKernelsV2(const Records& records,Query&& query,Verify&& verify,Rows& output){
+  if(records.empty()||records.size()>kM0NativeKernelRecordsV2.size())return false;
+  std::array<bool,kM0NativeKernelRecordsV2.size()+1> seen{};
+  for(uint32_t id:records){if(!M0NativeKernelRecordByIdV2(id)||seen[id])return false;seen[id]=true;}
+  Rows pending;pending.reserve(records.size());
+  for(uint32_t id:records){
+    const auto* expected=M0NativeKernelRecordByIdV2(id);
+    M0NativeProviderKernelBindingV2 row;
+    if(query(2,id,&row)!=1||row.abi!=2||row.record_id!=id||row.type!=expected->type||
+      !row.registry||!row.registration_definition||!row.creator.callback||!row.creator.state||!verify(row))return false;
+    pending.push_back(row);
+  }
+  output=std::move(pending);return true;
+}
 }  // namespace onnxruntime

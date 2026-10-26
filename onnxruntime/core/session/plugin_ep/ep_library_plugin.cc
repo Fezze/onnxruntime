@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <array>
 #include "core/session/plugin_ep/ep_library_plugin.h"
 
 #include "core/common/logging/logging.h"
@@ -208,14 +209,19 @@ Status EpLibraryPlugin::M0LoadOriginalLstmV1() {
 Status EpLibraryPlugin::M0QueryOriginalLstmV1(M0PluginKernelCreatorBindingV1& binding) {
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && defined(__ANDROID__) && defined(USE_WEBGPU) && !defined(ORT_MINIMAL_BUILD) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
   std::lock_guard<std::mutex> lock{mutex_};
-  ORT_RETURN_IF_NOT(handle_ && m0_query_v1_ && !m0_module_lease_key_.empty() && factories_.empty(),
+  ORT_RETURN_IF_NOT(handle_ && m0_query_v1_ && !m0_module_lease_key_.empty() && factories_.size() <= 1,
                     "RW07_LSTM_MODULE_QUERY_STATE");
   const auto canonical = std::filesystem::canonical(library_path_);
   void* base = nullptr;
   ORT_RETURN_IF_NOT(M0SymbolPathV1(m0_query_v1_, &base) == canonical &&
                         M0FileKeyV1(canonical) == m0_module_lease_key_,
                     "RW07_LSTM_MODULE_QUERY_CHANGED");
-  ORT_RETURN_IF_ERROR(ep_library_plugin_utils::CreateFactories(create_fn_, release_fn_, registration_name_, factories_));
+  // An exclusively retained private module can serve sequential sessions. Keep
+  // its one factory alive, but authenticate the actual creator binding again on
+  // every query. Session providers/devices are still created afresh by Open.
+  if (factories_.empty()) {
+    ORT_RETURN_IF_ERROR(ep_library_plugin_utils::CreateFactories(create_fn_, release_fn_, registration_name_, factories_));
+  }
   const auto query = reinterpret_cast<M0WebGpuLstm14CreatorBindingQueryV1>(m0_query_v1_);
   M0PluginKernelCreatorBindingV1 actual;
   ORT_RETURN_IF_NOT(query(1, &actual) == 1 && actual.callback && actual.state, "RW07_LSTM_MODULE_BINDING");
@@ -232,16 +238,21 @@ Status EpLibraryPlugin::M0QueryOriginalLstmV1(M0PluginKernelCreatorBindingV1& bi
   return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "RW07_LSTM_MODULE_UNSUPPORTED");
 #endif
 }
-Status EpLibraryPlugin::M0QueryNativeKernelV2(uint32_t record,M0NativeProviderKernelBindingV2& binding) {
+Status EpLibraryPlugin::M0QueryNativeKernelV2(uint32_t record,M0NativeProviderKernelBindingV2& binding){
+  const std::array<uint32_t,1> records{record};InlinedVector<M0NativeProviderKernelBindingV2> rows;
+  ORT_RETURN_IF_ERROR(M0QueryNativeKernelsV2(records,rows));
+  ORT_RETURN_IF_NOT(rows.size()==1,"RW07_NATIVE_MODULE_QUERY_COUNT");binding=rows.front();return Status::OK();
+}
+Status EpLibraryPlugin::M0QueryNativeKernelsV2(gsl::span<const uint32_t> records,
+    InlinedVector<M0NativeProviderKernelBindingV2>& bindings){
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && defined(__ANDROID__) && defined(USE_WEBGPU) && !defined(ORT_MINIMAL_BUILD) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
   auto status=Status::OK();
   ORT_TRY {
     std::lock_guard<std::mutex> lock{mutex_};
     status=[&]()->Status{
-      ORT_RETURN_IF_NOT(handle_&&m0_query_v1_&&!m0_module_lease_key_.empty()&&factories_.size()==1&&M0NativeKernelRecordByIdV2(record),
+      ORT_RETURN_IF_NOT(handle_&&m0_query_v1_&&!m0_module_lease_key_.empty()&&factories_.size()==1,
                         "RW07_NATIVE_MODULE_QUERY_STATE");
-      const auto canonical=std::filesystem::canonical(library_path_);
-      void* base=nullptr;
+      const auto canonical=std::filesystem::canonical(library_path_);void* base=nullptr;
       ORT_RETURN_IF_NOT(M0SymbolPathV1(m0_query_v1_,&base)==canonical&&M0MappedKeyV1(m0_query_v1_)==m0_module_lease_key_&&
                             M0FileKeyV1(canonical)==m0_module_lease_key_,"RW07_NATIVE_MODULE_ORIGIN_CHANGED");
       M0WebGpuNativeCreatorBindingQueryV2 query=nullptr;
@@ -249,17 +260,20 @@ Status EpLibraryPlugin::M0QueryNativeKernelV2(uint32_t record,M0NativeProviderKe
       void* query_base=nullptr;
       ORT_RETURN_IF_NOT(query&&M0SymbolPathV1(reinterpret_cast<void*>(query),&query_base)==canonical&&query_base==base&&
                             M0MappedKeyV1(reinterpret_cast<void*>(query))==m0_module_lease_key_,"RW07_NATIVE_MODULE_QUERY_ORIGIN");
-      M0NativeProviderKernelBindingV2 pending;
-      ORT_RETURN_IF_NOT(query(2,record,&pending)==1&&pending.abi==2&&pending.record_id==record&&pending.registry&&
-                            pending.registration_definition&&pending.creator.callback&&pending.creator.state,
-                        "RW07_NATIVE_MODULE_QUERY_BINDING");
-      for(void* symbol:{reinterpret_cast<void*>(pending.creator.callback),pending.creator.state}){
-        void* actual_base=nullptr;
-        ORT_RETURN_IF_NOT(M0SymbolPathV1(symbol,&actual_base)==canonical&&actual_base==base&&M0MappedKeyV1(symbol)==m0_module_lease_key_,
-                          "RW07_NATIVE_MODULE_CREATOR_ORIGIN");
-      }
+      std::set<void*> verified_symbols;
+      const auto verify=[&](const M0NativeProviderKernelBindingV2& row){
+        for(void* symbol:{reinterpret_cast<void*>(row.creator.callback),row.creator.state}){
+          if(verified_symbols.count(symbol))continue;
+          void* actual_base=nullptr;
+          if(M0SymbolPathV1(symbol,&actual_base)!=canonical||actual_base!=base||M0MappedKeyV1(symbol)!=m0_module_lease_key_)return false;
+          verified_symbols.insert(symbol);
+        }
+        return true;
+      };
+      InlinedVector<M0NativeProviderKernelBindingV2> pending;
+      ORT_RETURN_IF_NOT(M0CollectNativeKernelsV2(records,query,verify,pending),"RW07_NATIVE_MODULE_QUERY_BINDING");
       ORT_RETURN_IF_NOT(M0FileKeyV1(canonical)==m0_module_lease_key_,"RW07_NATIVE_MODULE_QUERY_INODE_CHANGED");
-      binding=pending;return Status::OK();
+      bindings=std::move(pending);return Status::OK();
     }();
   }
   ORT_CATCH(const std::exception& error){
@@ -267,12 +281,20 @@ Status EpLibraryPlugin::M0QueryNativeKernelV2(uint32_t record,M0NativeProviderKe
   }
   return status;
 #else
-  ORT_UNUSED_PARAMETER(record);ORT_UNUSED_PARAMETER(binding);
+  ORT_UNUSED_PARAMETER(records);ORT_UNUSED_PARAMETER(bindings);
   return ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_MODULE_UNSUPPORTED");
 #endif
 }
 Status EpLibraryPlugin::M0QueryNativeResourceV3(const OrtEp* ep,uintptr_t handle,uint64_t required_bytes,
                                                M0NativeResourceBindingV3& binding){
+ const std::array<std::pair<uintptr_t,uint64_t>,1> queries{{{handle,required_bytes}}};
+ InlinedVector<M0NativeResourceBindingV3> result;
+ ORT_RETURN_IF_ERROR(M0QueryNativeResourcesV3(ep,queries,result));
+ ORT_RETURN_IF_NOT(result.size()==1,"RW07_NATIVE_RESOURCE_BINDING_COUNT");
+ binding=result.front();return Status::OK();
+}
+Status EpLibraryPlugin::M0QueryNativeResourcesV3(const OrtEp* ep,
+    gsl::span<const std::pair<uintptr_t,uint64_t>> queries,InlinedVector<M0NativeResourceBindingV3>& bindings){
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && defined(__ANDROID__) && defined(USE_WEBGPU) && !defined(ORT_MINIMAL_BUILD) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
  auto status=Status::OK();
  ORT_TRY {
@@ -296,12 +318,10 @@ Status EpLibraryPlugin::M0QueryNativeResourceV3(const OrtEp* ep,uintptr_t handle
     ORT_RETURN_IF_NOT(symbol&&M0SymbolPathV1(symbol,&symbol_base)==canonical&&symbol_base==base&&
       M0MappedKeyV1(symbol)==m0_module_lease_key_,"RW07_NATIVE_RESOURCE_EP_ORIGIN");
    }
-   M0NativeResourceBindingV3 pending;
-   ORT_RETURN_IF_NOT(query(3,ep,handle,required_bytes,&pending)==1&&pending.abi==3&&pending.structure_bytes==sizeof(pending)&&
-     pending.ep==reinterpret_cast<uintptr_t>(ep)&&pending.context&&pending.device&&pending.queue&&pending.handle==handle,
-     "RW07_NATIVE_RESOURCE_BINDING");
+   InlinedVector<M0NativeResourceBindingV3> pending;
+   ORT_RETURN_IF_NOT(M0CollectNativeResourcesV3(ep,queries,query,pending),"RW07_NATIVE_RESOURCE_BINDING");
    ORT_RETURN_IF_NOT(M0FileKeyV1(canonical)==m0_module_lease_key_,"RW07_NATIVE_RESOURCE_INODE_CHANGED");
-   binding=pending;return Status::OK();
+   bindings=std::move(pending);return Status::OK();
   }();
  }
  ORT_CATCH(const std::exception& error){
@@ -309,7 +329,7 @@ Status EpLibraryPlugin::M0QueryNativeResourceV3(const OrtEp* ep,uintptr_t handle
  }
  return status;
 #else
- ORT_UNUSED_PARAMETER(ep);ORT_UNUSED_PARAMETER(handle);ORT_UNUSED_PARAMETER(required_bytes);ORT_UNUSED_PARAMETER(binding);
+ ORT_UNUSED_PARAMETER(ep);ORT_UNUSED_PARAMETER(queries);ORT_UNUSED_PARAMETER(bindings);
  return ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_RESOURCE_UNSUPPORTED");
 #endif
 }

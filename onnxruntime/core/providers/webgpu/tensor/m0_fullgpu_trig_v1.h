@@ -5,8 +5,9 @@
 namespace onnxruntime::webgpu::m0_trig_detail {
 // WGSL only bounds builtin sin/cos accuracy on [-pi, pi]. Original phase
 // accumulation and Snake activations are not restricted to that interval.
-// Reduce the actual FP32 argument using an integer 256-bit 2/pi product;
-// float modulo by a rounded pi would lose the phase of large arguments.
+// Use an exact-product split pi/2 reduction for bounded arguments and an
+// integer 256-bit 2/pi product for large arguments. Float modulo by a
+// rounded pi would lose the phase of large arguments.
 inline constexpr const char* Trig = R"WGSL(
 fn rw07_trig_f32(bits:u32)->f32 {return bitcast<f32>(bits);}
 fn rw07_trig_bit(p:array<u32,18>,at:u32)->u32 {
@@ -48,7 +49,18 @@ fn rw07_sincos(x:f32)->vec2<f32> {
  if(magnitude>=0x7f800000u){let nan=rw07_trig_f32(0x7fc00000u);return vec2<f32>(nan);}
  if(magnitude<0x39800000u){return vec2<f32>(x,1.0);}
  var r=bitcast<f32>(magnitude);var quadrant=0u;
- if(magnitude>0x3f490fdbu){let reduced=rw07_trig_reduce(magnitude);r=reduced.x;quadrant=u32(reduced.y);}
+ if(magnitude>0x3f490fdbu){
+  if(magnitude<=0x46000000u){
+   // For |x|<=8192, q<=5215. These first two products are exact:
+   // 1.5703125=201/128 and 0.0004837512969970703125=2029/2^22.
+   // Subtract the split pi/2 terms before the small rounded tail.
+   let q=round(r*0.63661977236758134308);
+   r=((r-q*1.5703125)-q*0.0004837512969970703125)-q*7.549789954891882e-8;
+   quadrant=u32(q)&3u;
+  }else{
+   let reduced=rw07_trig_reduce(magnitude);r=reduced.x;quadrant=u32(reduced.y);
+  }
+ }
  // Taylor polynomials on [-pi/4,pi/4]: truncation <4e-13 for cos,
  // <3e-14 for sin; FP32 evaluation error is tested separately.
  let z=r*r;

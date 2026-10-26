@@ -42,8 +42,8 @@ class LstmCellProgram final : public Program<LstmCellProgram> {
                   bool input_forget, bool has_clip, int layout,
                   const std::string& f_activation_fn,
                   const std::string& g_activation_fn,
-                  const std::string& h_activation_fn)
-      : Program{"LstmCell"},
+                  const std::string& h_activation_fn, bool coalesced_weights = false)
+      : Program{coalesced_weights ? "LstmCellCoalescedWeights" : "LstmCell"},
         has_bias_(has_bias),
         has_peephole_(has_peephole),
         has_Y_(has_Y),
@@ -53,7 +53,8 @@ class LstmCellProgram final : public Program<LstmCellProgram> {
         layout_(layout),
         f_activation_fn_(f_activation_fn),
         g_activation_fn_(g_activation_fn),
-        h_activation_fn_(h_activation_fn) {}
+        h_activation_fn_(h_activation_fn),
+        coalesced_weights_(coalesced_weights) {}
 
   Status GenerateShaderCode(ShaderHelper& shader) const override;
 
@@ -78,6 +79,7 @@ class LstmCellProgram final : public Program<LstmCellProgram> {
   std::string f_activation_fn_;
   std::string g_activation_fn_;
   std::string h_activation_fn_;
+  bool coalesced_weights_;
 };
 
 // Writes h_new values to the Y output tensor with optional seq_lens masking.

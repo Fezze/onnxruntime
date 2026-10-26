@@ -3,6 +3,7 @@
 #include "core/session/m0_native_lowering_qualification_v1.h"
 
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && !defined(ORT_MINIMAL_BUILD)
+#include "core/session/m0_native_public_input_fixture_v1.h"
 #include <algorithm>
 #include <cstring>
 #include <gsl/gsl>
@@ -202,9 +203,13 @@ M0NativeDescriptorReceiptV1 M0NativeLoweringQualificationV1::Descriptors(
 }
 #if defined(__ANDROID__) && defined(USE_WEBGPU) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
 M0NativeRunReceiptV1 M0NativeLoweringQualificationV1::RunSequence(InferenceSession& session) {
-  ORT_ENFORCE(InitializedExecution(session, M0NativeInitializedFaultV1::None).initialized,
-              "RW07_NATIVE_RUN_QUALIFICATION_INITIALIZED");
+  // Exercise the app's device-selected physical capacity. Explicit1024/2048
+  // descriptor and initialization cases remain separate qualification coverage;
+  // forcing1024 here can exceed the production device admission's work/memory.
+  ORT_THROW_IF_ERROR(session.M0PrepareOriginalDeviceLoweringV1());
   auto& native = *session.m0_native_lowering_v1_;
+  ORT_ENFORCE(native.device_capacity_&&native.capacity_>0,"RW07_NATIVE_RUN_QUALIFICATION_DEVICE_CAPACITY");
+  ORT_THROW_IF_ERROR(native.InitializeExecution(session));
   const auto* holder = native.execution_plan_.get();
   ORT_THROW_IF_ERROR(session.Initialize());
   const bool public_initialized = session.IsInitialized() && native.execution_plan_.get() == holder;
@@ -217,22 +222,12 @@ M0NativeRunReceiptV1 M0NativeLoweringQualificationV1::RunSequence(InferenceSessi
   const std::array<std::string, 3> names{"tokens", "style", "speed"};
   const std::array<std::string, 1> outputs{native.outputs_.pcm.data};
   RunOptions options;
-  // Normal public-input fixtures, not replacement model parameters or a fake
-  // execution path. Only the original tokens/style/speed enter the real graph.
-  const auto inputs = [&](bool short_input, bool invalid_token) {
-    const std::vector<int64_t> tokens = short_input ? std::vector<int64_t>{0, 43, 0}
-        : std::vector<int64_t>{0, 43, 44, 45, 46, 47, 48, 0};
-    std::vector<OrtValue> values(3);
-    Tensor::InitOrtValue(DataTypeImpl::GetType<int64_t>(), TensorShape({1, int64_t(tokens.size())}), allocator, values[0]);
-    std::memcpy(values[0].GetMutable<Tensor>()->MutableDataRaw(), tokens.data(), tokens.size() * sizeof(int64_t));
-    if (invalid_token) values[0].GetMutable<Tensor>()->MutableData<int64_t>()[1] = 999999;
-    Tensor::InitOrtValue(DataTypeImpl::GetType<float>(), TensorShape({1, 256}), allocator, values[1]);
-    std::memset(values[1].GetMutable<Tensor>()->MutableDataRaw(), 0, 256 * sizeof(float));
-    Tensor::InitOrtValue(DataTypeImpl::GetType<float>(), TensorShape{1}, allocator, values[2]);
-    values[2].GetMutable<Tensor>()->MutableData<float>()[0] = 1.0f;
-    return values;
+  const auto inputs=[&](bool short_input,bool invalid_token){
+    return M0NativePublicInputFixtureV1(allocator,short_input,invalid_token);
   };
   M0NativeRunReceiptV1 receipt;
+  receipt.device_selected_capacity=native.device_capacity_;
+  receipt.physical_capacity=native.capacity_;
   receipt.public_initialized_replay = public_initialized;
   receipt.checked_idle_after_each_run = receipt.same_private_state = true;
   const auto idle = [&]() {
@@ -389,6 +384,8 @@ M0NativeRunReceiptV1 M0NativeLoweringQualificationV1::RunSequence(InferenceSessi
       preallocated.Get<Tensor>().DataRaw() == pcm_storage.data() + 1;
   receipt.pointer_preallocated_pcm_equal = preallocated.Get<Tensor>().SizeInBytes() == second.Get<Tensor>().SizeInBytes() &&
       std::memcmp(preallocated.Get<Tensor>().DataRaw(), second.Get<Tensor>().DataRaw(), second.Get<Tensor>().SizeInBytes()) == 0;
+  receipt.preallocated_difference=M0MeasureNativePcmDifferenceV1(second.Get<Tensor>().DataRaw(),second.Get<Tensor>().SizeInBytes(),
+      preallocated.Get<Tensor>().DataRaw(),preallocated.Get<Tensor>().SizeInBytes());
   receipt.pointer_preallocated_canaries_retained = pcm_storage.front() == 777.0f && pcm_storage.back() == 777.0f;
   idle();
   OrtValue empty_wrapper;
@@ -399,6 +396,8 @@ M0NativeRunReceiptV1 M0NativeLoweringQualificationV1::RunSequence(InferenceSessi
       empty_wrapper.Get<Tensor>().Shape() == second.Get<Tensor>().Shape() &&
       empty_wrapper.Get<Tensor>().SizeInBytes() == second.Get<Tensor>().SizeInBytes() &&
       std::memcmp(empty_wrapper.Get<Tensor>().DataRaw(), second.Get<Tensor>().DataRaw(), second.Get<Tensor>().SizeInBytes()) == 0;
+  if(empty_wrapper.IsTensor())receipt.empty_wrapper_difference=M0MeasureNativePcmDifferenceV1(
+      second.Get<Tensor>().DataRaw(),second.Get<Tensor>().SizeInBytes(),empty_wrapper.Get<Tensor>().DataRaw(),empty_wrapper.Get<Tensor>().SizeInBytes());
   idle();
   const OrtValue third = valid_run(false, true);
   const auto& repeated = third.Get<Tensor>();
@@ -408,10 +407,61 @@ M0NativeRunReceiptV1 M0NativeLoweringQualificationV1::RunSequence(InferenceSessi
       std::memcmp(first_bytes.data(), first_tensor.DataRaw(), first_bytes.size()) == 0;
   receipt.repeated_pcm_equal = repeated.SizeInBytes() == first_bytes.size() &&
       std::memcmp(first_bytes.data(), repeated.DataRaw(), first_bytes.size()) == 0;
+  receipt.repeated_difference=M0MeasureNativePcmDifferenceV1(first_bytes.data(),first_bytes.size(),repeated.DataRaw(),repeated.SizeInBytes());
   receipt.original_session_retained = session.model_.get() == original && !session.is_inited_ && !session.session_state_ &&
       original_inputs == original->MainGraph().GetInputs() && original_outputs == original->MainGraph().GetOutputs();
   // Only final logical PCM is compared. No internal extent/alignment/activation
   // readback, caller-supplied module/factory or diagnostic authority is used.
+  return receipt;
+}
+
+M0NativeRepeatReceiptV1 M0NativeLoweringQualificationV1::RepeatPublicPcm(
+    InferenceSession& session,M0NativeRepeatInterludeV1 interlude){
+  ORT_ENFORCE(interlude==M0NativeRepeatInterludeV1::None||interlude==M0NativeRepeatInterludeV1::Short||
+      interlude==M0NativeRepeatInterludeV1::Invalid,"RW07_REPEAT_CLOSED_INTERLUDE");
+  ORT_THROW_IF_ERROR(session.M0PrepareOriginalDeviceLoweringV1());
+  auto& native=*session.m0_native_lowering_v1_;
+  ORT_ENFORCE(native.device_capacity_,"RW07_REPEAT_ACTUAL_DEVICE_CAPACITY");
+  ORT_THROW_IF_ERROR(native.InitializeExecution(session));
+  ORT_THROW_IF_ERROR(session.Initialize());
+  const auto* holder=native.execution_plan_.get();
+  const auto allocator=std::make_shared<CPUAllocator>();
+  const std::array<std::string,3> names{"tokens","style","speed"};
+  const std::array<std::string,1> outputs{native.outputs_.pcm.data};
+  RunOptions options;
+  M0NativeRepeatReceiptV1 receipt;receipt.physical_capacity=native.capacity_;
+  receipt.checked_idle=true;receipt.interlude_valid=true;
+  const auto run=[&](bool short_input,bool invalid){
+    const auto feeds=M0NativePublicInputFixtureV1(allocator,short_input,invalid);
+    std::vector<OrtValue> result;
+    const auto status=session.Run(options,names,feeds,outputs,&result);
+    if(invalid){
+      receipt.interlude_valid=!status.IsOK()&&status.ErrorMessage()=="RW07_NATIVE_GPU_STATUS_103"&&result.empty();
+    }else{
+      ORT_THROW_IF_ERROR(status);
+      ORT_ENFORCE(result.size()==1&&result[0].IsTensor()&&result[0].Get<Tensor>().IsDataType<float>()&&
+          result[0].Get<Tensor>().Location().device==OrtDevice()&&result[0].Get<Tensor>().SizeInBytes()>0,
+          "RW07_REPEAT_PUBLIC_PCM");
+    }
+    native.ValidateInitializedExecution();
+    receipt.checked_idle=receipt.checked_idle&&native.execution_plan_.get()==holder&&
+        !holder->state->M0FullGpuExtentRunIdV2()&&!holder->state->M0FullGpuRunOwnerV2().Poisoned();
+    return result;
+  };
+  const auto first=run(false,false);
+  const auto& expected=first[0].Get<Tensor>();
+  const auto* bytes=static_cast<const unsigned char*>(expected.DataRaw());
+  receipt.first_pcm.assign(bytes,bytes+expected.SizeInBytes());
+  if(interlude==M0NativeRepeatInterludeV1::Short){(void)run(true,false);}
+  else if(interlude==M0NativeRepeatInterludeV1::Invalid){(void)run(false,true);}
+  const auto repeated=run(false,false);
+  const auto& actual=repeated[0].Get<Tensor>();
+  bytes=static_cast<const unsigned char*>(actual.DataRaw());
+  receipt.repeated_pcm.assign(bytes,bytes+actual.SizeInBytes());
+  receipt.first_retained=expected.SizeInBytes()==receipt.first_pcm.size()&&
+      std::memcmp(expected.DataRaw(),receipt.first_pcm.data(),receipt.first_pcm.size())==0;
+  receipt.difference=M0MeasureNativePcmDifferenceV1(receipt.first_pcm.data(),receipt.first_pcm.size(),
+      receipt.repeated_pcm.data(),receipt.repeated_pcm.size());
   return receipt;
 }
 

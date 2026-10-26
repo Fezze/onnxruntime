@@ -1,10 +1,11 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 #pragma once
-
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && !defined(ORT_MINIMAL_BUILD)
+#include "core/session/m0_native_pcm_difference_v1.h"
 #include <cstddef>
 #include <string>
+#include <vector>
 #include "core/common/status.h"
 
 namespace onnxruntime {
@@ -59,6 +60,9 @@ struct M0NativeInitializedReceiptV1 {
   bool retired = false;
 };
 struct M0NativeRunReceiptV1 {
+  M0NativePcmDifferenceV1 preallocated_difference,empty_wrapper_difference,repeated_difference;
+  uint32_t physical_capacity=0;
+  bool device_selected_capacity=false;
   size_t long_samples = 0, short_samples = 0, repeated_samples = 0;
   bool valid_logical_pcm = false, checked_idle_after_each_run = false, same_private_state = false;
   bool canonical_token_failure = false, failed_output_unchanged = false;
@@ -74,6 +78,13 @@ struct M0NativeRunReceiptV1 {
   bool pointer_empty_wrapper_retained = false, pointer_empty_wrapper_pcm_equal = false;
   bool pointer_preallocated_retained = false, pointer_preallocated_pcm_equal = false;
   bool pointer_preallocated_canaries_retained = false;
+};
+enum class M0NativeRepeatInterludeV1 { None,Short,Invalid };
+struct M0NativeRepeatReceiptV1 {
+  M0NativePcmDifferenceV1 difference;
+  std::vector<unsigned char> first_pcm,repeated_pcm;
+  uint32_t physical_capacity=0;
+  bool first_retained=false,checked_idle=false,interlude_valid=false;
 };
 struct M0NativePlanReceiptV1 {
   size_t nodes = 0, selected = 0, resources = 0, initializers = 0, kernels = 0, allocators = 0;
@@ -114,6 +125,7 @@ class M0NativeLoweringQualificationV1 final {
   static M0NativeResourceMetadataReceiptV3 ResourceMetadata(InferenceSession& session, M0NativeResourceMetadataFaultV3 fault);
   static M0NativeInitializedReceiptV1 InitializedExecution(InferenceSession& session, M0NativeInitializedFaultV1 fault);
   static M0NativeRunReceiptV1 RunSequence(InferenceSession& session);
+  static M0NativeRepeatReceiptV1 RepeatPublicPcm(InferenceSession& session,M0NativeRepeatInterludeV1 interlude);
 #endif
 
 };
