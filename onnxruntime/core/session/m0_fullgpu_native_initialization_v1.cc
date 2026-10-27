@@ -41,9 +41,13 @@ void M0FullGpuNativeLoweringOwnerV1::BeginInitialization(SessionState& state){
  // A real private original-model initialization is the only caller. Observed
  // qualification plans cannot be upgraded, replayed or substituted here.
  ORT_THROW_IF_ERROR(session_->M0ValidateOriginalSelectionOptionsV1());
- M0OriginalPreloadOwnerV1::ValidateNativeLoweringSource(*source_);ValidateExecutionModel();
+ // ValidateInitializerPlan first authenticates the full original source.
+ // Keep that check before walking execution metadata, once per boundary.
  LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=initialization_plan_check_begin"<<" mono_us="<<M0MonotonicMicrosecondsV1();
- ValidateInitializerPlan(state);ValidateResourcePlan(state);
+ {
+  const auto proof=ValidateSourceBoundary();
+  ValidateInitializerPlan(state,&proof);ValidateExecutionModel(&proof);ValidateResourcePlan(state);
+ }
  LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=initialization_plan_check_done"<<" mono_us="<<M0MonotonicMicrosecondsV1();
  ORT_ENFORCE(ExecutionPlanFingerprint(state)==p.plan_sha256,"RW07_NATIVE_INITIALIZATION_CHANGED_PLAN");
  p.initialization_thread=M0NativeInitializationThreadV1();
@@ -179,14 +183,20 @@ void M0FullGpuNativeLoweringOwnerV1::ValidateInitializedExecution(uint64_t activ
  ORT_ENFORCE(p.stage!=ExecutionPlan::Stage::Initializing||
   p.initialization_thread==M0NativeCurrentInitializationThreadV1(),"RW07_NATIVE_INITIALIZATION_THREAD");
  auto& state=*p.state;
+ ORT_ENFORCE(p.options.config_options.GetConfigOptionsMap()==session_->session_options_.config_options.GetConfigOptionsMap(),
+  "RW07_NATIVE_INITIALIZED_OPTIONS_MUTATION");
  ORT_ENFORCE(state.m0_native_plan_owner_v1_==this&&&state.graph_==&execution_model_->MainGraph()&&
   p.epoch==state.M0FullGpuExtentOwnerEpochV1()&&p.plan==&*state.p_seq_exec_plan_&&
   state.initialized_tensors_.size()==p.uploaded.size()&&state.constant_initialized_tensors_.size()==p.uploaded.size(),
   "RW07_NATIVE_INITIALIZED_ACTUAL_STATE");
  ORT_THROW_IF_ERROR(session_->M0ValidateOriginalSelectionOptionsV1());
  LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=completion_source_check_begin"<<" mono_us="<<M0MonotonicMicrosecondsV1();
- M0OriginalPreloadOwnerV1::ValidateNativeLoweringSource(*source_);ValidateExecutionModel();
- ValidateInitializerPlan(state);ValidateResourcePlan(state);
+ // ValidateInitializerPlan first authenticates the full original source.
+ // Keep that check before walking execution metadata, once per boundary.
+ {
+  const auto proof=ValidateSourceBoundary();
+  ValidateInitializerPlan(state,&proof);ValidateExecutionModel(&proof);ValidateResourcePlan(state);
+ }
  LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=completion_source_check_done"<<" mono_us="<<M0MonotonicMicrosecondsV1();
  ORT_ENFORCE(ExecutionPlanFingerprint(state)==p.plan_sha256,"RW07_NATIVE_INITIALIZED_CHANGED_PLAN");
  const auto device=p.module->Provider().GetOrtDeviceByMemType(OrtMemTypeDefault);

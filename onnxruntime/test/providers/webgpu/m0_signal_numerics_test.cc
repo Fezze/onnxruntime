@@ -354,7 +354,7 @@ class M0ResidualNumerics : public M0SignalNumerics {
     return values;
   }
   void CpuConv(int index,const std::vector<float>& input,std::vector<float>& output,
-               uint32_t active_channels=channels,uint32_t active_length=length) {
+               uint32_t active_channels=channels,uint32_t active_length=length,const std::vector<float>* weight_override=nullptr) {
     const uint32_t channels=active_channels,length=active_length;
     const auto& node=original_.graph().node(index);
     ASSERT_EQ(node.op_type(),"Conv");
@@ -364,7 +364,11 @@ class M0ResidualNumerics : public M0SignalNumerics {
     for(const auto& opset:original_.opset_import())model.add_opset_import()->CopyFrom(opset);
     auto& graph=*model.mutable_graph();graph.set_name("original_generator_convolution_cpu");
     graph.add_node()->CopyFrom(node);
-    graph.add_initializer()->CopyFrom(Parameter(node.input(1)));
+    auto* weights=graph.add_initializer();weights->CopyFrom(Parameter(node.input(1)));
+    if(weight_override){
+      ASSERT_EQ(weight_override->size()*sizeof(float),weights->raw_data().size());
+      weights->set_raw_data(reinterpret_cast<const char*>(weight_override->data()),weight_override->size()*sizeof(float));
+    }
     graph.add_initializer()->CopyFrom(Parameter(node.input(2)));
     auto* port=graph.add_input();port->set_name(node.input(0));
     auto* type=port->mutable_type()->mutable_tensor_type();type->set_elem_type(ONNX_NAMESPACE::TensorProto::FLOAT);
@@ -388,7 +392,7 @@ class M0ResidualNumerics : public M0SignalNumerics {
   }
   void GpuConv(int index,const std::vector<float>& input,uint32_t capacity,
                uint32_t input_tile,uint32_t output_tile,std::vector<float>& output,
-               uint32_t element_limit=0,uint32_t active_channels=channels,uint32_t active_length=length,bool vectorized=false,bool tiled=false,uint32_t dilation=1,bool channel_tiled=false,bool valid_extent=true,uint32_t channel_block=1,bool matrix=false,bool tune_matrix=false,bool packed=false,bool tune_packed=false) {
+               uint32_t element_limit=0,uint32_t active_channels=channels,uint32_t active_length=length,bool vectorized=false,bool tiled=false,uint32_t dilation=1,bool channel_tiled=false,bool valid_extent=true,uint32_t channel_block=1,bool matrix=false,bool tune_matrix=false,bool packed=false,bool tune_packed=false,bool force_cached=false,uint32_t force_register=0,const std::vector<float>* weight_override=nullptr) {
     const uint32_t channels=active_channels,length=active_length;
     const bool autotune=channel_tiled&&channel_block==0;
     if(autotune)channel_block=1;
@@ -410,7 +414,8 @@ class M0ResidualNumerics : public M0SignalNumerics {
     auto xb=Storage(padded.data(),padded.size()*sizeof(float));
     auto yb=Storage(result.data(),result.size()*sizeof(float));
     auto eb=Storage(extent.data(),sizeof(extent));
-    auto wb=Storage(weight.raw_data().data(),weight.raw_data().size());
+    if(weight_override)ASSERT_EQ(weight_override->size()*sizeof(float),weight.raw_data().size());
+    auto wb=Storage(weight_override?static_cast<const void*>(weight_override->data()):static_cast<const void*>(weight.raw_data().data()),weight.raw_data().size());
     auto bb=Storage(bias.raw_data().data(),bias.raw_data().size());
     const OrtMemoryInfo memory(WEBGPU_BUFFER,OrtDeviceAllocator,WebGpuDevice(0),OrtMemTypeDefault);
     Tensor x(DataTypeImpl::GetType<float>(),{1,channels,capacity},xb.get(),memory);
@@ -428,13 +433,18 @@ class M0ResidualNumerics : public M0SignalNumerics {
     SignalTestKernel kernel(info);ComputeContextBase context(WebGpuContextFactory::GetContext(0),ep,kernel);
     const auto alignment=context.DeviceLimits().minStorageBufferOffsetAlignment;
     const auto words=gsl::span<const uint32_t>{identity.data(),identity.size()};
-    if(packed||tune_packed){
+    if(packed||tune_packed||force_cached||force_register){
       const uint64_t packed_size=m0_residual_stages::ResidualPackedElementsV1(std::min(input_tile,channels),taps);
       std::vector<float> columns(packed_size,std::numeric_limits<float>::quiet_NaN());
       std::vector<uint32_t> flags(m0_residual_stages::ResidualPackedFlagCapacityV1(packed_size),UINT32_MAX);
       auto packed_buffer=Storage(columns.data(),columns.size()*4),flag_buffer=Storage(flags.data(),flags.size()*4);
       Tensor col(DataTypeImpl::GetType<float>(),{int64_t(packed_size)},packed_buffer.get(),memory);
       Tensor flag(DataTypeImpl::GetType<uint32_t>(),{int64_t(flags.size())},flag_buffer.get(),memory);
+      const uint64_t register_elements=m0_residual_stages::ResidualRegisterWeightElementsV1(std::min(output_tile,channels),std::min(input_tile,channels),taps);
+      ASSERT_GT(register_elements,0u);
+      std::vector<float> register_values(register_elements,std::numeric_limits<float>::quiet_NaN());
+      auto register_buffer=Storage(register_values.data(),register_values.size()*4);
+      Tensor register_weight(DataTypeImpl::GetType<float>(),{int64_t(register_elements)},register_buffer.get(),memory);
       uint64_t dispatches=0;
       for(uint32_t ic=0;ic<channels;ic+=input_tile){
         const uint32_t ni=std::min(input_tile,channels-ic);
@@ -444,8 +454,15 @@ class M0ResidualNumerics : public M0SignalNumerics {
             taps,dilation,capacity,ic,ni,oc,no,words};
           const auto in=ProgramInput::FloatBufferWindow(&x,ProgramTensorMetadataDependency::None,TensorShape{1,ni,capacity},ic*capacity,alignment);
           const auto out=ProgramOutput::FloatBufferWindow(&y,ProgramTensorMetadataDependency::None,TensorShape{1,no,capacity},oc*capacity,alignment);
-          if(tune_packed){
-            ASSERT_STATUS_OK(m0_residual_stages::RunResidualConvolutionV1(context,in,out,&e,&w,&b,&col,&flag,spec,dispatches,true));
+          if(force_cached||force_register){
+            const uint64_t before=dispatches;
+            ASSERT_STATUS_OK(m0_residual_stages::RunResidualConvolutionV1(context,in,out,&e,&w,&b,&col,&flag,spec,dispatches,true,force_register?(force_register==4?32:64):16,&register_weight));
+            // These test windows fit one matrix dispatch per time window.
+            const uint32_t step=m0_residual_stages::ResidualPackedTimeV1(ni,taps);
+            ASSERT_LE(no,128u);
+            EXPECT_EQ(dispatches-before,1u+2u*((capacity+step-1)/step));
+          }else if(tune_packed){
+            ASSERT_STATUS_OK(m0_residual_stages::RunResidualConvolutionV1(context,in,out,&e,&w,&b,&col,&flag,spec,dispatches,true,0,&register_weight));
           }else{
             const auto step=m0_residual_stages::ResidualPackedTimeV1(ni,taps);ASSERT_GT(step,0u);
             for(uint32_t t=0;t<capacity;t+=step)
@@ -1065,6 +1082,98 @@ TEST_F(M0ResidualNumerics, PackedMatrixReusesScratchForWideInputAndOutputWindows
   }
 }
 
+
+TEST_F(M0ResidualNumerics, CachedWeightsAndInactivePackingPreserveOriginalCpuAndExceptionalInputs){
+  ASSERT_TRUE(M0BatchHeavyProgramsV1());
+  const uint32_t count=361;
+  for(const int node:{2407,2408,2409}){
+    const auto input=Input(channels,count);std::vector<float> cpu,result;
+    ASSERT_NO_FATAL_FAILURE(CpuConv(node,input,cpu,channels,count));
+    ASSERT_NO_FATAL_FAILURE(GpuConv(node,input,2409,128,128,result,0,channels,count,
+        true,true,1,true,true,1,false,false,false,false,true));
+    ASSERT_EQ(cpu.size(),result.size());
+    for(size_t i=0;i<cpu.size();++i)ASSERT_NEAR(result[i],cpu[i],1e-4f)<<node<<","<<i;
+  }
+  for(const float bad:{std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity(),std::ldexp(1.0f,70)}){
+    auto input=Input();input[17]=bad;std::vector<float> cpu,result;
+    ASSERT_NO_FATAL_FAILURE(CpuConv(2407,input,cpu));
+    ASSERT_NO_FATAL_FAILURE(GpuConv(2407,input,511,17,19,result,0,channels,length,
+        true,true,1,true,true,1,false,false,false,false,true));
+    for(size_t i=0;i<cpu.size();++i){
+      if(std::isnan(cpu[i]))ASSERT_TRUE(std::isnan(result[i]));
+      else if(std::isinf(cpu[i]))ASSERT_EQ(result[i],cpu[i]);
+      else ASSERT_NEAR(result[i],cpu[i],std::max(1e-4f,std::abs(cpu[i])*1e-4f));
+    }
+  }
+}
+TEST_F(M0ResidualNumerics, RegisterMatrixPreservesOriginalConvolutionWindowsWeightsAndFailure){
+  ASSERT_TRUE(M0BatchHeavyProgramsV1());
+  for(uint32_t register_rows:{4u,8u}){
+    SCOPED_TRACE(register_rows);
+    const auto compare=[&](int node,uint32_t width,uint32_t count,uint32_t capacity,uint32_t input_tile,
+                           uint32_t output_tile,bool valid,float input_fault,int weight_fault){
+      auto input=Input(width,count);if(input_fault!=0.0f)input[17]=input_fault;
+      std::vector<float> weights;const std::vector<float>* override=nullptr;
+      if(weight_fault){
+        const auto& raw=Parameter(original_.graph().node(node).input(1)).raw_data();
+        weights.resize(raw.size()/sizeof(float));std::memcpy(weights.data(),raw.data(),raw.size());
+        // Straddle the register tile's two32-row weight flags, including a partial last tile.
+        const size_t kernel=Parameter(original_.graph().node(node).input(1)).dims(2);
+        const uint32_t row=weight_fault==4?64u:33u;
+        weights[(size_t(row)*width+3)*kernel+kernel-1]=weight_fault==1?std::numeric_limits<float>::quiet_NaN():
+            (weight_fault==2||weight_fault==4)?std::numeric_limits<float>::infinity():std::ldexp(1.0f,51);
+        override=&weights;
+      }
+      std::vector<float> cpu,result;
+      if(valid)ASSERT_NO_FATAL_FAILURE(CpuConv(node,input,cpu,width,count,override));
+      ASSERT_NO_FATAL_FAILURE(GpuConv(node,input,capacity,input_tile,output_tile,result,0,width,count,
+          true,true,1,true,valid,1,false,false,false,false,false,register_rows,override));
+      if(!valid){for(float v:result)EXPECT_EQ(v,0.0f);return;}
+      ASSERT_EQ(cpu.size(),result.size());
+      for(size_t i=0;i<cpu.size();++i){
+        if(std::isnan(cpu[i]))ASSERT_TRUE(std::isnan(result[i]));
+        else if(std::isinf(cpu[i]))ASSERT_EQ(result[i],cpu[i]);
+        else ASSERT_NEAR(result[i],cpu[i],std::max(1e-4f,std::abs(cpu[i])*1e-4f))<<i;
+      }
+    };
+    for(int node:{2407,2408,2409}){
+      ASSERT_NO_FATAL_FAILURE(compare(node,128,361,2409,128,128,true,0.0f,0));
+      ASSERT_NO_FATAL_FAILURE(compare(node,128,121,511,17,19,true,0.0f,0));
+    }
+    ASSERT_NO_FATAL_FAILURE(compare(1951,256,60,203,128,128,true,0.0f,0));
+    for(float bad:{std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity(),std::ldexp(1.0f,70)})
+      ASSERT_NO_FATAL_FAILURE(compare(2407,128,121,511,17,19,true,bad,0));
+    for(int fault:{1,2,3,4})ASSERT_NO_FATAL_FAILURE(compare(2407,128,121,511,17,65,true,0.0f,fault));
+    ASSERT_NO_FATAL_FAILURE(compare(2407,128,121,511,17,65,false,0.0f,0));
+  }
+}
+TEST_F(M0SpectrumNumerics, RegisterVariantUsesBoundedSupportedAutotuneCache){
+  using namespace m0_residual_stages;
+  EXPECT_EQ(ResidualBestBlockV1({100,90,80,70,60,50,40},64),64u);
+  EXPECT_EQ(ResidualBestBlockV1({100,90,80,70,60,50,40},32),32u);
+  EXPECT_EQ(ResidualBestBlockV1({100,90,80,70,60,50},16),16u);
+  EXPECT_EQ(ResidualBestBlockV1({100,99,98,97,96,95},32),1u);
+  ASSERT_NO_FATAL_FAILURE(WithContext([&](ComputeContextBase& context){
+    context.M0RememberResidualBlockV1("test-register-selected",64);
+    uint32_t chosen=0,calls=0;
+    const auto execute=[&](uint32_t){++calls;return Status::OK();};
+    ASSERT_STATUS_OK(ResidualAutotunedBlockV1(context,"test-register-selected",64,false,execute,chosen));
+    EXPECT_EQ(chosen,64u);EXPECT_EQ(calls,0u);
+    ASSERT_STATUS_OK(ResidualAutotunedBlockV1(context,"test-register-selected",16,false,execute,chosen));
+    EXPECT_EQ(chosen,1u);EXPECT_EQ(calls,0u);
+    ASSERT_STATUS_OK(ResidualAutotunedBlockV1(context,"test-register-all-candidates",64,true,execute,chosen));
+    EXPECT_EQ(calls,21u);
+    ASSERT_STATUS_OK(ResidualAutotunedBlockV1(context,"test-register-all-candidates",64,false,execute,chosen));
+    EXPECT_EQ(calls,21u);
+    const auto fail=[](uint32_t variant)->Status {
+      return variant==32?ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"register candidate refusal"):Status::OK();
+    };
+    EXPECT_FALSE(ResidualAutotunedBlockV1(context,"test-register-refused",64,true,fail,chosen).IsOK());
+    EXPECT_EQ(context.M0ResidualBlockChoiceV1("test-register-refused"),0u);
+    EXPECT_FALSE(ResidualAutotunedBlockV1(context,"test-register-invalid",128,true,execute,chosen).IsOK());
+  }));
+}
+
 TEST_F(M0ResidualNumerics, AutotunedPackedConvolutionRepeatsExactOutputsAfterShortShapeAndFailure){
   if(!m0_residual_stages::ResidualPackedSupportedV1(WebGpuContextFactory::GetContext(0).DeviceLimits()))
     GTEST_SKIP()<<"Packed matrix device requirements";
@@ -1402,7 +1511,8 @@ TEST(M0RecurrenceMemoryPlan, ResidualFixedScratchCoversWiderActivationWindowsAnd
     const uint32_t channels=branch==0?256:128;
     const uint64_t columns=webgpu::m0_residual_stages::ResidualPackedElementsV1(channels,11);
     const uint64_t actual_fixed=uint64_t(channels)*6*4+15+columns*4+
-      webgpu::m0_residual_stages::ResidualPackedFlagCapacityV1(columns)*4+2*15;
+      webgpu::m0_residual_stages::ResidualPackedFlagCapacityV1(columns)*4+
+      webgpu::m0_residual_stages::ResidualRegisterWeightElementsV1(channels,channels,11)*4+3*15;
     EXPECT_GE(M0NativeResidualFixedScratchBytesV1(channels,true),actual_fixed);
     for(uint32_t duration:{1024u,4096u}){
       const uint64_t outputs=uint64_t(channels)*20*duration*4+15+128;
@@ -1768,7 +1878,7 @@ TEST_F(M0RecurrenceProjection, PackedFlagsMatchOnlyTheirTimeTileAndPreserveScrat
     auto selected=extent;if(!valid)selected[22]^=1u;
     auto selected_buffer=Storage(selected.data(),sizeof(selected));
     Tensor selected_extent(DataTypeImpl::GetType<uint32_t>(),{32},selected_buffer.get(),memory);
-    const uint64_t count=uint64_t(inner)*times,groups=ResidualPackedFlagCountV1(channels,kernel,times);
+    const uint64_t count=uint64_t(ResidualPackedInnerV1(channels,kernel))*times,groups=ResidualPackedFlagCountV1(channels,kernel,times);
     std::vector<float> columns(count+16,12345.0f);
     std::vector<uint32_t> flags(groups+8,UINT32_MAX);
     auto cb=Storage(columns.data(),columns.size()*4),fb=Storage(flags.data(),flags.size()*4);
@@ -1787,16 +1897,24 @@ TEST_F(M0RecurrenceProjection, PackedFlagsMatchOnlyTheirTimeTileAndPreserveScrat
     }));
     Ep().BufferManager().Download(Ep().Recording(),cb.get(),columns.data(),columns.size()*4);
     Ep().BufferManager().Download(Ep().Recording(),fb.get(),flags.data(),flags.size()*4);
-    for(uint32_t row=0;row<inner;++row)for(uint32_t t=0;t<times;++t){
-      const int pos=int(begin+t)+int(row%kernel)-1;float expected=0;
-      if(valid&&begin+t<length&&pos>=0&&pos<int(length))expected=input[(row/kernel)*capacity+size_t(pos)];
-      const float actual=columns[size_t(row)*times+t];
-      if(std::isnan(expected))ASSERT_TRUE(std::isnan(actual));else ASSERT_EQ(actual,expected);
-    }
+    const auto expected_value=[&](uint32_t row,uint32_t t){
+      const int pos=int(begin+t)+int(row%kernel)-1;
+      return row<inner&&valid&&begin+t<length&&pos>=0&&pos<int(length)?input[(row/kernel)*capacity+size_t(pos)]:0.0f;
+    };
+    // Independent serial traversal of the declared physical layout, not the
+    // shader's random-address formula. Reader/writer transposes cannot cancel.
+    size_t physical=0;
+    for(uint32_t k4=0;k4<ResidualPackedInnerV1(channels,kernel);k4+=4)
+      for(uint32_t tile=0;tile<times;tile+=32)for(uint32_t lane=0;lane<4;++lane)
+        for(uint32_t t=tile;t<tile+32;++t){
+          const float expected=expected_value(k4+lane,t),actual=columns[physical++];
+          if(std::isnan(expected))ASSERT_TRUE(std::isnan(actual));else ASSERT_EQ(actual,expected);
+        }
+    ASSERT_EQ(physical,count);
     for(uint32_t block=0;block<(inner+7)/8;++block)for(uint32_t tile=0;tile<times/32;++tile){
       bool unsafe=false;
       for(uint32_t row=block*8;row<std::min(inner,block*8+8);++row)for(uint32_t t=tile*32;t<tile*32+32;++t){
-        const float value=columns[size_t(row)*times+t];
+        const float value=expected_value(row,t);
         unsafe=unsafe||!std::isfinite(value)||std::abs(value)>std::ldexp(1.0f,50);
       }
       EXPECT_EQ(flags[block*(times/32)+tile],unsafe?1u:0u)<<block<<","<<tile;
@@ -1977,6 +2095,15 @@ TEST_F(M0RecurrenceProjection, DecoderConcatSharedPredicatePreservesEveryChannel
     for(size_t i=1090*capacity;i<actual.size();++i)ASSERT_EQ(actual[i],-12345)<<"canary="<<i;
   }
 }
+TEST(M0ResidualDispatchBudget, DecoderFourTimeDispatchCountsPaddedVectorsWithoutCrossingRows){
+  m0_decoder_stages::DecoderConvTile scalar(true,false),finite(true,true,false),four(true,true,true);
+  for(uint32_t rows:{1u,5u,32u})for(uint32_t capacity:{0u,1u,4u,17u,65u,40561u,UINT32_MAX}){
+    const uint64_t vectors=uint64_t(capacity)/4u+uint64_t(capacity%4u!=0u);
+    EXPECT_EQ(four.WorkItems(rows,capacity),uint64_t(rows)*vectors);
+    EXPECT_EQ(scalar.WorkItems(rows,capacity),uint64_t(rows)*capacity);
+    EXPECT_EQ(finite.WorkItems(rows,capacity),scalar.WorkItems(rows,capacity));
+  }
+}
 TEST_F(M0RecurrenceProjection, DecoderConvolutionSharedPredicateRetainsSplitAccumulationBiasAndTailGuards){
   constexpr uint32_t capacity=17,length=7,inputs=13,outputs=9,rows=3,offset=4;
   const OrtMemoryInfo memory(WEBGPU_BUFFER,OrtDeviceAllocator,WebGpuDevice(0),OrtMemTypeDefault);
@@ -2020,6 +2147,68 @@ TEST_F(M0RecurrenceProjection, DecoderConvolutionSharedPredicateRetainsSplitAccu
       else ASSERT_NEAR(actual[row*capacity+t],expected,1e-5)<<row<<","<<t;
     }
     for(size_t i=rows*capacity;i<actual.size();++i)ASSERT_EQ(actual[i],-12345)<<i;
+  }
+}
+TEST_F(M0RecurrenceProjection, DecoderFiniteWindowsKeepSerialSeedsNearestPaddingExceptionsAndCanaries){
+  constexpr uint32_t inputs=67,outputs=9,rows=5,offset=4;
+  const OrtMemoryInfo memory(WEBGPU_BUFFER,OrtDeviceAllocator,WebGpuDevice(0),OrtMemTypeDefault);
+  for(uint32_t scenario=0;scenario<3;++scenario)for(uint32_t fault=0;fault<9;++fault){
+    SCOPED_TRACE(scenario);
+    SCOPED_TRACE(fault);
+    const uint32_t capacity=scenario==0?1u:scenario==1?17u:65u;
+    const uint32_t length=scenario==0?1u:scenario==1?8u:63u,width=scenario==0?1u:3u;
+    const bool nearest=scenario==1,bias_enabled=scenario!=0;
+    const uint32_t source_capacity=nearest?(capacity+1)/2:capacity;
+    std::vector<float> source(inputs*source_capacity),weights(outputs*inputs*width),bias(outputs);
+    for(size_t i=0;i<source.size();++i)source[i]=float(int(i*37%97)-48)/64;
+    for(size_t i=0;i<weights.size();++i)weights[i]=float(int(i*17%53)-26)/128;
+    for(size_t i=0;i<bias.size();++i)bias[i]=float(i)/16;
+    if(fault==1)source[64*source_capacity]=std::numeric_limits<float>::quiet_NaN();
+    if(fault==2)source[inputs*source_capacity-1]=-std::numeric_limits<float>::infinity();
+    if(fault==3)source[nearest?(length-1)/2:length-1]=std::ldexp(1.0f,60);
+    if(fault==4)weights[((offset+1)*inputs+65)*width]=std::numeric_limits<float>::quiet_NaN();
+    if(fault==5)weights[(offset*inputs+3)*width]=std::numeric_limits<float>::infinity();
+    if(fault==6)weights[((offset+2)*inputs+66)*width]=std::ldexp(1.0f,60);
+    if(fault==7){
+      std::fill(weights.begin(),weights.end(),0.0f);std::fill(source.begin(),source.end(),0.5f);
+      weights[(offset*inputs)*width+width/2]=std::numeric_limits<float>::max();
+    }
+    auto words=identity;if(nearest)words[8]=24;auto extent=Extent(3,length);extent[4]=nearest?512u:1024u;
+    extent[18]=extent[4]*length;std::copy(words.begin(),words.end(),extent.begin()+22);if(fault==8)extent[20]=103;
+    auto xb=Storage(source.data(),source.size()*4),wb=Storage(weights.data(),weights.size()*4);
+    auto bb=Storage(bias.data(),bias.size()*4),eb=Storage(extent.data(),sizeof(extent));
+    Tensor x(DataTypeImpl::GetType<float>(),{1,inputs,source_capacity},xb.get(),memory),
+      w(DataTypeImpl::GetType<float>(),{outputs,inputs,width},wb.get(),memory),
+      b(DataTypeImpl::GetType<float>(),{outputs},bb.get(),memory),e(DataTypeImpl::GetType<uint32_t>(),{32},eb.get(),memory);
+    std::vector<float> serial;
+    for(uint32_t variant:{0u,1u,2u}){
+      std::vector<float> actual(rows*capacity+16,-12345.0f);auto yb=Storage(actual.data(),actual.size()*4);
+      Tensor y(DataTypeImpl::GetType<float>(),{1,rows,capacity},yb.get(),memory);
+      ASSERT_NO_FATAL_FAILURE(WithContext([&](ComputeContextBase& context){
+        for(uint32_t first:{0u,64u}){
+          const uint32_t count=std::min(64u,inputs-first);
+          m0_decoder_stages::DecoderConvTile program(bias_enabled,variant!=0,variant==2);
+          program.AddInput(ProgramInput::FloatBufferWindow(&x,ProgramTensorMetadataDependency::None,
+              TensorShape{1,count,source_capacity},first*source_capacity,context.DeviceLimits().minStorageBufferOffsetAlignment))
+            .AddInput({&w,ProgramTensorMetadataDependency::None});
+          if(bias_enabled)program.AddInput({&b,ProgramTensorMetadataDependency::None});
+          program.AddInput({&e,ProgramTensorMetadataDependency::None}).AddOutput({&y,ProgramTensorMetadataDependency::None})
+            .SetWorkgroupSize(64).SetDispatchGroupSize(static_cast<uint32_t>((program.WorkItems(rows,capacity)+63)/64+1))
+            .AddUniformVariables({source_capacity,capacity,inputs,outputs,width,first,count,offset,rows,uint32_t(nearest),capacity,
+              gsl::span<const uint32_t>{words.data(),words.size()}});
+          ASSERT_STATUS_OK(context.RunProgramWithCheckedCompletion(program));
+        }
+      }));
+      Ep().BufferManager().Download(Ep().Recording(),yb.get(),actual.data(),actual.size()*4);
+      for(size_t i=rows*capacity;i<actual.size();++i)ASSERT_EQ(actual[i],-12345.0f)<<i;
+      if(variant==0){serial=actual;continue;}
+      for(size_t i=0;i<rows*capacity;++i){
+        if(std::isnan(serial[i]))ASSERT_TRUE(std::isnan(actual[i]))<<i;
+        else if(fault||std::isinf(serial[i]))ASSERT_EQ(actual[i],serial[i])<<i;
+        else ASSERT_NEAR(actual[i],serial[i],1e-5f)<<i;
+        if(fault==8||i%capacity>=length)ASSERT_EQ(actual[i],0.0f)<<i;
+      }
+    }
   }
 }
 TEST_F(M0RecurrenceProjection, DecoderPoolingAndResidualAddKeepTransposedStageAndPhysicalTails){
@@ -2743,7 +2932,7 @@ class M0GeneratorUpsample : public M0GeneratorNormalization {
   }
   void GpuUpsample(uint32_t stage,uint32_t duration,uint32_t physical_duration,
                    const std::vector<float>& input,bool windowed,uint32_t input_tile,uint32_t output_tile,
-                   std::vector<float>& output,bool finite=false,bool valid_extent=true) {
+                   std::vector<float>& output,bool finite=false,bool valid_extent=true,bool phase_taps=true) {
     ASSERT_LE(stage,1u);ASSERT_GE(physical_duration,duration);
     const uint32_t ic=stage==0?512:256,oc=stage==0?256:128,taps=stage==0?20:12;
     const uint32_t length=(stage==0?2:20)*duration,pc=(stage==0?2:20)*physical_duration;
@@ -2777,7 +2966,7 @@ class M0GeneratorUpsample : public M0GeneratorNormalization {
         ASSERT_GT(chunk,0u);
         for(uint64_t first=0;first<uint64_t(oc)*capacity;first+=chunk){
           const uint32_t size=static_cast<uint32_t>(std::min<uint64_t>(chunk,uint64_t(oc)*capacity-first));
-          m0_generator_edges_detail::EdgeData program{0,1,finite};program.CacheHint("0");
+          m0_generator_edges_detail::EdgeData program{0,1,finite,phase_taps};program.CacheHint("0");
           program.AddInputs({{&x,ProgramTensorMetadataDependency::None},{&e,ProgramTensorMetadataDependency::None},
                              {&w,ProgramTensorMetadataDependency::None},{&b,ProgramTensorMetadataDependency::None}})
             .AddOutput({&y,ProgramTensorMetadataDependency::None})
@@ -2879,6 +3068,32 @@ TEST_F(M0GeneratorUpsample, FiniteGroupsFindIsolatedNonfiniteSourceAtBothTimeEdg
       for(size_t i=0;i<old.size();++i){
         if(std::isnan(old[i]))ASSERT_TRUE(std::isnan(fast[i]))<<i;
         else ASSERT_NEAR(old[i],fast[i],1e-4f)<<i;
+      }
+    }
+  }
+}
+TEST_F(M0GeneratorUpsample, PhaseTraversalRetainsDenseTapOrderForReflectionPaddingAndExceptions){
+  for(uint32_t stage:{0u,1u})for(uint32_t variant=0;variant<5;++variant){
+    SCOPED_TRACE(stage);
+    SCOPED_TRACE(variant);
+    const uint32_t duration=variant==0?3u:1u,length=(stage==0?2u:20u)*duration;
+    const uint32_t channels=stage==0?512u:256u;
+    auto input=Carrier(channels,length);
+    if(variant==1)input[(channels-1)*length]=std::numeric_limits<float>::quiet_NaN();
+    if(variant==2)input[channels*length-1]=-std::numeric_limits<float>::infinity();
+    if(variant==3)input[length-1]=std::nextafter(std::ldexp(1.0f,50),std::numeric_limits<float>::infinity());
+    const bool valid=variant!=4;
+    std::vector<float> dense,phase,finite;
+    ASSERT_NO_FATAL_FAILURE(GpuUpsample(stage,duration,7,input,false,128,64,dense,false,valid,false));
+    ASSERT_NO_FATAL_FAILURE(GpuUpsample(stage,duration,7,input,false,128,64,phase,false,valid,true));
+    ASSERT_NO_FATAL_FAILURE(GpuUpsample(stage,duration,7,input,false,128,64,finite,true,valid,true));
+    ASSERT_EQ(dense.size(),phase.size());ASSERT_EQ(dense.size(),finite.size());
+    for(size_t i=0;i<dense.size();++i){
+      if(std::isnan(dense[i])){ASSERT_TRUE(std::isnan(phase[i]))<<i;ASSERT_TRUE(std::isnan(finite[i]))<<i;}
+      else{
+        ASSERT_EQ(std::bit_cast<uint32_t>(phase[i]),std::bit_cast<uint32_t>(dense[i]))<<i;
+        if(std::isinf(dense[i]))ASSERT_EQ(finite[i],dense[i])<<i;
+        else ASSERT_NEAR(finite[i],dense[i],1e-4f)<<i;
       }
     }
   }
@@ -3053,6 +3268,230 @@ TEST_F(M0SignalNumerics, TransposeCopyCheckCoversEncoderShapeShortInterludeAndDe
   run(TensorShape{33,7},{1,0});
   run(TensorShape{1,2,3,5},{0,2,3,1});
 }
+
+TEST_F(M0RecurrenceProjection, PackedWeightFlagsRegenerateForWindowsAndPreserveUnrelatedScratch){
+  using namespace m0_residual_stages;
+  constexpr uint32_t channels=64,taps=3,input_offset=11,input_count=17,output_offset=7,output_count=33;
+  auto extent=Extent(3,73);extent[4]=channels;extent[18]=channels*73;
+  auto eb=Storage(extent.data(),sizeof(extent));
+  const OrtMemoryInfo memory(WEBGPU_BUFFER,OrtDeviceAllocator,WebGpuDevice(0),OrtMemTypeDefault);
+  Tensor e(DataTypeImpl::GetType<uint32_t>(),{32},eb.get(),memory);
+  constexpr uint32_t flag_size=160,flag_base=flag_size-kM0ResidualPackedWeightFlagWordsV1;
+  std::vector<float> weights(channels*channels*taps,0.125f);
+  const auto at=[](uint32_t row,uint32_t input){return (row*channels+input)*taps+1;};
+  std::vector<uint32_t> flags(flag_size+8,0x12345678u);
+  auto fb=Storage(flags.data(),flags.size()*4);
+  Tensor f(DataTypeImpl::GetType<uint32_t>(),{flag_size},fb.get(),memory);
+  for(int fault:{0,1,2,3,0}){
+    std::fill(weights.begin(),weights.end(),0.125f);
+    if(fault==1)weights[at(output_offset+32,input_offset+1)]=std::numeric_limits<float>::quiet_NaN();
+    if(fault==2)weights[at(output_offset+1,input_offset-1)]=std::numeric_limits<float>::infinity();
+    if(fault==3)weights[at(output_offset,input_offset+input_count-1)]=std::ldexp(1.0f,51);
+    auto wb=Storage(weights.data(),weights.size()*4);
+    Tensor w(DataTypeImpl::GetType<float>(),{channels,channels,taps},wb.get(),memory);
+    const ResidualConvSpecV1 spec{97,97,channels,1,97,1,0,taps,1,97,input_offset,input_count,output_offset,output_count,
+        gsl::span<const uint32_t>{identity.data(),identity.size()}};
+    ASSERT_NO_FATAL_FAILURE(WithContext([&](ComputeContextBase& c){
+      uint64_t dispatches=0;
+      ASSERT_STATUS_OK(PrepareResidualPackedWeightFlagsV1(c,&e,&w,&f,spec,dispatches));
+      EXPECT_EQ(dispatches,1u);
+    }));
+    Ep().BufferManager().Download(Ep().Recording(),fb.get(),flags.data(),flags.size()*4);
+    EXPECT_EQ(flags[flag_base],fault==3?1u:0u);
+    EXPECT_EQ(flags[flag_base+1],fault==1?1u:0u);
+    for(size_t i=0;i<flags.size();++i)if(i!=flag_base&&i!=flag_base+1)EXPECT_EQ(flags[i],0x12345678u);
+  }
+}
+TEST_F(M0RecurrenceProjection, InactivePackedTimeTilesLeaveColumnsUntouchedWithoutChangingActiveTiles){
+  using namespace m0_residual_stages;
+  constexpr uint32_t channels=13,kernel=3,capacity=97,length=73,times=128,inner=channels*kernel;
+  const uint32_t padded=ResidualPackedInnerV1(channels,kernel);
+  std::vector<float> input(channels*capacity,0.25f),columns(padded*times+16,12345.0f);
+  auto extent=Extent(3,length);extent[4]=128;extent[18]=128*length;
+  auto xb=Storage(input.data(),input.size()*4),eb=Storage(extent.data(),sizeof(extent));
+  std::vector<uint32_t> flags(ResidualPackedFlagCountV1(channels,kernel,times)+8,UINT32_MAX);
+  auto cb=Storage(columns.data(),columns.size()*4),fb=Storage(flags.data(),flags.size()*4);
+  const OrtMemoryInfo memory(WEBGPU_BUFFER,OrtDeviceAllocator,WebGpuDevice(0),OrtMemTypeDefault);
+  Tensor x(DataTypeImpl::GetType<float>(),{1,channels,capacity},xb.get(),memory);
+  Tensor e(DataTypeImpl::GetType<uint32_t>(),{32},eb.get(),memory);
+  Tensor col(DataTypeImpl::GetType<float>(),{int64_t(columns.size())},cb.get(),memory);
+  Tensor flag(DataTypeImpl::GetType<uint32_t>(),{int64_t(flags.size())},fb.get(),memory);
+  ASSERT_NO_FATAL_FAILURE(WithContext([&](ComputeContextBase& c){
+    ResidualPackColumnsV1 program(true);
+    program.AddInputs({{&x,ProgramTensorMetadataDependency::None},{&e,ProgramTensorMetadataDependency::None}})
+        .AddOutput({&col,ProgramTensorMetadataDependency::None,ProgramOutput::Flatten,4})
+        .AddOutput({&flag,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64)
+        .SetDispatchGroupSize(uint32_t(ResidualPackedFlagCountV1(channels,kernel,times)));
+    const ResidualConvSpecV1 spec{capacity,capacity,128,1,capacity,1,0,kernel,1,capacity,0,channels,0,17,
+      gsl::span<const uint32_t>{identity.data(),identity.size()}};
+    spec.ApplyPacked(program,0,times,0,17);
+    ASSERT_STATUS_OK(c.RunProgramWithCheckedCompletion(program));
+  }));
+  Ep().BufferManager().Download(Ep().Recording(),cb.get(),columns.data(),columns.size()*4);
+  Ep().BufferManager().Download(Ep().Recording(),fb.get(),flags.data(),flags.size()*4);
+  size_t physical=0;
+  for(uint32_t k4=0;k4<padded;k4+=4)for(uint32_t tile=0;tile<times;tile+=32)
+    for(uint32_t lane=0;lane<4;++lane)for(uint32_t t=tile;t<tile+32;++t){
+      const uint32_t row=k4+lane;const int pos=int(t)+int(row%kernel)-1;
+      const float expected=t>=96?12345.0f:(row<inner&&t<length&&pos>=0&&pos<int(length)?0.25f:0.0f);
+      EXPECT_EQ(columns[physical++],expected);
+    }
+  EXPECT_EQ(physical,size_t(padded)*times);
+  const auto count=ResidualPackedFlagCountV1(channels,kernel,times);
+  for(size_t i=0;i<count;++i)EXPECT_EQ(flags[i],0u);
+  for(size_t i=count;i<flags.size();++i)EXPECT_EQ(flags[i],UINT32_MAX);
+  for(size_t i=padded*times;i<columns.size();++i)EXPECT_EQ(columns[i],12345.0f);
+}
+
+TEST(M0ResidualDispatchBudget, PackedInnerPaddingCoversEveryRegisterLaneWithinFixedScratch){
+  using namespace m0_residual_stages;
+  for(uint32_t channels=1;channels<=256;++channels)for(uint32_t kernel=1;kernel<=11;++kernel){
+    const auto inner=ResidualPackedInnerV1(channels,kernel);const auto time=ResidualPackedTimeV1(channels,kernel);
+    ASSERT_GE(inner,channels*kernel);ASSERT_LT(inner,channels*kernel+4);ASSERT_EQ(inner%4,0u);
+    ASSERT_GT(time,0u);EXPECT_LE(uint64_t(inner)*time,ResidualPackedElementsV1(channels,kernel));
+    EXPECT_LE(ResidualPackedElementsV1(channels,kernel)*4,kResidualPackedScratchBytesV1);
+  }
+  for(const auto shape:{std::array<uint32_t,2>{0,3},{257,3},{13,0},{13,12}})
+    EXPECT_EQ(ResidualPackedInnerV1(shape[0],shape[1]),0u);
+}
+TEST_F(M0RecurrenceProjection, PackedRegisterRefusesLogicalOnlyColumnsBeforeQueueingAnyWork){
+  using namespace m0_residual_stages;
+  constexpr uint32_t channels=128,input_count=13,output_count=33,kernel=3,capacity=97,times=128;
+  const uint32_t physical=ResidualPackedInnerV1(input_count,kernel)*times;
+  const OrtMemoryInfo memory(WEBGPU_BUFFER,OrtDeviceAllocator,WebGpuDevice(0),OrtMemTypeDefault);
+  std::vector<float> source(input_count*capacity,0.25f),target(output_count*capacity+16,12345.0f);
+  std::vector<float> weights(channels*channels*kernel,0.125f),bias(channels,0.0f),columns(physical+16,12345.0f);
+  std::vector<float> register_weights(ResidualRegisterWeightElementsV1(output_count,input_count,kernel),0.0f);
+  std::vector<uint32_t> flags(ResidualPackedFlagCapacityV1(physical),UINT32_MAX);
+  auto extent=Extent(3,73);extent[4]=channels;extent[18]=channels*73;
+  auto xb=Storage(source.data(),source.size()*4),yb=Storage(target.data(),target.size()*4),
+    wb=Storage(weights.data(),weights.size()*4),bb=Storage(bias.data(),bias.size()*4),
+    cb=Storage(columns.data(),columns.size()*4),rb=Storage(register_weights.data(),register_weights.size()*4),
+    fb=Storage(flags.data(),flags.size()*4),eb=Storage(extent.data(),sizeof(extent));
+  Tensor x(DataTypeImpl::GetType<float>(),{1,input_count,capacity},xb.get(),memory),
+    y(DataTypeImpl::GetType<float>(),{1,output_count,capacity},yb.get(),memory),
+    w(DataTypeImpl::GetType<float>(),{channels,channels,kernel},wb.get(),memory),
+    b(DataTypeImpl::GetType<float>(),{channels},bb.get(),memory),
+    logical_columns(DataTypeImpl::GetType<float>(),{int64_t(input_count*kernel*times)},cb.get(),memory),
+    r(DataTypeImpl::GetType<float>(),{int64_t(register_weights.size())},rb.get(),memory),
+    f(DataTypeImpl::GetType<uint32_t>(),{int64_t(flags.size())},fb.get(),memory),
+    e(DataTypeImpl::GetType<uint32_t>(),{32},eb.get(),memory);
+  ASSERT_NO_FATAL_FAILURE(WithContext([&](ComputeContextBase& context){
+    const ResidualConvSpecV1 spec{capacity,capacity,channels,1,capacity,1,0,kernel,1,capacity,0,input_count,0,output_count,
+      gsl::span<const uint32_t>{identity.data(),identity.size()}};
+    uint64_t dispatches=0;
+    const ProgramInput input{&x,ProgramTensorMetadataDependency::None};
+    const ProgramOutput output{&y,ProgramTensorMetadataDependency::None};
+    EXPECT_FALSE(RunResidualPackedTileV1(context,input,output,&e,&w,&b,&logical_columns,&f,spec,0,times,true,dispatches,false,4,&r).IsOK());
+    EXPECT_EQ(dispatches,0u);
+  }));
+  Ep().BufferManager().Download(Ep().Recording(),cb.get(),columns.data(),columns.size()*4);
+  Ep().BufferManager().Download(Ep().Recording(),yb.get(),target.data(),target.size()*4);
+  Ep().BufferManager().Download(Ep().Recording(),fb.get(),flags.data(),flags.size()*4);
+  EXPECT_TRUE(std::all_of(columns.begin(),columns.end(),[](float value){return value==12345.0f;}));
+  EXPECT_TRUE(std::all_of(target.begin(),target.end(),[](float value){return value==12345.0f;}));
+  EXPECT_TRUE(std::all_of(flags.begin(),flags.end(),[](uint32_t value){return value==UINT32_MAX;}));
+}
+TEST_F(M0RecurrenceProjection, RegisterMatrixRejectsUnalignedOutputTileBeforeUsingPackedPadding){
+  using namespace m0_residual_stages;
+  constexpr uint32_t channels=128,inputs=13,outputs=64,kernel=3,capacity=97,times=128;
+  const OrtMemoryInfo memory(WEBGPU_BUFFER,OrtDeviceAllocator,WebGpuDevice(0),OrtMemTypeDefault);
+  std::vector<float> source(inputs*capacity,1.0f),target(outputs*capacity+16,12345.0f),bias(channels,0.0f),
+    weights(ResidualRegisterWeightElementsV1(outputs,inputs,kernel),1.0f),
+    columns(ResidualPackedInnerV1(inputs,kernel)*times,1.0f);
+  std::vector<uint32_t> flags(ResidualPackedFlagCapacityV1(columns.size()),0u);
+  auto extent=Extent(3,73);extent[4]=channels;extent[18]=channels*73;
+  auto xb=Storage(source.data(),source.size()*4),yb=Storage(target.data(),target.size()*4),wb=Storage(weights.data(),weights.size()*4),
+    cb=Storage(columns.data(),columns.size()*4),bb=Storage(bias.data(),bias.size()*4),
+    eb=Storage(extent.data(),sizeof(extent)),fb=Storage(flags.data(),flags.size()*4);
+  Tensor x(DataTypeImpl::GetType<float>(),{1,inputs,capacity},xb.get(),memory),
+    y(DataTypeImpl::GetType<float>(),{1,outputs,capacity},yb.get(),memory),
+    w(DataTypeImpl::GetType<float>(),{int64_t(weights.size())},wb.get(),memory),
+    b(DataTypeImpl::GetType<float>(),{channels},bb.get(),memory),
+    col(DataTypeImpl::GetType<float>(),{int64_t(columns.size())},cb.get(),memory),
+    e(DataTypeImpl::GetType<uint32_t>(),{32},eb.get(),memory),f(DataTypeImpl::GetType<uint32_t>(),{int64_t(flags.size())},fb.get(),memory);
+  ASSERT_NO_FATAL_FAILURE(WithContext([&](ComputeContextBase& context){
+    ResidualPackedMatrixV1 program(true,4);
+    program.AddInputs({{&x,ProgramTensorMetadataDependency::None},{&e,ProgramTensorMetadataDependency::None},
+      {&w,ProgramTensorMetadataDependency::None,ProgramInput::Flatten,4},{&b,ProgramTensorMetadataDependency::None},
+      {&col,ProgramTensorMetadataDependency::None,ProgramInput::Flatten,4},{&f,ProgramTensorMetadataDependency::None}})
+      .AddOutput({&y,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(8,8).SetDispatchGroupSize(times/32,1);
+    const ResidualConvSpecV1 spec{capacity,capacity,channels,1,capacity,1,0,kernel,1,capacity,0,inputs,0,outputs,
+      gsl::span<const uint32_t>{identity.data(),identity.size()}};
+    spec.ApplyPacked(program,0,times,63,1,uint32_t(flags.size())-kM0ResidualPackedWeightFlagWordsV1);
+    ASSERT_STATUS_OK(context.RunProgramWithCheckedCompletion(program));
+  }));
+  Ep().BufferManager().Download(Ep().Recording(),yb.get(),target.data(),target.size()*4);
+  for(size_t i=0;i<target.size();++i)EXPECT_EQ(target[i],i>=63*capacity&&i<outputs*capacity?0.0f:12345.0f)<<i;
+}
+TEST(M0ResidualDispatchBudget, BlockedRegisterWeightEnvelopeIncludesPaddingAndRejectsOverflow){
+  using namespace m0_residual_stages;
+  EXPECT_EQ(ResidualRegisterWeightElementsV1(33,17,3),64u*13u*4u);
+  EXPECT_EQ(ResidualRegisterWeightElementsV1(65,17,11),128u*47u*4u);
+  EXPECT_LE(ResidualRegisterWeightElementsV1(256,256,11)*4,kM0ResidualRegisterWeightScratchBytesV1);
+  for(const auto shape:{std::array<uint32_t,3>{0,17,3},{513,17,3},{65,257,3},{65,17,0},{65,17,12},{512,256,11}})
+    EXPECT_EQ(ResidualRegisterWeightElementsV1(shape[0],shape[1],shape[2]),0u);
+}
+TEST_F(M0RecurrenceProjection, BlockedRegisterWeightCopyReusesScratchAndRetainsWindowFlagsAndCanaries){
+  using namespace m0_residual_stages;
+  constexpr uint32_t channels=128,input_offset=11,input_count=17,output_offset=7,output_count=65,kernel=3;
+  const uint64_t elements=ResidualRegisterWeightElementsV1(output_count,input_count,kernel);
+  constexpr uint32_t rows=128,inner=input_count*kernel,vectors=(inner+3)/4,flag_size=160,flag_base=flag_size-kM0ResidualPackedWeightFlagWordsV1;
+  std::vector<float> packed(elements+16,12345.0f),weights(channels*channels*kernel);
+  std::vector<uint32_t> flags(flag_size+8,0x12345678u);
+  auto pb=Storage(packed.data(),packed.size()*4),fb=Storage(flags.data(),flags.size()*4);
+  auto extent=Extent(3,73);extent[4]=channels;extent[18]=channels*73;
+  auto eb=Storage(extent.data(),sizeof(extent));
+  const OrtMemoryInfo memory(WEBGPU_BUFFER,OrtDeviceAllocator,WebGpuDevice(0),OrtMemTypeDefault);
+  Tensor p(DataTypeImpl::GetType<float>(),{int64_t(elements)},pb.get(),memory);
+  Tensor f(DataTypeImpl::GetType<uint32_t>(),{flag_size},fb.get(),memory);
+  Tensor e(DataTypeImpl::GetType<uint32_t>(),{32},eb.get(),memory);
+  {
+    auto wb=Storage(weights.data(),weights.size()*4);
+    Tensor w(DataTypeImpl::GetType<float>(),{channels,channels,kernel},wb.get(),memory);
+    Tensor short_p(DataTypeImpl::GetType<float>(),{int64_t(elements-4)},pb.get(),memory);
+    Tensor short_f(DataTypeImpl::GetType<uint32_t>(),{16},fb.get(),memory);
+    Tensor wrong_e(DataTypeImpl::GetType<float>(),{32},eb.get(),memory);
+    const ResidualConvSpecV1 spec{97,97,channels,1,97,1,0,kernel,1,97,input_offset,input_count,output_offset,output_count,
+      gsl::span<const uint32_t>{identity.data(),identity.size()}};
+    ASSERT_NO_FATAL_FAILURE(WithContext([&](ComputeContextBase& c){
+      uint64_t dispatches=0;
+      EXPECT_FALSE(PrepareResidualRegisterWeightsV1(c,&e,&w,&short_p,&f,spec,dispatches).IsOK());
+      EXPECT_FALSE(PrepareResidualRegisterWeightsV1(c,&e,&w,&p,&short_f,spec,dispatches).IsOK());
+      EXPECT_FALSE(PrepareResidualRegisterWeightsV1(c,&wrong_e,&w,&p,&f,spec,dispatches).IsOK());
+      EXPECT_EQ(dispatches,0u);
+    }));
+    Ep().BufferManager().Download(Ep().Recording(),pb.get(),packed.data(),packed.size()*4);
+    EXPECT_TRUE(std::all_of(packed.begin(),packed.end(),[](float value){return value==12345.0f;}));
+  }
+  for(int fault:{0,1,2,3,0}){
+    for(size_t i=0;i<weights.size();++i)weights[i]=float(int(i%97)-48)/32.0f;
+    if(fault==1)weights[((output_offset+33)*channels+input_offset+1)*kernel]=std::numeric_limits<float>::infinity();
+    if(fault==2)weights[((output_offset+1)*channels+input_offset-1)*kernel]=std::numeric_limits<float>::quiet_NaN();
+    if(fault==3)weights[((output_offset+64)*channels+input_offset+input_count-1)*kernel+kernel-1]=std::numeric_limits<float>::infinity();
+    auto wb=Storage(weights.data(),weights.size()*4);
+    Tensor w(DataTypeImpl::GetType<float>(),{channels,channels,kernel},wb.get(),memory);
+    const ResidualConvSpecV1 spec{97,97,channels,1,97,1,0,kernel,1,97,input_offset,input_count,output_offset,output_count,
+      gsl::span<const uint32_t>{identity.data(),identity.size()}};
+    ASSERT_NO_FATAL_FAILURE(WithContext([&](ComputeContextBase& c){
+      uint64_t dispatches=0;ASSERT_STATUS_OK(PrepareResidualRegisterWeightsV1(c,&e,&w,&p,&f,spec,dispatches));EXPECT_EQ(dispatches,1u);
+    }));
+    Ep().BufferManager().Download(Ep().Recording(),pb.get(),packed.data(),packed.size()*4);
+    Ep().BufferManager().Download(Ep().Recording(),fb.get(),flags.data(),flags.size()*4);
+    size_t physical=0;
+    for(uint32_t block=0;block<rows;block+=64)for(uint32_t k=0;k<vectors;++k)
+      for(uint32_t within=0;within<64;++within)for(uint32_t lane=0;lane<4;++lane){
+        const uint32_t row=block+within,position=k*4+lane;
+        const float expected=row<output_count&&position<inner?weights[((output_offset+row)*channels+input_offset)*kernel+position]:0.0f;
+        EXPECT_EQ(packed[physical++],expected)<<row<<","<<position;
+      }
+    EXPECT_EQ(physical,elements);
+    for(size_t i=elements;i<packed.size();++i)EXPECT_EQ(packed[i],12345.0f);
+    for(uint32_t group=0;group<rows/32;++group)EXPECT_EQ(flags[flag_base+group],(fault==1&&group==1)||(fault==3&&group==2)?1u:0u);
+    for(size_t i=0;i<flags.size();++i)if(i<flag_base||i>=flag_base+rows/32)EXPECT_EQ(flags[i],0x12345678u);
+  }
+}
+
 }  // namespace
 }  // namespace onnxruntime::test
 #endif  // ORT_M0_DESCRIPTOR_QUALIFICATION && !ORT_MINIMAL_BUILD

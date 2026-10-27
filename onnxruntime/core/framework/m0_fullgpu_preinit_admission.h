@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "core/framework/session_options.h"
+#include "core/common/m0_capacity_ceiling_v1.h"
 
 namespace onnxruntime {
 
@@ -14,7 +15,16 @@ inline bool M0FullGpuPreinitRequestedV1(const SessionOptions& options) {
   return options.config_options.GetConfigOrDefault("m0.fullgpu.preinit_admission_v1", "0") != "0";
 }
 
+inline Status M0FullGpuReadCapacityCeilingV1(const SessionOptions& options,uint32_t& ceiling){
+  const auto& entries=options.config_options.GetConfigOptionsMap();
+  const auto found=entries.find(kM0CapacityCeilingConfigV1);
+  ceiling=kM0MaximumDurationCapacityV1;
+  ORT_RETURN_IF_NOT(found==entries.end()||M0ParseCapacityCeilingV1(found->second,ceiling),"RW07_NATIVE_CAPACITY_CEILING_CONFIG");
+  return Status::OK();
+}
+
 inline Status M0FullGpuValidatePreinitOptionsV1(const SessionOptions& options) {
+  uint32_t ceiling=0;ORT_RETURN_IF_ERROR(M0FullGpuReadCapacityCeilingV1(options,ceiling));
   ORT_RETURN_IF_NOT(options.config_options.GetConfigOrDefault("m0.fullgpu.preinit_admission_v1", "0") == "1" &&
                         options.config_options.GetConfigOrDefault("m0.fullgpu.preinit_abi_v1", "0") == "1",
                     "RW07_PREINIT_DENY_ABI");

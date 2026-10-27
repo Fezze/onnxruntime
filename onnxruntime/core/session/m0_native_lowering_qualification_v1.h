@@ -50,14 +50,14 @@ struct M0NativeResourceMetadataReceiptV3 {
   bool missing_extent_denied = false, fault_denied = false, restored_requery = false;
   bool session_uninitialized = false;
 };
-enum class M0NativeInitializedFaultV1 { None, InitializerSubstitution, AllocationReuse, LateCopy };
+enum class M0NativeInitializedFaultV1 { None, InitializerSubstitution, AllocationReuse, LateCopy, SourceRawBytes, SourceGraphPorts, CapacityCeilingMutation, BoundaryExecutionSubstitution };
 struct M0NativeInitializedReceiptV1 {
   size_t expected_initializers = 0, initializers = 0, constants = 0, uploaded = 0, planned_sources = 0;
   size_t nodes = 0, kernels = 0, unique_resources = 0;
   bool initialized = false, checked_completion = false, state_bound = false, epoch_bound = false, plan_bound = false;
   bool gpu_parameters = false, original_model_retained = false, original_ports_retained = false;
   bool session_uninitialized = false, replay_retained = false, fault_denied = false, restored_replay_denied = false;
-  bool retired = false;
+  bool retired = false, boundary_source_lease_checked = false;
 };
 struct M0NativeRunReceiptV1 {
   M0NativePcmDifferenceV1 preallocated_difference,empty_wrapper_difference,repeated_difference;

@@ -14,7 +14,7 @@
 #include <gsl/gsl>
 #include <gsl/span>
 #if defined(__linux__)
-#include <dlfcn.h>
+#include "m0_core_context_queries_v1.h"
 #endif
 
 #include "core/common/inlined_containers.h"
@@ -87,6 +87,12 @@ struct OpKernel {
   }
 
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(OpKernel);
+#if defined(__linux__)
+  // Per retained kernel, not per transient ComputeImpl context and not global.
+  // Declared before the other members so core queries remain pinned through
+  // their destructors and every invocation using this kernel.
+  m0_detail::M0CoreContextQueryLeaseV1<> m0_core_queries_;
+#endif
   OpKernelInfo op_kernel_info_;
   bool outer_prepack_parallelism_enabled_{false};
 };
@@ -230,22 +236,10 @@ struct OpKernelContext {
 #if defined(__linux__)
     if(CurrentOrtApiVersion()<28)return false;
     const auto api_function=Ort::GetApi().KernelContext_GetSyncStream;
-    Dl_info api_info{};
-    if(!api_function||!dladdr(reinterpret_cast<void*>(api_function),&api_info)||!api_info.dli_fname)return false;
-    void* core=dlopen(api_info.dli_fname,RTLD_NOW|RTLD_LOCAL|RTLD_NOLOAD);
-    // Qualification links the actual core into a PIE executable. Android does
-    // not reopen that executable by filename; resolve its exported ABI through
-    // the main-program handle, with the same exact API-module origin check.
-    if(!core)core=dlopen(nullptr,RTLD_NOW|RTLD_LOCAL);
-    if(!core)return false;
     using Query=int (ORT_API_CALL*)(const OrtKernelContext*,uint32_t,Value*) noexcept;
-    auto query=reinterpret_cast<Query>(dlsym(core,symbol));
-    Dl_info query_info{};Value pending=0;
-    const bool available=query&&dladdr(reinterpret_cast<void*>(query),&query_info)&&
-        query_info.dli_fbase==api_info.dli_fbase&&
-        query(context_.GetOrtKernelContext(),version,&pending)==1;
-    dlclose(core);
-    if(!available)return false;
+    auto query=reinterpret_cast<Query>(op_kernel_.m0_core_queries_.Lookup(reinterpret_cast<const void*>(api_function),symbol));
+    Value pending=0;
+    if(!query||query(context_.GetOrtKernelContext(),version,&pending)!=1)return false;
     value=pending;
     return true;
 #else

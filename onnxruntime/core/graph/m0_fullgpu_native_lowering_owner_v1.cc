@@ -5,8 +5,8 @@
 #include "core/session/m0_native_gpu_module_v2.h"
 namespace onnxruntime {
 M0FullGpuNativeLoweringOwnerV1::M0FullGpuNativeLoweringOwnerV1(
-    const Model& source,const InferenceSession& session,uint32_t capacity,bool device_capacity)
-    :source_(&source),session_(&session),capacity_(capacity),device_capacity_(device_capacity){}
+    const Model& source,const InferenceSession& session,uint32_t capacity,bool device_capacity,uint32_t requested_ceiling)
+    :source_(&source),session_(&session),capacity_(capacity),device_capacity_(device_capacity),requested_capacity_ceiling_(requested_ceiling){}
 void M0FullGpuNativeLoweringOwnerV1::PreparedModuleDeleter::operator()(M0NativeGpuModuleV2* module)const{
  std::default_delete<M0NativeGpuModuleV2>{}(module);
 }
@@ -25,21 +25,47 @@ M0FullGpuNativeLoweringOwnerV1::~M0FullGpuNativeLoweringOwnerV1(){
 #include "core/session/inference_session.h"
 #include "core/session/ort_env.h"
 #include <algorithm>
+#include <limits>
 #include <tuple>
 #include "sha256.h"
 #include "core/graph/m0_proto_hash_v1.h"
 #include "core/graph/m0_bounded_backing_v1.h"
 #include "core/graph/m0_fullgpu_native_memory_plan_v1.h"
 #include "core/common/m0_memory_reserve_v1.h"
+#include "core/common/m0_capacity_ceiling_v1.h"
 namespace onnxruntime {
+static_assert(kM0MaximumDurationCapacityV1==m0_internal::M0NativeMemoryPlanV1::kLogicalCapacity);
+M0FullGpuNativeLoweringOwnerV1::BoundarySourceValidation::BoundarySourceValidation(
+ const M0FullGpuNativeLoweringOwnerV1& owner)
+ :owner_(&owner),source_(owner.source_),execution_(owner.execution_model_.get()){
+ ORT_ENFORCE(source_&&execution_&&source_!=execution_&&!owner.active_source_boundary_&&
+  owner.source_boundary_serial_!=std::numeric_limits<uint64_t>::max(),"RW07_NATIVE_BOUNDARY_SOURCE_IDENTITY");
+ M0OriginalPreloadOwnerV1::ValidateNativeLoweringSource(*source_);
+ serial_=++owner.source_boundary_serial_;owner.active_source_boundary_=serial_;
+}
+M0FullGpuNativeLoweringOwnerV1::BoundarySourceValidation::~BoundarySourceValidation(){
+ if(owner_->active_source_boundary_==serial_)owner_->active_source_boundary_=0;
+}
+M0FullGpuNativeLoweringOwnerV1::BoundarySourceValidation M0FullGpuNativeLoweringOwnerV1::ValidateSourceBoundary()const{
+ return BoundarySourceValidation(*this);
+}
+void M0FullGpuNativeLoweringOwnerV1::CheckBoundarySourceValidation(const BoundarySourceValidation& proof)const{
+ ORT_ENFORCE(proof.owner_==this&&proof.source_==source_&&proof.execution_==execution_model_.get()&&
+  source_&&proof.execution_&&source_!=proof.execution_&&proof.serial_&&
+  proof.serial_==source_boundary_serial_&&proof.serial_==active_source_boundary_,"RW07_NATIVE_BOUNDARY_SOURCE_SUBSTITUTION");
+}
 const ONNX_NAMESPACE::TensorProto& M0FullGpuNativeLoweringOwnerV1::ExpectedInitializer(
- const ONNX_NAMESPACE::TensorProto& metadata)const{
+ const ONNX_NAMESPACE::TensorProto& metadata,const BoundarySourceValidation* proof)const{
+ if(proof)CheckBoundarySourceValidation(*proof);
  const auto found=initializer_sources_.find(metadata.name());
  ORT_ENFORCE(initializer_payloads_transferred_&&found!=initializer_sources_.end()&&
   found->second.first&&found->second.second==&metadata&&metadata.raw_data().empty()&&
   m0_internal::M0SameInitializerMetadataV1(*found->second.first,metadata),
   "RW07_NATIVE_RETIRED_INITIALIZER_METADATA");
- M0OriginalPreloadOwnerV1::ValidateNativeInitializer(*source_,*found->second.first);
+ // A complete source check in this same boundary already authenticated every
+ // original initializer against its independent canonical backing. Standalone
+ // upload/descriptor callers retain the individual check.
+ if(!proof)M0OriginalPreloadOwnerV1::ValidateNativeInitializer(*source_,*found->second.first);
  return *found->second.first;
 }
 namespace {
@@ -81,7 +107,7 @@ uint64_t InitializerEnvelope(const ONNX_NAMESPACE::ModelProto& model){
 }
 }  // namespace
 uint32_t M0FullGpuNativeLoweringOwnerV1::SelectPhysicalCapacity(M0NativeGpuModuleV2& module,
- const ONNX_NAMESPACE::ModelProto& original,const Model& source,ExecutionOrder execution_order,M0NativeDeviceLimitsV1& limits,
+ const ONNX_NAMESPACE::ModelProto& original,const Model& source,ExecutionOrder execution_order,uint32_t requested_ceiling,M0NativeDeviceLimitsV1& limits,
  uint64_t& initializer_bytes,std::vector<std::string>& memory_order,uint64_t& available_bytes,uint64_t& peak_bytes){
  limits=module.DeviceLimits();initializer_bytes=InitializerEnvelope(original);
  // The seal contains metadata and independently owned raw byte views. Building
@@ -118,28 +144,24 @@ uint32_t M0FullGpuNativeLoweringOwnerV1::SelectPhysicalCapacity(M0NativeGpuModul
     "RW07_NATIVE_CAPACITY_DEVICE_CHANGED");
   return CapacityFits(d,sized,single)&&memory_fits(d);
  };
- ORT_ENFORCE(fits(1),"RW07_NATIVE_CAPACITY_DEVICE_OR_MEMORY_UNSUPPORTED available_bytes=",available_bytes,
+ const uint32_t low=M0LargestFittingCapacityV1(requested_ceiling,fits);
+ ORT_ENFORCE(low>0,"RW07_NATIVE_CAPACITY_DEVICE_OR_MEMORY_UNSUPPORTED available_bytes=",available_bytes,
   " reserve_bytes=",kM0MemoryReserveBytesV1," future_weight_bytes=",future_weights,
   " minimum_peak_bytes=",memory.PeakBytes(1));
- uint32_t low=1,high=102400;
- while(low<high){
-  const uint32_t middle=low+(high-low+1)/2;
-  if(fits(middle))low=middle;else high=middle-1;
- }
  memory_order=memory.Order();peak_bytes=memory.PeakBytes(low);
  const uint64_t remaining=available_bytes>=future_weights?available_bytes-future_weights:0;
  const uint64_t reserved=remaining>=kM0MemoryReserveBytesV1?remaining-kM0MemoryReserveBytesV1:0;
  const bool queued_slack=kM0EnforceMemoryReserveV1||minimum_peak<=reserved/2||
   (minimum_peak>reserved&&minimum_peak<=remaining/2);
  LOGS_DEFAULT(INFO)<<"M0_RW07_MEMORY_CAPACITY selected_duration="<<low<<" available_bytes="<<available_bytes
-  <<" reserve_bytes="<<kM0MemoryReserveBytesV1<<" future_weight_bytes="<<future_weights
+  <<" requested_ceiling="<<requested_ceiling<<" reserve_bytes="<<kM0MemoryReserveBytesV1<<" future_weight_bytes="<<future_weights
   <<" estimated_live_and_scratch_bytes="<<peak_bytes<<" queued_slack_bytes="<<(queued_slack?peak_bytes:0)
   <<" planning_budget_bytes="<<planning_budget<<" memory_policy="<<(kM0EnforceMemoryReserveV1?"enforce":"monitor")<<" mono_us="<<M0MonotonicMicrosecondsV1();
  return low;
 }
 void M0FullGpuNativeLoweringOwnerV1::ValidatePhysicalCapacity(M0NativeGpuModuleV2& module)const{
  if(!device_capacity_)return;
- ORT_ENFORCE(capacity_>0&&capacity_<=102400&&InitializerEnvelope(derived_)<=initializer_capacity_bytes_,
+ ORT_ENFORCE(capacity_>0&&capacity_<=requested_capacity_ceiling_&&requested_capacity_ceiling_<=kM0MaximumDurationCapacityV1&&InitializerEnvelope(derived_)<=initializer_capacity_bytes_,
    "RW07_NATIVE_CAPACITY_DERIVED_ENVELOPE");
  const auto sized=module.DeviceLimits(CarrierBytes(capacity_),initializer_capacity_bytes_,kUniformBytes);
  const auto single=module.DeviceLimits(SingleBindingBytes(capacity_));
@@ -150,6 +172,7 @@ void M0FullGpuNativeLoweringOwnerV1::ValidatePhysicalCapacity(M0NativeGpuModuleV
 std::unique_ptr<M0FullGpuNativeLoweringOwnerV1> M0FullGpuNativeLoweringOwnerV1::Prepare(
  const Model& source,const InferenceSession& session,const ONNX_NAMESPACE::ModelProto& original,uint32_t capacity,
  bool device_capacity){
+ const uint32_t requested_ceiling=capacity;
  std::unique_ptr<M0NativeGpuModuleV2> module;
  M0NativeDeviceLimitsV1 limits;uint64_t initializer_bytes=0;
  std::vector<std::string> memory_order;uint64_t memory_available=0,memory_peak=0;
@@ -166,11 +189,11 @@ std::unique_ptr<M0FullGpuNativeLoweringOwnerV1> M0FullGpuNativeLoweringOwnerV1::
  };
  if(device_capacity){
   validate();module=M0NativeGpuModuleV2::Open(*session.session_logger_);
-  capacity=SelectPhysicalCapacity(*module,original,source,session.session_options_.execution_order,limits,initializer_bytes,
+  capacity=SelectPhysicalCapacity(*module,original,source,session.session_options_.execution_order,requested_ceiling,limits,initializer_bytes,
    memory_order,memory_available,memory_peak);validate();
  }
  auto pending=std::unique_ptr<M0FullGpuNativeLoweringOwnerV1>(
-   new M0FullGpuNativeLoweringOwnerV1(source,session,capacity,device_capacity));
+   new M0FullGpuNativeLoweringOwnerV1(source,session,capacity,device_capacity,requested_ceiling));
  if(device_capacity){
   pending->prepared_module_.reset(module.release());pending->device_limits_=limits;
   pending->initializer_capacity_bytes_=initializer_bytes;

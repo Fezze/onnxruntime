@@ -264,8 +264,9 @@ std::string M0FullGpuNativeLoweringOwnerV1::ExecutionFingerprint()const{
  for(const auto& row:value_arguments_){field(row.first);field(row.second->TypeAsProto()->SerializeAsString());}
  return hash.FinalHex();
 }
-void M0FullGpuNativeLoweringOwnerV1::ValidateExecutionModel(){
+void M0FullGpuNativeLoweringOwnerV1::ValidateExecutionModel(const BoundarySourceValidation* proof){
  try{
+ if(proof)CheckBoundarySourceValidation(*proof);
  ORT_ENFORCE(descriptor_inference_started_,"RW07 native descriptor inference entry missing");
  ORT_ENFORCE((phase_==Phase::Resolving||phase_==Phase::Resolved)&&execution_model_&&execution_model_.get()==constructing_model_&&execution_model_.get()!=source_,"RW07 native retained separate execution model");
  const auto& graph=execution_model_->MainGraph();ORT_ENFORCE(size_t(graph.NumberOfNodes())==descriptors_.size()&&graph.GetInputs().size()==3&&graph.GetOutputs().size()==4,"RW07 native actual execution inventory");
@@ -277,7 +278,7 @@ void M0FullGpuNativeLoweringOwnerV1::ValidateExecutionModel(){
  for(const auto& row:descriptors_)ORT_ENFORCE(row.second.checked&&row.second.selected&&row.second.inferred&&row.second.propagated&&row.second.published,"RW07 native incomplete descriptor callbacks");
  const auto& init=graph.GetAllInitializedTensors();ORT_ENFORCE(init.size()==size_t(derived_.graph().initializer_size()),"RW07 native initializer inventory");
  for(const auto& metadata:derived_.graph().initializer()){
-  const auto& expected=ExpectedInitializer(metadata);
+  const auto& expected=ExpectedInitializer(metadata,proof);
   const auto actual=init.find(metadata.name());ORT_ENFORCE(actual!=init.end()&&actual->second&&
    m0_internal::M0SameInlineInitializerV1(*actual->second,expected),"RW07 native immutable execution initializer");
  }

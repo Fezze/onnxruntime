@@ -133,7 +133,8 @@ inline uint64_t ResidualFixedReferencesV1(uint32_t input_capacity,uint32_t outpu
   // the maximum packed scratch, coefficients, extent, uniforms and alignment.
   const uint64_t carrier=uint64_t(std::max(input_capacity,output_capacity))*channels*sizeof(float);
   return carrier+weight_bytes+bias_bytes+uint64_t(channels)*6*sizeof(float)+128+
-    kM0ResidualPackedScratchBytesV1+kM0ResidualPackedFlagWordsV1*sizeof(uint32_t)+kM0UniformArenaBytesV1+8*15;
+    kM0ResidualPackedScratchBytesV1+kM0ResidualRegisterWeightScratchBytesV1+
+    kM0ResidualPackedFlagWordsV1*sizeof(uint32_t)+kM0UniformArenaBytesV1+9*15;
 }
 inline Status ResidualTileChannels(ComputeContext& c,uint32_t input_capacity,uint32_t output_capacity,
     uint32_t channels,uint32_t& tile_channels,bool wide_residual=false,uint64_t fixed_references=0){
@@ -477,7 +478,7 @@ inline uint32_t ResidualChannelBlockV1(uint64_t workgroup_bytes) {
   for(uint32_t block:{8u,4u,2u,1u})if(ResidualChannelTileStorageV1(block)<=workgroup_bytes)return block;
   return 0;
 }
-inline uint32_t ResidualBestBlockV1(const std::array<double,5>& scores,uint32_t maximum) {
+inline uint32_t ResidualBestBlockV1(const std::array<double,7>& scores,uint32_t maximum) {
   uint32_t chosen=1;
   double best=scores[0];
   for(size_t i=1;i<scores.size();++i){
@@ -491,7 +492,7 @@ inline uint32_t ResidualBestBlockV1(const std::array<double,5>& scores,uint32_t 
 template <typename Run>
 inline Status ResidualAutotunedBlockV1(ComputeContextBase& context,const std::string& key,
     uint32_t maximum,bool overwrite_pass,Run&& run,uint32_t& chosen) {
-  ORT_RETURN_IF_NOT(maximum==1||maximum==2||maximum==4||maximum==8||maximum==16,"RW07 residual tuning capacity");
+  ORT_RETURN_IF_NOT(maximum==1||maximum==2||maximum==4||maximum==8||maximum==16||maximum==32||maximum==64,"RW07 residual tuning capacity");
   chosen=context.M0ResidualBlockChoiceV1(key);
   if(chosen>maximum)chosen=0;
   if(chosen)return Status::OK();
@@ -500,10 +501,10 @@ inline Status ResidualAutotunedBlockV1(ComputeContextBase& context,const std::st
   // Compile/warm all candidates outside the measured intervals. Reverse the
   // second round so one candidate does not always receive the warmest device.
   for(uint32_t block=1;block<=maximum;block*=2)ORT_RETURN_IF_ERROR(run(block));
-  std::array<double,5> scores{};
+  std::array<double,7> scores{};
   for(uint32_t round=0;round<2;++round){
-    for(uint32_t i=0;i<5;++i){
-      const uint32_t index=round?4u-i:i,block=1u<<index;
+    for(uint32_t i=0;i<7;++i){
+      const uint32_t index=round?6u-i:i,block=1u<<index;
       if(block>maximum)continue;
       const auto start=std::chrono::steady_clock::now();
       ORT_RETURN_IF_ERROR(run(block));
@@ -513,7 +514,7 @@ inline Status ResidualAutotunedBlockV1(ComputeContextBase& context,const std::st
   chosen=ResidualBestBlockV1(scores,maximum);
   context.M0RememberResidualBlockV1(key,chosen);
   LOGS(context.Logger(),INFO)<<"M0_RW07_RESIDUAL_BLOCK_TUNING key="<<key<<" selected="<<chosen
-    <<" max_supported="<<maximum<<" samples_ns="<<scores[0]<<","<<scores[1]<<","<<scores[2]<<","<<scores[3]<<","<<scores[4];
+    <<" max_supported="<<maximum<<" samples_ns="<<scores[0]<<","<<scores[1]<<","<<scores[2]<<","<<scores[3]<<","<<scores[4]<<","<<scores[5]<<","<<scores[6];
   return Status::OK();
 }
 inline constexpr uint64_t kResidualMatrixStorageV1=5760;
@@ -555,9 +556,9 @@ struct ResidualConvSpecV1 {
     p.AddUniformVariables({input_capacity,output_capacity,channels,minimum,maximum,modulus,remainder,kernel,dilation,
       residual_capacity,channel_offset,channel_count,output_channel_offset,output_channel_count,first,count,identity,t,n});
   }
-  template <typename P> void ApplyPacked(P& p,uint32_t t,uint32_t n,uint32_t row,uint32_t rows)const {
+  template <typename P> void ApplyPacked(P& p,uint32_t t,uint32_t n,uint32_t row,uint32_t rows,uint32_t flag_offset=0)const {
     p.AddUniformVariables({input_capacity,output_capacity,channels,minimum,maximum,modulus,remainder,kernel,dilation,
-      residual_capacity,channel_offset,channel_count,output_channel_offset,output_channel_count,0u,0u,identity,t,n,row,rows});
+      residual_capacity,channel_offset,channel_count,output_channel_offset,output_channel_count,0u,0u,identity,t,n,row,rows,flag_offset});
   }
 };
 inline constexpr uint32_t kResidualPackedTimeV1=2048;
@@ -565,15 +566,20 @@ inline constexpr uint64_t kResidualPackedScratchBytesV1=kM0ResidualPackedScratch
 inline uint32_t ResidualPackedProductsPerDispatchV1(bool batched=M0BatchHeavyProgramsV1()) {
   return batched?(1u<<28):ResidualProductsPerDispatchV1(false);
 }
-inline uint64_t ResidualPackedElementsV1(uint32_t channels,uint32_t kernel) {
+inline uint32_t ResidualPackedInnerV1(uint32_t channels,uint32_t kernel){
   if(channels==0||channels>256||kernel==0||kernel>11)return 0;
-  return std::min(uint64_t(channels)*kernel*kResidualPackedTimeV1,kResidualPackedScratchBytesV1/4);
+  return (channels*kernel+3u)/4u*4u;
+}
+inline uint64_t ResidualPackedElementsV1(uint32_t channels,uint32_t kernel) {
+  const uint64_t inner=ResidualPackedInnerV1(channels,kernel);
+  return inner?std::min(inner*kResidualPackedTimeV1,kResidualPackedScratchBytesV1/4):0;
 }
 // Eight inner rows by32 time positions per flag. Padding at most seven
 // inner rows adds at most56 words across the bounded2048-position window.
+// The final16 words hold one weight-safety flag per32 output channels.
 inline uint64_t ResidualPackedFlagCapacityV1(uint64_t column_elements){
   if(!column_elements||column_elements>kResidualPackedScratchBytesV1/sizeof(float))return 0;
-  return (column_elements+255)/256+kResidualPackedTimeV1/32;
+  return (column_elements+255)/256+kResidualPackedTimeV1/32+kM0ResidualPackedWeightFlagWordsV1;
 }
 inline uint64_t ResidualPackedFlagCountV1(uint32_t channels,uint32_t kernel,uint32_t time_count){
   if(!channels||channels>256||!kernel||kernel>11||!time_count||time_count>kResidualPackedTimeV1||time_count%32)return 0;
@@ -581,55 +587,125 @@ inline uint64_t ResidualPackedFlagCountV1(uint32_t channels,uint32_t kernel,uint
 }
 inline constexpr uint64_t kResidualPackedStorageV1=8512;
 inline uint32_t ResidualPackedTimeV1(uint32_t channels,uint32_t kernel,uint32_t budget=ResidualPackedProductsPerDispatchV1()) {
-  const uint64_t inner=uint64_t(channels)*kernel;
-  if(!inner||channels>256||kernel>11)return 0;
+  const uint64_t inner=ResidualPackedInnerV1(channels,kernel);
+  if(!inner)return 0;
   const uint64_t rounded=(inner+31)/32*32;
   const auto count=std::min({uint64_t(kResidualPackedTimeV1),uint64_t(budget)/(rounded*32),kResidualPackedScratchBytesV1/(inner*4)});
   return static_cast<uint32_t>(count/32*32);
+}
+inline uint64_t ResidualRegisterWeightElementsV1(uint32_t outputs,uint32_t inputs,uint32_t kernel){
+  if(!outputs||outputs>512||!inputs||inputs>256||!kernel||kernel>11)return 0;
+  const uint64_t rows=(uint64_t(outputs)+63)/64*64,inner=(uint64_t(inputs)*kernel+3)/4;
+  const uint64_t elements=rows*inner*4;
+  return elements<=kM0ResidualRegisterWeightScratchBytesV1/sizeof(float)?elements:0;
 }
 inline bool ResidualPackedSupportedV1(const wgpu::Limits& limits) {
   return limits.maxComputeWorkgroupStorageSize>=kResidualPackedStorageV1&&limits.maxComputeWorkgroupSizeX>=8&&
     limits.maxComputeWorkgroupSizeY>=8&&limits.maxComputeInvocationsPerWorkgroup>=64&&
     limits.maxStorageBuffersPerShaderStage>=7&&limits.maxBindingsPerBindGroup>=8;
 }
+
+// Physical weights: [row block64][K4][64rows][4K]. Physical columns:
+// [K4][time block32][4K][32times]. A group reads compact adjacent K/row/time
+// tiles, rather than striding across all padded rows or the whole time window.
+// Per invocation/window GPU preparation. No cross-Run cache or CPU weight access.
+class ResidualPackedWeightFlagsV1 final : public Program<ResidualPackedWeightFlagsV1> {
+ public:
+  explicit ResidualPackedWeightFlagsV1(bool pack=false)
+      :Program{pack?"RW07ResidualPackWeightsAndFlagsV5":"RW07ResidualPackedWeightFlagsV1"},pack_weights_(pack){}
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(M0_RESIDUAL_TILE_UNIFORMS_V1,
+    {"row_begin",ProgramUniformVariableDataType::Uint32},{"row_count",ProgramUniformVariableDataType::Uint32},
+    {"weight_flag_offset",ProgramUniformVariableDataType::Uint32});
+  Status GenerateShaderCode(ShaderHelper& s)const override {
+    const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
+    const auto& w=s.AddInput("weight",ShaderUsage::UseValueTypeAlias);
+    const auto* packed=pack_weights_?&s.AddOutput("packed_weight",ShaderUsage::UseValueTypeAlias):nullptr;
+    const auto& flags=s.AddOutput("flags",ShaderUsage::UseValueTypeAlias);
+    ValidOutput(s,e,true);
+    s.AdditionalImplementation()<<"var<workgroup> weight_unsafe:array<u32,64>;";
+    auto& f=s.MainFunctionBody();
+    if(pack_weights_){
+      f<<"let row_base=workgroup_idx*32u;if(row_base>=uniforms.row_count){return;}"
+        <<"let inner=uniforms.channel_count*uniforms.kernel;let vectors=(inner+3u)/4u;"
+        <<"var bad=select(1u,0u,valid_output());"
+        <<"for(var index=local_idx;index<32u*vectors;index+=64u){let row=row_base+index%32u;let k=index/32u;"
+        <<"var value=vec4<f32>(0.0);if(valid_output()&&row<uniforms.output_channel_count){"
+        <<"let at=((uniforms.output_channel_offset+row)*uniforms.channels+uniforms.channel_offset)*uniforms.kernel+k*4u;"
+        <<"for(var lane=0u;lane<4u;lane++){if(k*4u+lane<inner){value[lane]="
+        <<w.GetByOffset("(at+lane)/4u")<<"[(at+lane)%4u];}}}"
+        <<packed->SetByOffset("((row/64u)*vectors+k)*64u+row%64u","value")
+        <<"if(any((bitcast<vec4<u32>>(value)&vec4u(0x7fffffffu))>vec4u(0x58800000u))){bad=1u;}}";
+    }else{
+    f<<"let row_base=workgroup_idx*32u;if(row_base>=uniforms.output_channel_count){return;}"
+      <<"let inner=uniforms.channel_count*uniforms.kernel;var bad=select(1u,0u,valid_output());"
+      <<"for(var index=local_idx;index<32u*inner;index+=64u){let row=row_base+index/inner;"
+      <<"if(row<uniforms.output_channel_count){let at=((uniforms.output_channel_offset+row)*uniforms.channels+"
+      <<"uniforms.channel_offset)*uniforms.kernel+index%inner;let value="<<w.GetByOffset("at/4u")<<"[at%4u];"
+      <<"bad=bad|select(0u,1u,(bitcast<u32>(value)&0x7fffffffu)>0x58800000u);}}";
+    }
+    f<<"weight_unsafe[local_idx]=bad;workgroupBarrier();if(local_idx==0u){var combined=0u;"
+      <<"for(var lane=0u;lane<64u;lane++){combined|=weight_unsafe[lane];}"
+      <<flags.SetByOffset("uniforms.weight_flag_offset+workgroup_idx","combined")<<"}";
+    return Status::OK();
+  }
+ private:
+  const bool pack_weights_;
+};
 class ResidualPackColumnsV1 final : public Program<ResidualPackColumnsV1> {
  public:
-  ResidualPackColumnsV1():Program{"RW07ResidualPackColumnsV1"}{}
+  explicit ResidualPackColumnsV1(bool skip_inactive=false):Program{skip_inactive?"RW07ResidualPackActiveColumnsV6":"RW07ResidualPackColumnsV6"},skip_inactive_(skip_inactive){}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(M0_RESIDUAL_TILE_UNIFORMS_V1,
-    {"row_begin",ProgramUniformVariableDataType::Uint32},{"row_count",ProgramUniformVariableDataType::Uint32});
+    {"row_begin",ProgramUniformVariableDataType::Uint32},{"row_count",ProgramUniformVariableDataType::Uint32},
+    {"weight_flag_offset",ProgramUniformVariableDataType::Uint32});
   Status GenerateShaderCode(ShaderHelper& s)const override {
     const auto& x=s.AddInput("source",ShaderUsage::UseValueTypeAlias);
     const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
     const auto& col=s.AddOutput("columns",ShaderUsage::UseValueTypeAlias);
     const auto& flag=s.AddOutput("flags",ShaderUsage::UseValueTypeAlias);
     ValidOutput(s,e,true);s.AdditionalImplementation()<<"var<workgroup> pack_flags:array<u32,64>;";
+    if(skip_inactive_)s.AdditionalImplementation()<<"var<workgroup> skip_tail:u32;";
     auto& f=s.MainFunctionBody();
     f<<"if(uniforms.time_count<32u||uniforms.time_count>2048u||uniforms.time_count%32u!=0u||"
       <<"uniforms.channel_count==0u||uniforms.channel_count>256u||uniforms.kernel==0u||uniforms.kernel>11u){return;}"
       <<"let inner_count=uniforms.channel_count*uniforms.kernel;let time_tiles=uniforms.time_count/32u;"
       <<"let group_count=((inner_count+7u)/8u)*time_tiles;"
-      <<"if(workgroup_idx>=group_count){return;}var value=vec4<f32>(0.0);"
+      <<"if(workgroup_idx>=group_count){return;}";
+    if(skip_inactive_){
+      f<<"if(local_idx==0u){skip_tail=select(0u,1u,valid_output()&&uniforms.time_begin+"
+        <<"(workgroup_idx%time_tiles)*32u>="<<e.GetByOffset("6u")<<");}"
+        <<"let inactive=workgroupUniformLoad(&skip_tail);if(inactive!=0u){if(local_idx==0u){"
+        <<flag.SetByOffset("workgroup_idx","0u")<<"}return;}";
+    }
+    f<<"var value=vec4<f32>(0.0);"
       <<"let row=(workgroup_idx/time_tiles)*8u+local_idx/8u;"
       <<"let local_t=(workgroup_idx%time_tiles)*32u+(local_idx%8u)*4u;"
       <<"let valid=valid_output()&&uniforms.dilation>=1u&&uniforms.dilation<=5u;"
-      <<"if(row<inner_count){if(valid){let ic=row/uniforms.kernel;let k=row%uniforms.kernel;"
+      <<"if(row<(inner_count+3u)/4u*4u){if(row<inner_count&&valid){let ic=row/uniforms.kernel;let k=row%uniforms.kernel;"
       <<"let n="<<e.GetByOffset("6u")<<";let pad=i32((uniforms.kernel-1u)*uniforms.dilation/2u);"
       <<"for(var lane=0u;lane<4u;lane++){let t=uniforms.time_begin+local_t+lane;let pos=i32(t+k*uniforms.dilation)-pad;"
       <<"if(t<n&&pos>=0&&pos<i32(n)&&pos<i32(uniforms.input_capacity)){value[lane]="
       <<x.GetByOffset("ic*uniforms.input_capacity+u32(pos)")<<";}}}"
-      <<col.SetByOffset("row*(uniforms.time_count/4u)+local_t/4u","value")<<"}"
+      <<col.SetByOffset("((row/4u)*time_tiles+local_t/32u)*32u+(row%4u)*8u+(local_t%32u)/4u","value")<<"}"
       <<"pack_flags[local_idx]=select(0u,1u,any((bitcast<vec4<u32>>(value)&vec4u(0x7fffffffu))>vec4u(0x58800000u)));"
       <<"workgroupBarrier();if(local_idx==0u){var bad=0u;for(var i=0u;i<64u;i++){bad|=pack_flags[i];}"
       <<flag.SetByOffset("workgroup_idx","bad")<<"}";
     return Status::OK();
   }
+ private:
+  const bool skip_inactive_;
 };
 class ResidualPackedMatrixV1 final : public Program<ResidualPackedMatrixV1> {
  public:
-  ResidualPackedMatrixV1():Program{"RW07ResidualPackedMatrixV1"}{}
+  explicit ResidualPackedMatrixV1(bool cached_weights=false,uint32_t register_rows=0)
+      :Program{register_rows==8?"RW07ResidualRegister8MatrixV6":register_rows==4?"RW07ResidualRegister4MatrixV6":cached_weights?"RW07ResidualPackedMatrixWeightsV3":"RW07ResidualPackedMatrixV2"},
+       cached_weights_(cached_weights),register_rows_(register_rows){}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(M0_RESIDUAL_TILE_UNIFORMS_V1,
-    {"row_begin",ProgramUniformVariableDataType::Uint32},{"row_count",ProgramUniformVariableDataType::Uint32});
+    {"row_begin",ProgramUniformVariableDataType::Uint32},{"row_count",ProgramUniformVariableDataType::Uint32},
+    {"weight_flag_offset",ProgramUniformVariableDataType::Uint32});
   Status GenerateShaderCode(ShaderHelper& s)const override {
+    ORT_RETURN_IF_NOT((register_rows_==0||register_rows_==4||register_rows_==8)&&(!register_rows_||cached_weights_),"RW07 register matrix requires prepared safety flags");
+    const uint32_t tile_rows=register_rows_?8u*register_rows_:32u;
+    const uint32_t tile_elements=tile_rows*32u;
     const auto& x=s.AddInput("source",ShaderUsage::UseValueTypeAlias);
     const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
     const auto& w=s.AddInput("weight",ShaderUsage::UseValueTypeAlias);
@@ -638,8 +714,19 @@ class ResidualPackedMatrixV1 final : public Program<ResidualPackedMatrixV1> {
     const auto& flags=s.AddInput("flags",ShaderUsage::UseValueTypeAlias);
     const auto& y=s.AddOutput("output",ShaderUsage::UseValueTypeAlias);
     ValidOutput(s,e);OriginalArithmetic(s);auto& a=s.AdditionalImplementation();
-    a<<"var<workgroup> matrix_flags:array<u32,64>;var<workgroup> matrix_enabled:u32;var<workgroup> matrix_safe:u32;"
-      <<"fn scalar_weight(at:u32)->f32{return "<<w.GetByOffset("at/4u")<<"[at%4u];}"
+    a<<"var<workgroup> matrix_flags:array<u32,64>;var<workgroup> matrix_enabled:u32;var<workgroup> matrix_safe:u32;";
+    if(register_rows_){
+      a<<"fn scalar_weight(at:u32)->f32 {let row=at/(uniforms.channels*uniforms.kernel)-uniforms.output_channel_offset;"
+        <<"let inner=at%(uniforms.channels*uniforms.kernel)-uniforms.channel_offset*uniforms.kernel;"
+        <<"let vectors=(uniforms.channel_count*uniforms.kernel+3u)/4u;return "
+        <<w.GetByOffset("((row/64u)*vectors+inner/4u)*64u+row%64u")<<"[inner%4u];}"
+        // Prepared weights own zero-padded64-row and4-K tails. The actual
+        // caller emits aligned output tiles and exactly ceil(K/4) iterations.
+        <<"fn mm_readA(batch:i32,row:i32,c:i32)->vec4<f32>{"
+        <<"let vectors=(uniforms.channel_count*uniforms.kernel+3u)/4u;let r=uniforms.row_begin+u32(row);return "
+        <<w.GetByOffset("((r/64u)*vectors+u32(c))*64u+r%64u")<<";}";
+    }else{
+    a<<"fn scalar_weight(at:u32)->f32{return "<<w.GetByOffset("at/4u")<<"[at%4u];}"
       <<"fn mm_readA(batch:i32,row:i32,c:i32)->vec4<f32>{var result=vec4<f32>(0.0);"
       <<"if(row<0||u32(row)>=uniforms.row_count){return result;}"
       <<"let inner=u32(c)*4u;let count=uniforms.channel_count*uniforms.kernel;if(inner>=count){return result;}"
@@ -648,9 +735,13 @@ class ResidualPackedMatrixV1 final : public Program<ResidualPackedMatrixV1> {
       <<"if(shift==0u){result=first;}else{var second=vec4<f32>(0.0);"
       <<"if(base/4u+1u<uniforms.channels*uniforms.channels*uniforms.kernel/4u){second="<<w.GetByOffset("base/4u+1u")<<";}"
       <<"for(var lane=0u;lane<4u;lane++){let index=shift+lane;if(index<4u){result[lane]=first[index];}else{result[lane]=second[index-4u];}}}"
-      <<"if(inner+4u>count){for(var lane=0u;lane<4u;lane++){if(inner+lane>=count){result[lane]=0.0;}}}return result;}"
-      <<"fn mm_readB(batch:i32,row:i32,c:i32)->vec4<f32>{if(row<0||u32(row)>=uniforms.channel_count*uniforms.kernel){return vec4<f32>(0.0);}return "
-      <<col.GetByOffset("u32(row)*(uniforms.time_count/4u)+u32(c)")<<";}"
+      <<"if(inner+4u>count){for(var lane=0u;lane<4u;lane++){if(inner+lane>=count){result[lane]=0.0;}}}return result;}";
+    }
+    a<<"fn mm_readB(batch:i32,row:i32,c:i32)->vec4<f32>{";
+    if(!register_rows_)a<<"if(row<0||u32(row)>=uniforms.channel_count*uniforms.kernel){return vec4<f32>(0.0);}";
+    // Register loads address the physical four-row padding prepared with the
+    // columns; shared32-K tiles retain their wider logical-tail guard.
+    a<<"return "<<col.GetByOffset("((u32(row)/4u)*(uniforms.time_count/32u)+u32(c)/8u)*32u+(u32(row)%4u)*8u+u32(c)%8u")<<";}"
       <<"fn serial_sample(row:u32,t:u32)->f32 {let n="<<e.GetByOffset("6u")<<";if(t>=n){return 0.0;}"
       <<"var total=0.0;if(uniforms.channel_offset!=0u){total="<<y.GetByOffset("row*uniforms.output_capacity+t")<<";}"
       <<"let pad=i32((uniforms.kernel-1u)*uniforms.dilation/2u);"
@@ -665,32 +756,72 @@ class ResidualPackedMatrixV1 final : public Program<ResidualPackedMatrixV1> {
       <<"if(t<n){result=value[lane];if(uniforms.channel_offset+uniforms.channel_count==uniforms.channels){result=original_add(result,"
       <<b.GetByOffset("uniforms.output_channel_offset+r")<<");}}"<<y.SetByOffset("r*uniforms.output_capacity+t","result")<<"}}}";
     auto& f=s.MainFunctionBody();
-    f<<"let tile_columns=uniforms.time_count/32u;if(tile_columns==0u||workgroup_idx>=tile_columns*((uniforms.row_count+31u)/32u)){return;}"
-      <<"let tile_t=uniforms.time_begin+(workgroup_idx%tile_columns)*32u;let tile_row=uniforms.row_begin+(workgroup_idx/tile_columns)*32u;"
+    f<<"let tile_columns=uniforms.time_count/32u;if(tile_columns==0u||workgroup_idx>=tile_columns*((uniforms.row_count+"<<tile_rows-1<<"u)/"<<tile_rows<<"u)){return;}"
+      <<"let tile_t=uniforms.time_begin+(workgroup_idx%tile_columns)*32u;let tile_row=uniforms.row_begin+(workgroup_idx/tile_columns)*"<<tile_rows<<"u;"
       <<"if(local_idx==0u){matrix_enabled=0u;let n="<<e.GetByOffset("6u")<<";"
       <<"if(valid_output()&&n<=uniforms.input_capacity&&uniforms.time_count<=2048u&&uniforms.time_count%32u==0u&&"
       <<"uniforms.row_begin<uniforms.output_channel_count&&uniforms.row_count>0u&&uniforms.row_count<=uniforms.output_channel_count-uniforms.row_begin&&"
+      <<(register_rows_?"uniforms.row_begin%"+std::to_string(tile_rows)+"u==0u&&":"")
       <<"uniforms.channel_count>0u&&uniforms.channel_count<=256u&&uniforms.channel_offset<uniforms.channels&&"
       <<"uniforms.channel_count<=uniforms.channels-uniforms.channel_offset&&uniforms.output_channel_offset<uniforms.channels&&"
       <<"uniforms.output_channel_count<=uniforms.channels-uniforms.output_channel_offset&&"
       <<"uniforms.kernel>=1u&&uniforms.kernel<=11u&&uniforms.dilation>=1u&&uniforms.dilation<=5u&&tile_t<n){matrix_enabled=1u;}}"
       <<"let enabled=workgroupUniformLoad(&matrix_enabled);"
-      <<"if(enabled==0u){for(var index=local_idx;index<1024u;index+=64u){let r=tile_row+index/32u;let t=tile_t+index%32u;"
+      <<"if(enabled==0u){for(var index=local_idx;index<"<<tile_elements<<"u;index+=64u){let r=tile_row+index/32u;let t=tile_t+index%32u;"
       <<"if(r<uniforms.row_begin+uniforms.row_count&&t<uniforms.output_capacity){"<<y.SetByOffset("r*uniforms.output_capacity+t","0.0")<<"}}return;}"
       <<"let n="<<e.GetByOffset("6u")<<";var bad=0u;"
       <<"let flag_rows=(uniforms.channel_count*uniforms.kernel+7u)/8u;"
       <<"let flag_time=(tile_t-uniforms.time_begin)/32u;"
-      <<"for(var i=local_idx;i<flag_rows;i+=64u){bad|="<<flags.GetByOffset("i*tile_columns+flag_time")<<";}"
-      <<"let inner_vectors=(uniforms.channel_count*uniforms.kernel+3u)/4u;"
+      <<"for(var i=local_idx;i<flag_rows;i+=64u){bad|="<<flags.GetByOffset("i*tile_columns+flag_time")<<";}";
+    if(cached_weights_){
+      f<<"bad|="<<flags.GetByOffset("uniforms.weight_flag_offset+tile_row/32u")<<";";
+      if(register_rows_==8)f<<"if(tile_row+32u<uniforms.row_begin+uniforms.row_count){bad|="
+        <<flags.GetByOffset("uniforms.weight_flag_offset+tile_row/32u+1u")<<";}";
+    }
+    if(!cached_weights_)f<<"let inner_vectors=(uniforms.channel_count*uniforms.kernel+3u)/4u;"
       <<"for(var index=local_idx;index<32u*inner_vectors;index+=64u){let r=tile_row+index/inner_vectors;"
       <<"if(r<uniforms.row_begin+uniforms.row_count){let values=mm_readA(0,i32(r-uniforms.row_begin),i32(index%inner_vectors));"
-      <<"if(any((bitcast<vec4<u32>>(values)&vec4u(0x7fffffffu))>vec4u(0x58800000u))){bad=1u;}}}"
-      <<"if(uniforms.channel_offset!=0u){for(var index=local_idx;index<1024u;index+=64u){let r=tile_row+index/32u;let t=tile_t+index%32u;"
+      <<"if(any((bitcast<vec4<u32>>(values)&vec4u(0x7fffffffu))>vec4u(0x58800000u))){bad=1u;}}}";
+    f<<"if(uniforms.channel_offset!=0u){for(var index=local_idx;index<"<<tile_elements<<"u;index+=64u){let r=tile_row+index/32u;let t=tile_t+index%32u;"
       <<"if(r<uniforms.row_begin+uniforms.row_count&&t<n){let value="<<y.GetByOffset("r*uniforms.output_capacity+t")<<";"
       <<"if((bitcast<u32>(value)&0x7fffffffu)>0x71800000u){bad=1u;}}}}"
       <<"matrix_flags[local_idx]=bad;workgroupBarrier();if(local_idx==0u){var combined=0u;for(var i=0u;i<64u;i++){combined|=matrix_flags[i];}matrix_safe=1u-min(combined,1u);}"
-      <<"let safe=workgroupUniformLoad(&matrix_safe);if(safe==0u){for(var index=local_idx;index<1024u;index+=64u){let r=tile_row+index/32u;let t=tile_t+index%32u;"
+      <<"let safe=workgroupUniformLoad(&matrix_safe);if(safe==0u){for(var index=local_idx;index<"<<tile_elements<<"u;index+=64u){let r=tile_row+index/32u;let t=tile_t+index%32u;"
       <<"if(r<uniforms.row_begin+uniforms.row_count&&t<uniforms.output_capacity){"<<y.SetByOffset("r*uniforms.output_capacity+t","serial_sample(r,t)")<<"}}return;}";
+    if(register_rows_){
+      // Keep the reduction lane order, but reuse each four-time input vector
+      // across four/eight output rows without a shared-memory barrier per K block.
+      f<<"let first_row=tile_row-uniforms.row_begin+(local_idx/8u)*"<<register_rows_<<"u;"
+        <<"let column=(tile_t-uniforms.time_begin)/4u+local_idx%8u;"
+        <<"let first_t=uniforms.time_begin+column*4u;";
+      for(uint32_t row=0;row<register_rows_;++row){
+        f<<"var acc"<<row<<"=vec4<f32>(0.0);if(uniforms.channel_offset!=0u&&first_row+"<<row<<"u<uniforms.row_count){"
+          <<"for(var lane=0u;lane<4u;lane++){if(first_t+lane<n){acc"<<row<<"[lane]="
+          <<y.GetByOffset("(uniforms.row_begin+first_row+"+std::to_string(row)+"u)*uniforms.output_capacity+first_t+lane")<<";}}}";
+      }
+      f<<"let inner_vectors=(uniforms.channel_count*uniforms.kernel+3u)/4u;"
+        <<"for(var k=0u;k<inner_vectors;k++){"
+        <<"let v0=mm_readB(0,i32(k*4u),i32(column));"
+        <<"let v1=mm_readB(0,i32(k*4u+1u),i32(column));"
+        <<"let v2=mm_readB(0,i32(k*4u+2u),i32(column));"
+        <<"let v3=mm_readB(0,i32(k*4u+3u),i32(column));";
+      // Interleave two independent rows, keeping each accumulator's exact K
+      // order. Only two weight vectors are live at once; no reassociation/FMA.
+      for(uint32_t row=0;row<register_rows_;row+=2){
+        f<<"{let weights0=mm_readA(0,i32(first_row+"<<row<<"u),i32(k));"
+          <<"let weights1=mm_readA(0,i32(first_row+"<<row+1<<"u),i32(k));";
+        for(uint32_t k=0;k<4;++k){
+          const char component="xyzw"[k];
+          f<<"acc"<<row<<"=acc"<<row<<"+v"<<k<<"*vec4<f32>(weights0."<<component<<");"
+           <<"acc"<<row+1<<"=acc"<<row+1<<"+v"<<k<<"*vec4<f32>(weights1."<<component<<");";
+        }
+        f<<"}";
+      }
+      f<<"}";
+      for(uint32_t row=0;row<register_rows_;++row)
+        f<<"mm_write(0,i32(first_row+"<<row<<"u),i32(column),acc"<<row<<");";
+      return Status::OK();
+    }
     std::string prelude=std::move(f).str();f=OStringStream(kStringInitialSizeShaderSourceCodeMain);
     ORT_RETURN_IF_ERROR(MakeMatMulPackedVec4Source(s,InlinedVector<int64_t>{4,4,1},8,8,"f32",nullptr));
     std::string body=std::move(f).str();f=OStringStream(kStringInitialSizeShaderSourceCodeMain);
@@ -706,6 +837,9 @@ class ResidualPackedMatrixV1 final : public Program<ResidualPackedMatrixV1> {
       <<"let logical_global_id=logical_workgroup_id*vec3u(8u,8u,1u)+local_id;"<<body;
     return Status::OK();
   }
+ private:
+  const bool cached_weights_;
+  const uint32_t register_rows_;
 };
 
 class GeneratorResidualConv final : public Program<GeneratorResidualConv> {
@@ -1028,45 +1162,106 @@ fn original_add4(a:vec4<f32>,b:vec4<f32>)->vec4<f32>{
   const bool matrix_,wide_grid_;
 };
 
+
+inline Status PrepareResidualPackedWeightFlagsV1(ComputeContextBase& c,const Tensor* extent,
+    const Tensor* weight,Tensor* flags,const ResidualConvSpecV1& spec,uint64_t& dispatches) {
+  const uint32_t count=(spec.output_channel_count+31)/32;
+  ORT_RETURN_IF_NOT(extent&&weight&&flags&&weight->IsDataType<float>()&&flags->IsDataType<uint32_t>()&&
+      spec.channels>0&&spec.channels<=512&&spec.channel_count>0&&spec.channel_count<=256&&
+      spec.kernel>0&&spec.kernel<=11&&spec.channel_offset<spec.channels&&
+      spec.channel_count<=spec.channels-spec.channel_offset&&spec.output_channel_count>0&&
+      spec.output_channel_offset<spec.channels&&spec.output_channel_count<=spec.channels-spec.output_channel_offset&&
+      count<=kM0ResidualPackedWeightFlagWordsV1&&flags->Shape().Size()>kM0ResidualPackedWeightFlagWordsV1&&
+      flags->Shape().Size()<=UINT32_MAX&&weight->Shape().Size()==int64_t(spec.channels)*spec.channels*spec.kernel&&
+      weight->Shape().Size()%4==0,"RW07 packed weight flag dimensions");
+  const uint32_t base=static_cast<uint32_t>(flags->Shape().Size())-kM0ResidualPackedWeightFlagWordsV1;
+  ResidualPackedWeightFlagsV1 program;
+  program.AddInputs({{extent,ProgramTensorMetadataDependency::None},
+                    {weight,ProgramTensorMetadataDependency::None,ProgramInput::Flatten,4}})
+      .AddOutput({flags,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64).SetDispatchGroupSize(count);
+  spec.ApplyPacked(program,0,32,0,spec.output_channel_count,base);
+  ORT_RETURN_IF_ERROR(c.RunProgram(program));++dispatches;
+  return Status::OK();
+}
+inline Status PrepareResidualRegisterWeightsV1(ComputeContextBase& c,const Tensor* extent,
+    const Tensor* weight,Tensor* packed,Tensor* flags,const ResidualConvSpecV1& spec,uint64_t& dispatches){
+  const uint64_t elements=ResidualRegisterWeightElementsV1(spec.output_channel_count,spec.channel_count,spec.kernel);
+  ORT_RETURN_IF_NOT(elements&&extent&&extent->IsDataType<uint32_t>()&&extent->Shape().Size()==32&&weight&&
+    weight->IsDataType<float>()&&packed&&packed->IsDataType<float>()&&flags&&flags->IsDataType<uint32_t>()&&
+    spec.channels>0&&spec.channels<=512&&spec.channel_offset<spec.channels&&
+    spec.channel_count<=spec.channels-spec.channel_offset&&spec.output_channel_offset<spec.channels&&
+    spec.output_channel_count<=spec.channels-spec.output_channel_offset&&
+    weight->Shape().Size()==int64_t(spec.channels)*spec.channels*spec.kernel&&weight->Shape().Size()%4==0&&
+    uint64_t(packed->Shape().Size())>=elements&&uint64_t(packed->Shape().Size())<=kM0ResidualRegisterWeightScratchBytesV1/4&&
+    flags->Shape().Size()>kM0ResidualPackedWeightFlagWordsV1&&flags->Shape().Size()<=UINT32_MAX,
+    "RW07 blocked register weight dimensions/types/bound");
+  const uint32_t rows=(spec.output_channel_count+63)/64*64;
+  const uint32_t base=static_cast<uint32_t>(flags->Shape().Size())-kM0ResidualPackedWeightFlagWordsV1;
+  ResidualPackedWeightFlagsV1 program(true);
+  program.AddInputs({{extent,ProgramTensorMetadataDependency::None},
+                    {weight,ProgramTensorMetadataDependency::None,ProgramInput::Flatten,4}})
+    .AddOutput({packed,ProgramTensorMetadataDependency::None,ProgramOutput::Flatten,4})
+    .AddOutput({flags,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64).SetDispatchGroupSize(rows/32);
+  spec.ApplyPacked(program,0,32,0,rows,base);
+  ORT_RETURN_IF_ERROR(c.RunProgram(program,elements));++dispatches;
+  return Status::OK();
+}
 inline Status RunResidualPackedTileV1(ComputeContextBase& c,const ProgramInput& input,const ProgramOutput& output,
     const Tensor* extent,const Tensor* weight,const Tensor* bias,Tensor* columns,Tensor* flags,
-    const ResidualConvSpecV1& spec,uint32_t time_begin,uint32_t time_count,bool checked,uint64_t& dispatches) {
+    const ResidualConvSpecV1& spec,uint32_t time_begin,uint32_t time_count,bool checked,uint64_t& dispatches,
+    bool weights_ready=false,uint32_t register_rows=0,Tensor* register_weights=nullptr) {
+  ORT_RETURN_IF_NOT((register_rows==0||register_rows==4||register_rows==8)&&(!register_rows||M0BatchHeavyProgramsV1()),"RW07 register matrix requires bounded batching");
   ORT_RETURN_IF_NOT(ResidualPackedSupportedV1(c.DeviceLimits()),"RW07 packed matrix device requirements");
   ORT_RETURN_IF_NOT(columns&&flags&&columns->IsDataType<float>()&&flags->IsDataType<uint32_t>()&&
     weight&&weight->IsDataType<float>()&&bias&&bias->IsDataType<float>()&&
-    spec.channel_count>0&&spec.channel_count<=256&&spec.kernel>0&&spec.kernel<=11&&
+    spec.channels>0&&spec.channels<=512&&spec.channel_count>0&&spec.channel_count<=256&&spec.kernel>0&&spec.kernel<=11&&
     spec.dilation>0&&spec.dilation<=5&&spec.output_channel_count>0&&
     spec.output_channel_offset<spec.channels&&spec.output_channel_count<=spec.channels-spec.output_channel_offset&&
     spec.channel_offset<spec.channels&&spec.channel_count<=spec.channels-spec.channel_offset&&
     time_count>0&&time_count<=kResidualPackedTimeV1&&time_count%32==0&&time_begin<spec.output_capacity&&
     weight->Shape().Size()==int64_t(spec.channels)*spec.channels*spec.kernel&&weight->Shape().Size()%4==0,
     "RW07 packed convolution dimensions/types");
-  const uint64_t vectors=uint64_t(spec.channel_count)*spec.kernel*(time_count/4);
+  const uint64_t vectors=uint64_t(ResidualPackedInnerV1(spec.channel_count,spec.kernel))*(time_count/4);
   const uint32_t groups=static_cast<uint32_t>(ResidualPackedFlagCountV1(spec.channel_count,spec.kernel,time_count));
-  ORT_RETURN_IF_NOT(uint64_t(columns->Shape().Size())>=vectors*4&&uint64_t(flags->Shape().Size())>=groups,
+  const bool optimized=M0BatchHeavyProgramsV1();
+  ORT_RETURN_IF_NOT(uint64_t(columns->Shape().Size())>=vectors*4&&flags->Shape().Size()<=UINT32_MAX&&
+    uint64_t(flags->Shape().Size())>=uint64_t(groups)+(optimized?kM0ResidualPackedWeightFlagWordsV1:0),
     "RW07 packed convolution scratch extent");
-  ResidualPackColumnsV1 pack;
+  const uint32_t flag_base=optimized?static_cast<uint32_t>(flags->Shape().Size())-kM0ResidualPackedWeightFlagWordsV1:0;
+  if(register_rows){
+    const uint64_t weight_elements=ResidualRegisterWeightElementsV1(spec.output_channel_count,spec.channel_count,spec.kernel);
+    ORT_RETURN_IF_NOT(weight_elements&&register_weights&&register_weights->IsDataType<float>()&&
+      uint64_t(register_weights->Shape().Size())>=weight_elements&&
+      uint64_t(register_weights->Shape().Size())<=kM0ResidualRegisterWeightScratchBytesV1/4,
+      "RW07 register weight storage extent");
+  }
+  if(optimized&&!weights_ready){
+    if(register_rows)ORT_RETURN_IF_ERROR(PrepareResidualRegisterWeightsV1(c,extent,weight,register_weights,flags,spec,dispatches));
+    else ORT_RETURN_IF_ERROR(PrepareResidualPackedWeightFlagsV1(c,extent,weight,flags,spec,dispatches));
+  }
+  ResidualPackColumnsV1 pack(optimized);
   pack.AddInput(ProgramInput(input)).AddInput({extent,ProgramTensorMetadataDependency::None})
     .AddOutput({columns,ProgramTensorMetadataDependency::None,ProgramOutput::Flatten,4})
     .AddOutput({flags,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64);
   const auto limit=c.DeviceLimits().maxComputeWorkgroupsPerDimension;
   const auto dx=std::min(groups,limit);ORT_RETURN_IF_NOT(dx>0,"RW07 pack workgroup limit");
-  pack.SetDispatchGroupSize(dx,(groups+dx-1)/dx);spec.ApplyPacked(pack,time_begin,time_count,0,spec.output_channel_count);
+  pack.SetDispatchGroupSize(dx,(groups+dx-1)/dx);spec.ApplyPacked(pack,time_begin,time_count,0,spec.output_channel_count,flag_base);
   ORT_RETURN_IF_ERROR(c.RunProgram(pack));++dispatches;
   const uint64_t rounded=(uint64_t(spec.channel_count)*spec.kernel+31)/32*32;
-  const uint32_t row_limit=static_cast<uint32_t>(ResidualPackedProductsPerDispatchV1()/(time_count*rounded)/32*32);
-  ORT_RETURN_IF_NOT(row_limit>=32,"RW07 packed matrix work bound");
+  const uint32_t tile_rows=register_rows?8u*register_rows:32u;
+  const uint32_t row_limit=static_cast<uint32_t>(ResidualPackedProductsPerDispatchV1()/(time_count*rounded)/tile_rows*tile_rows);
+  ORT_RETURN_IF_NOT(row_limit>=tile_rows,"RW07 packed matrix work bound");
   for(uint32_t row=0;row<spec.output_channel_count;row+=row_limit){
     const uint32_t count=std::min(row_limit,spec.output_channel_count-row);
-    ResidualPackedMatrixV1 matrix;
+    ResidualPackedMatrixV1 matrix(optimized,register_rows);
     matrix.AddInput(ProgramInput(input)).AddInput({extent,ProgramTensorMetadataDependency::None})
-      .AddInput({weight,ProgramTensorMetadataDependency::None,ProgramInput::Flatten,4})
+      .AddInput({register_rows?register_weights:weight,ProgramTensorMetadataDependency::None,ProgramInput::Flatten,4})
       .AddInput({bias,ProgramTensorMetadataDependency::None})
       .AddInput({columns,ProgramTensorMetadataDependency::None,ProgramInput::Flatten,4})
       .AddInput({flags,ProgramTensorMetadataDependency::None}).AddOutput(ProgramOutput(output))
-      .SetWorkgroupSize(8,8).SetDispatchGroupSize(time_count/32,(count+31)/32);
-    spec.ApplyPacked(matrix,time_begin,time_count,row,count);
-    const uint64_t work=uint64_t((count+31)/32*32)*time_count*rounded;
+      .SetWorkgroupSize(8,8).SetDispatchGroupSize(time_count/32,(count+tile_rows-1)/tile_rows);
+    spec.ApplyPacked(matrix,time_begin,time_count,row,count,flag_base);
+    const uint64_t work=uint64_t((count+tile_rows-1)/tile_rows*tile_rows)*time_count*rounded;
     ORT_RETURN_IF_NOT(work<=ResidualPackedProductsPerDispatchV1(),"RW07 packed matrix scheduled work");
     if(!M0BatchHeavyProgramsV1()||(checked&&row+count==spec.output_channel_count))ORT_RETURN_IF_ERROR(c.RunProgramWithCheckedCompletion(matrix));
     else ORT_RETURN_IF_ERROR(c.RunProgram(matrix,work));
@@ -1076,10 +1271,12 @@ inline Status RunResidualPackedTileV1(ComputeContextBase& c,const ProgramInput& 
 }
 inline Status RunResidualConvolutionV1(ComputeContextBase& c,const ProgramInput& input,const ProgramOutput& output,
     const Tensor* extent,const Tensor* weight,const Tensor* bias,Tensor* columns,Tensor* flags,
-    const ResidualConvSpecV1& spec,uint64_t& dispatches,bool checked=false,uint32_t forced=0) {
+    const ResidualConvSpecV1& spec,uint64_t& dispatches,bool checked=false,uint32_t forced=0,Tensor* register_weights=nullptr) {
   const bool tiled=M0OutputChannelTiledConvV1();
   const bool packed=tiled&&columns&&flags&&ResidualPackedSupportedV1(c.DeviceLimits());
-  const uint32_t maximum=packed?16u:std::max(1u,ResidualChannelBlockV1(c.DeviceLimits().maxComputeWorkgroupStorageSize));
+  const bool registers=packed&&M0BatchHeavyProgramsV1()&&register_weights&&
+    ResidualRegisterWeightElementsV1(spec.output_channel_count,spec.channel_count,spec.kernel)>0;
+  const uint32_t maximum=packed?(registers?64u:16u):std::max(1u,ResidualChannelBlockV1(c.DeviceLimits().maxComputeWorkgroupStorageSize));
   const uint32_t sample_time=ResidualPackedTimeV1(spec.channel_count,spec.kernel);
   ORT_RETURN_IF_NOT(sample_time>0,"RW07 residual sample work bound");
   const auto original=[&](uint32_t block,uint32_t begin,uint32_t count,bool finish)->Status {
@@ -1102,22 +1299,43 @@ inline Status RunResidualConvolutionV1(ComputeContextBase& c,const ProgramInput&
     }
     return Status::OK();
   };
+  bool weights_ready=false,registers_ready=false;
+  const auto prepare_registers=[&]()->Status {
+    if(!registers_ready){
+      ORT_RETURN_IF_ERROR(PrepareResidualRegisterWeightsV1(c,extent,weight,register_weights,flags,spec,dispatches));
+      registers_ready=true;weights_ready=true;
+    }
+    return Status::OK();
+  };
+  const auto prepare_weights=[&]()->Status {
+    if(M0BatchHeavyProgramsV1()&&!weights_ready){
+      ORT_RETURN_IF_ERROR(PrepareResidualPackedWeightFlagsV1(c,extent,weight,flags,spec,dispatches));
+      weights_ready=true;
+    }
+    return Status::OK();
+  };
   uint32_t chosen=forced?forced:1;
-  if(forced){ORT_RETURN_IF_NOT(forced==1||forced==2||forced==4||forced==8||(forced==16&&packed),"RW07 forced convolution variant");}
+  if(forced){ORT_RETURN_IF_NOT(forced==1||forced==2||forced==4||forced==8||((forced==16||forced==32||forced==64)&&packed&&forced<=maximum),"RW07 forced convolution variant");}
   else if(tiled){
-    const std::string key="packed:"+std::to_string(spec.output_capacity)+":"+std::to_string(spec.channels)+":"+
+    const std::string key="packed-register-block64-time32-v6:"+std::to_string(maximum)+":"+std::to_string(spec.output_capacity)+":"+std::to_string(spec.channels)+":"+
       std::to_string(spec.channel_count)+":"+std::to_string(spec.output_channel_count)+":"+
       std::to_string(spec.kernel)+":"+std::to_string(spec.dilation);
     ORT_RETURN_IF_ERROR(ResidualAutotunedBlockV1(c,key,maximum,spec.channel_offset==0,
       [&](uint32_t variant)->Status {
-        if(variant==16)return RunResidualPackedTileV1(c,input,output,extent,weight,bias,columns,flags,spec,0,sample_time,true,dispatches);
+        if(variant==16||variant==32||variant==64){
+          if(variant==16)ORT_RETURN_IF_ERROR(prepare_weights());
+          else ORT_RETURN_IF_ERROR(prepare_registers());
+          return RunResidualPackedTileV1(c,input,output,extent,weight,bias,columns,flags,spec,0,sample_time,true,dispatches,weights_ready,variant==32?4u:variant==64?8u:0u,register_weights);
+        }
         return original(variant,0,sample_time,true);
       },chosen));
   }
-  if(chosen!=16)return original(chosen,0,0,checked);
+  if(chosen!=16&&chosen!=32&&chosen!=64)return original(chosen,0,0,checked);
+  if(chosen==16)ORT_RETURN_IF_ERROR(prepare_weights());
+  else ORT_RETURN_IF_ERROR(prepare_registers());
   for(uint32_t t=0;t<spec.output_capacity;t+=sample_time){
     ORT_RETURN_IF_ERROR(RunResidualPackedTileV1(c,input,output,extent,weight,bias,columns,flags,spec,t,sample_time,
-      checked&&spec.output_capacity-t<=sample_time,dispatches));
+      checked&&spec.output_capacity-t<=sample_time,dispatches,weights_ready,chosen==32?4u:chosen==64?8u:0u,register_weights));
   }
   return Status::OK();
 }
@@ -1274,7 +1492,12 @@ class DecoderPoolTile final : public Program<DecoderPoolTile> {
 };
 class DecoderConvTile final : public Program<DecoderConvTile> {
  public:
-  explicit DecoderConvTile(bool bias) : Program{"RW07DecoderResidualConvOutputWindowV3"}, bias_(bias) {}
+  explicit DecoderConvTile(bool bias,bool finite=M0BatchHeavyProgramsV1(),bool four_time=true)
+      :Program{finite&&four_time?"RW07DecoderResidualConvFourTimeWindowV5":finite?"RW07DecoderResidualConvFiniteWindowV4":"RW07DecoderResidualConvOutputWindowV3"},
+       bias_(bias),finite_(finite),four_time_(finite&&four_time) {}
+  uint64_t WorkItems(uint32_t rows,uint32_t capacity)const{
+    return uint64_t(rows)*(four_time_?capacity/4u+uint32_t(capacity%4u!=0):capacity);
+  }
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"input_capacity", ProgramUniformVariableDataType::Uint32},
       {"output_capacity", ProgramUniformVariableDataType::Uint32},
@@ -1295,7 +1518,39 @@ class DecoderConvTile final : public Program<DecoderConvTile> {
     const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
     const auto& y=s.AddOutput("accumulator",ShaderUsage::UseValueTypeAlias);
     PayloadGuard(s,e,true);OriginalArithmetic(s);
+    if(four_time_)return FourTimeShader(s,x,w,b,e,y);
     auto& f=s.MainFunctionBody();
+    if(finite_){
+      s.AdditionalImplementation()<<"var<workgroup> decoder_flags:array<u32,64>;var<workgroup> decoder_safe:u32;";
+      f<<"let elements=uniforms.output_count*uniforms.output_capacity;"
+        <<"if(workgroup_idx>=elements/64u+u32(elements%64u!=0u)){return;}"
+        <<"var bad=1u;if(valid_output()&&uniforms.channel_count>0u&&uniforms.channel_count<=64u&&"
+        <<"uniforms.channel_offset<uniforms.input_channels&&uniforms.channel_count<=uniforms.input_channels-uniforms.channel_offset&&"
+        <<"uniforms.output_offset<uniforms.output_channels&&uniforms.output_count<=uniforms.output_channels-uniforms.output_offset&&"
+        <<"(uniforms.width==1u||uniforms.width==3u)&&uniforms.input_capacity>0u){"
+        <<"bad=0u;let d="<<e.GetByOffset("6u")<<";let first=workgroup_idx*64u;let last=min(first+63u,elements-1u);"
+        <<"let first_row=first/uniforms.output_capacity;let last_row=last/uniforms.output_capacity;"
+        <<"var lo=first%uniforms.output_capacity;var hi=last%uniforms.output_capacity;"
+        <<"if(first_row!=last_row){lo=0u;hi=uniforms.output_capacity-1u;}"
+        <<"if(lo<d){hi=min(hi,d-1u);let radius=uniforms.width/2u;"
+        <<"let first_pos=u32(max(0,i32(lo)-i32(radius)));let last_pos=min(d-1u,hi+radius);"
+        <<"let begin=select(first_pos,first_pos/2u,uniforms.nearest!=0u);"
+        <<"let end=min(uniforms.input_capacity-1u,select(last_pos,last_pos/2u,uniforms.nearest!=0u));"
+        <<"if(begin<=end){let span=end-begin+1u;for(var index=local_idx;index<uniforms.channel_count*span;index+=64u){"
+        <<"let value="<<x.GetByOffset("(index/span)*uniforms.input_capacity+begin+index%span")<<";"
+        <<"if((bitcast<u32>(value)&0x7fffffffu)>0x58800000u){bad=1u;}}}}"
+        <<"let row_elements=uniforms.channel_count*uniforms.width;"
+        <<"for(var index=local_idx;index<(last_row-first_row+1u)*row_elements;index+=64u){"
+        <<"let row=uniforms.output_offset+first_row+index/row_elements;"
+        <<"let ic=uniforms.channel_offset+(index/uniforms.width)%uniforms.channel_count;let k=index%uniforms.width;"
+        <<"let value="<<w.GetByOffset("(row*uniforms.input_channels+ic)*uniforms.width+k")<<";"
+        <<"if((bitcast<u32>(value)&0x7fffffffu)>0x58800000u){bad=1u;}}"
+        <<"if(uniforms.channel_offset!=0u){let at=first+local_idx;if(at<=last&&at%uniforms.output_capacity<d){"
+        <<"let seed="<<y.GetByOffset("at")<<";if((bitcast<u32>(seed)&0x7fffffffu)>0x7b800000u){bad=1u;}}}}"
+        <<"decoder_flags[local_idx]=bad;workgroupBarrier();if(local_idx==0u){var combined=0u;"
+        <<"for(var lane=0u;lane<64u;lane++){combined|=decoder_flags[lane];}decoder_safe=1u-min(combined,1u);}"
+        <<"let finite_safe=workgroupUniformLoad(&decoder_safe)!=0u;";
+    }
     f<<"if(global_idx>=uniforms.output_count*uniforms.output_capacity){return;}"
       <<"if(!valid_output()){ "<<y.SetByOffset("global_idx","0.0")<<"return;}"
       <<"let d="<<e.GetByOffset("6u")<<";let t=global_idx%uniforms.output_capacity;"
@@ -1304,22 +1559,82 @@ class DecoderConvTile final : public Program<DecoderConvTile> {
       <<"uniforms.channel_count>64u||uniforms.channel_count>uniforms.input_channels-uniforms.channel_offset){"
       <<y.SetByOffset("global_idx","0.0")<<"return;}"
       // Continue the scalar sum; summing independent tile totals would reorder it.
-      <<"var sum:f32=0.0;if(uniforms.channel_offset!=0u){sum="<<y.GetByOffset("global_idx")<<";}"
-      <<"for(var local_ic=0u;local_ic<uniforms.channel_count;local_ic++){"
-      <<"let ic=uniforms.channel_offset+local_ic;for(var k=0u;k<uniforms.width;k++){"
-      <<"let pos=i32(t)+i32(k)-i32(uniforms.width/2u);var value:f32=0.0;"
-      <<"if(pos>=0&&u32(pos)<d){let source_t=select(u32(pos),u32(pos)/2u,uniforms.nearest!=0u);"
-      <<"if(source_t<uniforms.input_capacity){value="
-      <<x.GetByOffset("local_ic*uniforms.input_capacity+source_t")<<";}}"
-      <<"let product:f32=original_mul(value,"<<w.GetByOffset("(oc*uniforms.input_channels+ic)*uniforms.width+k")
-      <<");sum=original_add(sum,product);}}";
+      <<"var sum:f32=0.0;if(uniforms.channel_offset!=0u){sum="<<y.GetByOffset("global_idx")<<";}";
+    const auto dot=[&](bool fast){
+      f<<"for(var local_ic=0u;local_ic<uniforms.channel_count;local_ic++){"
+       <<"let ic=uniforms.channel_offset+local_ic;for(var k=0u;k<uniforms.width;k++){"
+       <<"let pos=i32(t)+i32(k)-i32(uniforms.width/2u);var value:f32=0.0;"
+       <<"if(pos>=0&&u32(pos)<d){let source_t=select(u32(pos),u32(pos)/2u,uniforms.nearest!=0u);"
+       <<"if(source_t<uniforms.input_capacity){value="
+       <<x.GetByOffset("local_ic*uniforms.input_capacity+source_t")<<";}}"
+       <<"let weight="<<w.GetByOffset("(oc*uniforms.input_channels+ic)*uniforms.width+k")<<";";
+      if(fast)f<<"let product=value*weight;sum=sum+product;}}";
+      else f<<"let product=original_mul(value,weight);sum=original_add(sum,product);}}";
+    };
+    // At most192 products <=2^100 plus a seed <=2^120 cannot overflowFP32.
+    // Keep the complete original exceptional path and the ic/k reduction order.
+    if(finite_){f<<"if(finite_safe){";dot(true);f<<"}else{";dot(false);f<<"}";}
+    else dot(false);
     if(bias_) f<<"if(uniforms.channel_offset+uniforms.channel_count==uniforms.input_channels){sum=original_add(sum,"
                <<b->GetByOffset("oc")<<");}";
     f<<y.SetByOffset("global_idx","sum");
     return Status::OK();
   }
  private:
-  const bool bias_;
+  Status FourTimeShader(ShaderHelper& s,const ShaderVariableHelper& x,const ShaderVariableHelper& w,
+      const ShaderVariableHelper* b,const ShaderVariableHelper& e,const ShaderVariableHelper& y)const{
+    s.AdditionalImplementation()<<"var<workgroup> decoder_flags:array<u32,64>;var<workgroup> decoder_safe:u32;var<workgroup> decoder_enabled:u32;";
+    auto& f=s.MainFunctionBody();
+    f<<"let vectors=uniforms.output_capacity/4u+u32(uniforms.output_capacity%4u!=0u);if(vectors==0u){return;}"
+      <<"let elements=uniforms.output_count*vectors;if(workgroup_idx>=elements/64u+u32(elements%64u!=0u)){return;}"
+      <<"let geometry=valid_output()&&uniforms.channel_count>0u&&uniforms.channel_count<=64u&&"
+      <<"uniforms.channel_offset<uniforms.input_channels&&uniforms.channel_count<=uniforms.input_channels-uniforms.channel_offset&&"
+      <<"uniforms.output_offset<uniforms.output_channels&&uniforms.output_count<=uniforms.output_channels-uniforms.output_offset&&"
+      <<"(uniforms.width==1u||uniforms.width==3u)&&uniforms.input_capacity>0u;"
+      <<"if(local_idx==0u){decoder_enabled=select(0u,1u,geometry);}var bad=1u;"
+      <<"if(geometry){bad=0u;let d="<<e.GetByOffset("6u")<<";let first=workgroup_idx*64u;let last=min(first+63u,elements-1u);"
+      <<"let first_row=first/vectors;let last_row=last/vectors;var lo=(first%vectors)*4u;"
+      <<"var hi=min((last%vectors)*4u+3u,uniforms.output_capacity-1u);"
+      <<"if(first_row!=last_row){lo=0u;hi=uniforms.output_capacity-1u;}"
+      <<"if(lo<d){hi=min(hi,d-1u);let radius=uniforms.width/2u;let first_pos=u32(max(0,i32(lo)-i32(radius)));"
+      <<"let last_pos=min(d-1u,hi+radius);let begin=select(first_pos,first_pos/2u,uniforms.nearest!=0u);"
+      <<"let end=min(uniforms.input_capacity-1u,select(last_pos,last_pos/2u,uniforms.nearest!=0u));"
+      <<"if(begin<=end){let span=end-begin+1u;for(var index=local_idx;index<uniforms.channel_count*span;index+=64u){"
+      <<"let value="<<x.GetByOffset("(index/span)*uniforms.input_capacity+begin+index%span")<<";"
+      <<"if((bitcast<u32>(value)&0x7fffffffu)>0x58800000u){bad=1u;}}}}"
+      <<"let row_elements=uniforms.channel_count*uniforms.width;for(var index=local_idx;index<(last_row-first_row+1u)*row_elements;index+=64u){"
+      <<"let row=uniforms.output_offset+first_row+index/row_elements;let ic=uniforms.channel_offset+(index/uniforms.width)%uniforms.channel_count;"
+      <<"let value="<<w.GetByOffset("(row*uniforms.input_channels+ic)*uniforms.width+index%uniforms.width")<<";"
+      <<"if((bitcast<u32>(value)&0x7fffffffu)>0x58800000u){bad=1u;}}"
+      <<"if(uniforms.channel_offset!=0u){let at=first+local_idx;if(at<=last){let row=at/vectors;let t=(at%vectors)*4u;"
+      <<"for(var lane=0u;lane<4u;lane++){if(t+lane<min(d,uniforms.output_capacity)){let seed="
+      <<y.GetByOffset("row*uniforms.output_capacity+t+lane")<<";if((bitcast<u32>(seed)&0x7fffffffu)>0x7b800000u){bad=1u;}}}}}}"
+      <<"decoder_flags[local_idx]=bad;workgroupBarrier();if(local_idx==0u){var combined=0u;for(var lane=0u;lane<64u;lane++){combined|=decoder_flags[lane];}"
+      <<"decoder_safe=1u-min(combined,1u);}let finite_safe=workgroupUniformLoad(&decoder_safe)!=0u;"
+      <<"let enabled=workgroupUniformLoad(&decoder_enabled)!=0u;if(global_idx>=elements){return;}"
+      <<"let row=global_idx/vectors;let t=(global_idx%vectors)*4u;let oc=uniforms.output_offset+row;let d="<<e.GetByOffset("6u")<<";"
+      <<"if(!enabled||t>=d){for(var lane=0u;lane<4u;lane++){if(t+lane<uniforms.output_capacity){"
+      <<y.SetByOffset("row*uniforms.output_capacity+t+lane","0.0")<<"}}return;}"
+      <<"var sum=vec4<f32>(0.0);if(uniforms.channel_offset!=0u){for(var lane=0u;lane<4u;lane++){if(t+lane<min(d,uniforms.output_capacity)){"
+      <<"sum[lane]="<<y.GetByOffset("row*uniforms.output_capacity+t+lane")<<";}}}";
+    const auto dot=[&](bool fast){
+      f<<"for(var local_ic=0u;local_ic<uniforms.channel_count;local_ic++){let ic=uniforms.channel_offset+local_ic;"
+       <<"for(var k=0u;k<uniforms.width;k++){let weight="<<w.GetByOffset("(oc*uniforms.input_channels+ic)*uniforms.width+k")<<";"
+       <<"var value=vec4<f32>(0.0);for(var lane=0u;lane<4u;lane++){let pos=i32(t+lane)+i32(k)-i32(uniforms.width/2u);"
+       <<"if(t+lane<min(d,uniforms.output_capacity)&&pos>=0&&u32(pos)<d){let source_t=select(u32(pos),u32(pos)/2u,uniforms.nearest!=0u);"
+       <<"if(source_t<uniforms.input_capacity){value[lane]="<<x.GetByOffset("local_ic*uniforms.input_capacity+source_t")<<";}}}";
+      if(fast)f<<"let product=value*vec4<f32>(weight);sum=sum+product;}}";
+      else f<<"for(var lane=0u;lane<4u;lane++){let product=original_mul(value[lane],weight);sum[lane]=original_add(sum[lane],product);}}}";
+    };
+    // Four independent sums retain exactly the original ic/k order per sample.
+    f<<"if(finite_safe){";dot(true);f<<"}else{";dot(false);f<<"}";
+    if(bias_)f<<"if(uniforms.channel_offset+uniforms.channel_count==uniforms.input_channels){let bias="<<b->GetByOffset("oc")
+      <<";for(var lane=0u;lane<4u;lane++){sum[lane]=original_add(sum[lane],bias);}}";
+    f<<"for(var lane=0u;lane<4u;lane++){if(t+lane<uniforms.output_capacity){var value=0.0;if(t+lane<d){value=sum[lane];}"
+      <<y.SetByOffset("row*uniforms.output_capacity+t+lane","value")<<"}}";
+    return Status::OK();
+  }
+  const bool bias_,finite_,four_time_;
 };
 class DecoderResidualAdd final : public Program<DecoderResidualAdd> {
  public:

@@ -51,10 +51,28 @@ class M0FullGpuNativeLoweringOwnerV1 final {
       const Model& source,const InferenceSession& session,
       const ONNX_NAMESPACE::ModelProto& sealed_original,uint32_t capacity,bool device_capacity=false);
   M0FullGpuNativeLoweringOwnerV1(const Model& source,const InferenceSession& session,
-                                uint32_t capacity,bool device_capacity=false);
+                                uint32_t capacity,bool device_capacity,uint32_t requested_ceiling);
   ~M0FullGpuNativeLoweringOwnerV1();
   void ResolveExecutionModel(const logging::Logger& logger);
-  const ONNX_NAMESPACE::TensorProto& ExpectedInitializer(const ONNX_NAMESPACE::TensorProto& metadata) const;
+  // Lexical proof for one synchronous validation boundary only. It never spans
+  // a Run, upload, kernel callback or publication, and cannot be saved/replayed.
+  class BoundarySourceValidation final {
+    friend class M0FullGpuNativeLoweringOwnerV1;
+    explicit BoundarySourceValidation(const M0FullGpuNativeLoweringOwnerV1& owner);
+   public:
+    ~BoundarySourceValidation();
+   private:
+    BoundarySourceValidation(const BoundarySourceValidation&)=delete;
+    BoundarySourceValidation& operator=(const BoundarySourceValidation&)=delete;
+    const M0FullGpuNativeLoweringOwnerV1* const owner_;
+    const Model* const source_;
+    const Model* const execution_;
+    uint64_t serial_=0;
+  };
+  BoundarySourceValidation ValidateSourceBoundary() const;
+  void CheckBoundarySourceValidation(const BoundarySourceValidation& proof) const;
+  const ONNX_NAMESPACE::TensorProto& ExpectedInitializer(const ONNX_NAMESPACE::TensorProto& metadata,
+      const BoundarySourceValidation* proof=nullptr) const;
   common::Status Callback(M0CallbackPolicyV1::Channel channel,const Model* model);
   void CheckNode(const Node& node) const;
   void Checked(const Node& node,const ONNX_NAMESPACE::NodeProto& wire);
@@ -64,7 +82,7 @@ class M0FullGpuNativeLoweringOwnerV1 final {
   void Propagation(Node& node,const void* context,std::vector<ONNX_NAMESPACE::TypeProto>& outputs);
   void Saver(const Node& node,const NodeArg& output,size_t index,const std::vector<ONNX_NAMESPACE::TypeProto>& values);
   void Published(const Node& node);
-  void ValidateExecutionModel();
+  void ValidateExecutionModel(const BoundarySourceValidation* proof=nullptr);
   std::string ExecutionFingerprint() const;
   enum class ExecutionIntent { ObservePlan, Initialize };
   common::Status PrepareExecutionPlan(InferenceSession& session);
@@ -84,7 +102,7 @@ class M0FullGpuNativeLoweringOwnerV1 final {
   common::Status AfterInitializerUpload(SessionState& state,int index,const OrtValue& value,bool constant,bool sparse);
   common::Status CaptureExecutionPlan(SessionState& state);
   std::string ExecutionPlanFingerprint(const SessionState& state) const;
-  void ValidateInitializerPlan(const SessionState& state) const;
+  void ValidateInitializerPlan(const SessionState& state,const BoundarySourceValidation* proof=nullptr) const;
   void ValidateResourcePlan(const SessionState& state) const;
   struct ExecutionPlan;
   struct ExecutionPlanDeleter { void operator()(ExecutionPlan*) const; };
@@ -124,13 +142,16 @@ class M0FullGpuNativeLoweringOwnerV1 final {
   struct PreparedModuleDeleter { void operator()(M0NativeGpuModuleV2* module)const; };
   std::unique_ptr<M0NativeGpuModuleV2,PreparedModuleDeleter> prepared_module_;
   static uint32_t SelectPhysicalCapacity(M0NativeGpuModuleV2& module,const ONNX_NAMESPACE::ModelProto& original,
-      const Model& source,ExecutionOrder execution_order,M0NativeDeviceLimitsV1& limits,uint64_t& initializer_bytes,
+      const Model& source,ExecutionOrder execution_order,uint32_t requested_ceiling,M0NativeDeviceLimitsV1& limits,uint64_t& initializer_bytes,
       std::vector<std::string>& memory_order,uint64_t& available_bytes,uint64_t& peak_bytes);
   void ValidatePhysicalCapacity(M0NativeGpuModuleV2& module)const;
   const Model* const source_;
+  mutable uint64_t source_boundary_serial_=0;
+  mutable uint64_t active_source_boundary_=0;
   const InferenceSession* const session_;
   const uint32_t capacity_;
   const bool device_capacity_;
+  const uint32_t requested_capacity_ceiling_;
   M0NativeDeviceLimitsV1 device_limits_;
   uint64_t initializer_capacity_bytes_=0;
   std::vector<std::string> memory_plan_order_;

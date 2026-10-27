@@ -8,9 +8,10 @@ using m0_residual_stages::ValidOutput;
 using m0_residual_stages::OriginalArithmetic;
 class EdgeData final : public Program<EdgeData> {
  public:
-  EdgeData(uint32_t mode,uint32_t pairs,bool finite=false)
-      :Program{finite&&mode==0?"RW07GeneratorEdgeFiniteV5":"RW07GeneratorEdgeElementChunksV4"},
-       mode_(mode),pairs_(pairs),finite_(finite&&mode==0) {}
+  EdgeData(uint32_t mode,uint32_t pairs,bool finite=false,bool phase_taps=true)
+      :Program{mode==0&&phase_taps?(finite?"RW07GeneratorEdgePhaseFiniteV6":"RW07GeneratorEdgePhaseScalarV6"):
+          finite&&mode==0?"RW07GeneratorEdgeFiniteV5":"RW07GeneratorEdgeElementChunksV4"},
+       mode_(mode),pairs_(pairs),finite_(finite&&mode==0),phase_taps_(phase_taps) {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
     {"input_capacity",ProgramUniformVariableDataType::Uint32},
     {"output_capacity",ProgramUniformVariableDataType::Uint32},
@@ -88,8 +89,12 @@ class EdgeData final : public Program<EdgeData> {
       // Select once for the complete dot loop. Keep tap/channel accumulation
       // order and the final exceptional-aware bias operation unchanged.
       const auto dot_loop=[&](bool fast){
-        f<<"for(var k=0u;k<kernel;k++){let numerator=i32(output_frame+pad)-i32(k);"
-         <<"if(numerator>=0&&u32(numerator)%stride==0u){let pos=u32(numerator)/stride;if(pos<input_length){var column:f32=0.0;"
+        // Only these taps satisfy the original stride condition. Their ascending
+        // order is unchanged; every lane traverses at most two taps.
+        f<<"for(var k="<<(phase_taps_?"(output_frame+pad)%stride":"0u")
+         <<";k<kernel;k+="<<(phase_taps_?"stride":"1u")<<"){let numerator=i32(output_frame+pad)-i32(k);"
+         <<"if(numerator>=0"<<(phase_taps_?"":"&&u32(numerator)%stride==0u")
+         <<"){let pos=u32(numerator)/stride;if(pos<input_length){var column:f32=0.0;"
          <<"for(var ic=0u;ic<input_channels;ic++){let value="
          <<inputs[0]->GetByOffset("ic*"+GetElementAt("uniforms.input_capacity","0u",3)+"+pos")<<";"
          <<"let weight="<<w->GetByOffset("(ic*uniforms.channels+oc)*kernel+k")<<";";
@@ -120,7 +125,7 @@ class EdgeData final : public Program<EdgeData> {
   }
  private:
   const uint32_t mode_,pairs_;
-  const bool finite_;
+  const bool finite_,phase_taps_;
 };
 inline void UpsampleTapGeometry(ShaderHelper& s,const ShaderVariableHelper& extent){
   ValidOutput(s,extent);OriginalArithmetic(s);

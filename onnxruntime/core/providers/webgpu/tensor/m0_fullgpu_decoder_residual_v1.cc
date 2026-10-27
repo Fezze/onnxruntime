@@ -320,7 +320,7 @@ class DecoderResidual final : public WebGpuKernel {
         p.AddInput(Words(static_cast<const Tensor*>(out))).AddOutput(output_window(dst,o,output_count))
             .AddUniformVariables({uint32_t(src->Shape()[2]),cap,total_channels,co,width,offset,count,o,output_count,
                                   uint32_t(nearest),cap,span(words)});
-        ORT_RETURN_IF_ERROR(dispatch(p,uint64_t(output_count)*cap));
+        ORT_RETURN_IF_ERROR(dispatch(p,p.WorkItems(output_count,cap)));
       }
       return Status::OK();
     };

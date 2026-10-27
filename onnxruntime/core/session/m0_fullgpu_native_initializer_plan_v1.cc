@@ -77,11 +77,12 @@ void CheckDescriptor(const NodeArg& argument, const ONNX_NAMESPACE::TensorProto&
 }
 }  // namespace
 
-void M0FullGpuNativeLoweringOwnerV1::ValidateInitializerPlan(const SessionState& state) const {
+void M0FullGpuNativeLoweringOwnerV1::ValidateInitializerPlan(const SessionState& state,const BoundarySourceValidation* proof) const {
   ORT_ENFORCE(source_ && execution_model_ && &state.graph_ == &execution_model_->MainGraph() &&
                   state.m0_native_plan_owner_v1_ == this && state.p_seq_exec_plan_ && state.graph_viewer_ &&
                   state.m0_fullgpu_preinit_snapshot_v1_, "RW07_NATIVE_INITIALIZER_ACTUAL_STATE");
-  M0OriginalPreloadOwnerV1::ValidateNativeLoweringSource(*source_);
+  if(proof)CheckBoundarySourceValidation(*proof);
+  else M0OriginalPreloadOwnerV1::ValidateNativeLoweringSource(*source_);
   ORT_THROW_IF_ERROR(M0FullGpuValidateIngressAuthoritiesV1(state.sess_options_));
   const auto& original_graph = source_->MainGraph();
   const auto& original_proto = source_->model_proto_.graph();
@@ -98,7 +99,7 @@ void M0FullGpuNativeLoweringOwnerV1::ValidateInitializerPlan(const SessionState&
   for (const auto& tensor : original_proto.initializer())
     ORT_ENFORCE(originals.emplace(tensor.name(), &tensor).second, "RW07_NATIVE_INITIALIZER_ORIGINAL_DUPLICATE");
   for (const auto& tensor : derived_.graph().initializer())
-    ORT_ENFORCE(expected.emplace(tensor.name(), &ExpectedInitializer(tensor)).second,
+    ORT_ENFORCE(expected.emplace(tensor.name(), &ExpectedInitializer(tensor,proof)).second,
                 "RW07_NATIVE_INITIALIZER_DERIVED_DUPLICATE");
   for (const auto& tensor : execution_proto.initializer())
     ORT_ENFORCE(backing.emplace(tensor.name(), &tensor).second, "RW07_NATIVE_INITIALIZER_LIVE_DUPLICATE");

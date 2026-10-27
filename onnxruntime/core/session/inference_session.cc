@@ -529,11 +529,12 @@ common::Status InferenceSession::M0ValidateOriginalSelectionOptionsV1() const {
   const auto model_config = Env::Default().GetEnvironmentVar(inference_session_utils::kOrtLoadConfigFromModelEnvVar);
   ORT_RETURN_IF_NOT(model_config.empty() || model_config == "0", "RW07_PREINIT_DENY_ENVIRONMENT");
   for (const auto& [key, value] : session_options_.config_options.GetConfigOptionsMap()) {
-    ORT_RETURN_IF_NOT(value == "1" &&
-                          (key == "m0.fullgpu.preinit_admission_v1" || key == "m0.fullgpu.preinit_abi_v1" ||
-                           key == "session.disable_prepacking" || key == "session.disable_aot_function_inlining" ||
-                           key == "session.disable_cpu_ep_fallback"),
+    ORT_RETURN_IF_NOT(M0ApprovedOriginalConfigEntryV1(key,value),
                       "RW07_LSTM_SELECTION_CONFIG");
+  }
+  if(m0_native_lowering_v1_&&m0_native_lowering_v1_->device_capacity_){
+    uint32_t ceiling=0;ORT_RETURN_IF_ERROR(M0FullGpuReadCapacityCeilingV1(session_options_,ceiling));
+    ORT_RETURN_IF_NOT(ceiling==m0_native_lowering_v1_->requested_capacity_ceiling_,"RW07_NATIVE_CAPACITY_CEILING_MUTATION");
   }
   return Status::OK();
 }
@@ -1414,10 +1415,7 @@ common::Status InferenceSession::M0LoadOriginalBytesV1(const void* model_data, i
     const auto model_config = Env::Default().GetEnvironmentVar(inference_session_utils::kOrtLoadConfigFromModelEnvVar);
     ORT_RETURN_IF_NOT(model_config.empty() || model_config == "0", "RW07_PREINIT_DENY_ENVIRONMENT");
     for (const auto& [key, value] : session_options_.config_options.GetConfigOptionsMap()) {
-      const bool approved = value == "1" &&
-                            (key == "m0.fullgpu.preinit_admission_v1" || key == "m0.fullgpu.preinit_abi_v1" ||
-                             key == "session.disable_prepacking" || key == "session.disable_aot_function_inlining" ||
-                             key == "session.disable_cpu_ep_fallback");
+      const bool approved = M0ApprovedOriginalConfigEntryV1(key,value);
       ORT_RETURN_IF_NOT(approved, "RW07_ORIGINAL_LOAD_CONFIG");
     }
     return Status::OK();
@@ -3547,13 +3545,18 @@ common::Status InferenceSession::M0PrepareOriginalLoweringV1(uint32_t capacity) 
   return M0PrepareOriginalLoweringImplV1(capacity,false);
 }
 common::Status InferenceSession::M0PrepareOriginalDeviceLoweringV1() {
-  return M0PrepareOriginalLoweringImplV1(102400,true);
+  uint32_t ceiling=0;ORT_RETURN_IF_ERROR(M0FullGpuReadCapacityCeilingV1(session_options_,ceiling));
+  return M0PrepareOriginalLoweringImplV1(ceiling,true);
 }
 common::Status InferenceSession::M0PrepareOriginalLoweringImplV1(uint32_t capacity,bool device_capacity) {
 #if !defined(ORT_MINIMAL_BUILD)
   std::lock_guard<std::mutex> lock(session_mutex_);
   // An existing explicit qualification receipt keeps its exact capacity;
   // neither this path nor repeated Initialize replaces a prepared owner/module.
+  uint32_t requested_ceiling=0;ORT_RETURN_IF_ERROR(M0FullGpuReadCapacityCeilingV1(session_options_,requested_ceiling));
+  const auto& capacity_entries=session_options_.config_options.GetConfigOptionsMap();
+  ORT_RETURN_IF_NOT(device_capacity||capacity_entries.find(kM0CapacityCeilingConfigV1)==capacity_entries.end()||
+                    capacity<=requested_ceiling,"RW07_NATIVE_CAPACITY_EXPLICIT_EXCEEDS_CEILING");
   if(device_capacity&&m0_native_lowering_v1_)capacity=m0_native_lowering_v1_->capacity_;
   if(m0_native_lowering_v1_&&m0_native_lowering_v1_->capacity_!=capacity)
     return ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07_NATIVE_LOWERING_RECEIPT_SUBSTITUTION");
@@ -3577,8 +3580,7 @@ common::Status InferenceSession::M0PrepareOriginalLoweringImplV1(uint32_t capaci
     const auto env=Env::Default().GetEnvironmentVar(inference_session_utils::kOrtLoadConfigFromModelEnvVar);
     ORT_RETURN_IF_NOT(env.empty()||env=="0","RW07_PREINIT_DENY_ENVIRONMENT");
     for(const auto& [key,value]:session_options_.config_options.GetConfigOptionsMap()){
-      ORT_RETURN_IF_NOT(value=="1"&&(key=="m0.fullgpu.preinit_admission_v1"||key=="m0.fullgpu.preinit_abi_v1"||
-        key=="session.disable_prepacking"||key=="session.disable_aot_function_inlining"||key=="session.disable_cpu_ep_fallback"),
+      ORT_RETURN_IF_NOT(M0ApprovedOriginalConfigEntryV1(key,value),
         "RW07_NATIVE_LOWERING_CONFIG");
     }
     return Status::OK();

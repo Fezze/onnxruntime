@@ -133,7 +133,7 @@ class NoiseResidualExtent final : public WebGpuKernel {
     auto activated=c.CreateGPUTensor(x->DataType(),TensorShape{1,tile_channels,capacity_});
     auto conv=c.CreateGPUTensor(x->DataType(),TensorShape{1,channels,capacity_});
     auto coefficients=c.CreateGPUTensor(x->DataType(),TensorShape{channels,6});
-    std::optional<Tensor> packed_columns,packed_flags;
+    std::optional<Tensor> packed_columns,packed_flags,register_weights;
     const uint64_t packed_elements=m0_residual_stages::ResidualPackedElementsV1(tile_channels,kernel);
     if(M0OutputChannelTiledConvV1()&&m0_residual_stages::ResidualPackedSupportedV1(limits)&&
         packed_elements*4<=limits.maxStorageBufferBindingSize&&packed_elements*4<=limits.maxBufferSize){
@@ -145,6 +145,14 @@ class NoiseResidualExtent final : public WebGpuKernel {
         ORT_RETURN_IF_NOT(t->DataRaw()!=packed_columns->DataRaw()&&t->DataRaw()!=packed_flags->DataRaw(),"RW07 packed source/output alias");
       }
       for(const auto* t:params)ORT_RETURN_IF_NOT(t->DataRaw()!=packed_columns->DataRaw()&&t->DataRaw()!=packed_flags->DataRaw(),"RW07 packed parameter alias");
+      const uint64_t weight_elements=m0_residual_stages::ResidualRegisterWeightElementsV1(channels,tile_channels,kernel);
+      if(M0BatchHeavyProgramsV1()&&weight_elements&&weight_elements*4<=limits.maxStorageBufferBindingSize&&weight_elements*4<=limits.maxBufferSize){
+        register_weights.emplace(c.CreateGPUTensor(x->DataType(),TensorShape{int64_t(weight_elements)}));
+        ORT_RETURN_IF_ERROR(binding(&*register_weights));
+        for(const Tensor* t:std::array<const Tensor*,10>{x,e,style,y,out,&activated,&conv,&coefficients,&*packed_columns,&*packed_flags})
+          ORT_RETURN_IF_NOT(t->DataRaw()!=register_weights->DataRaw(),"RW07 register weight scratch/source alias");
+        for(const auto* t:params)ORT_RETURN_IF_NOT(t->DataRaw()!=register_weights->DataRaw(),"RW07 register weight parameter alias");
+      }
     }
     std::array<const Tensor*,5> outputs{y,out,&activated,&conv,&coefficients};
     for(size_t i=0;i<outputs.size();i++){
@@ -184,6 +192,8 @@ class NoiseResidualExtent final : public WebGpuKernel {
             {&activated,out,params[6*h+4],params[6*h+5]}));
         if(packed_columns)ORT_RETURN_IF_ERROR(StorageBudgetWithWindow(c,output_window(accumulator,offset,count),
             {&activated,out,params[6*h+4],params[6*h+5],&*packed_columns,&*packed_flags}));
+        if(register_weights)ORT_RETURN_IF_ERROR(StorageBudgetWithWindow(c,output_window(accumulator,offset,count),
+            {&activated,out,&*register_weights,params[6*h+5],&*packed_columns,&*packed_flags}));
       }
     }
     ORT_RETURN_IF_NOT(c.M0FullGpuClaimExtentV2(*out,*y,role,instance,output),"RW07 noise residual output claim");
@@ -261,7 +271,7 @@ class NoiseResidualExtent final : public WebGpuKernel {
             offset,count,output_offset,output_count,identity};
           ORT_RETURN_IF_ERROR(m0_residual_stages::RunResidualConvolutionV1(c,
             ProgramInput{normout,ProgramTensorMetadataDependency::None},output_window(convout,output_offset,output_count),
-            out,params[6*h+4],params[6*h+5],packed_columns?&*packed_columns:nullptr,packed_flags?&*packed_flags:nullptr,spec,dispatches));
+            out,params[6*h+4],params[6*h+5],packed_columns?&*packed_columns:nullptr,packed_flags?&*packed_flags:nullptr,spec,dispatches,false,0,register_weights?&*register_weights:nullptr));
         }
       }
     }

@@ -18,6 +18,7 @@
 #include <nlohmann/json.hpp>
 #include "asserts.h"
 #include "core/common/common.h"
+#include "core/common/m0_capacity_ceiling_v1.h"
 #include "core/common/path_string.h"
 #include "core/platform/env.h"
 #include "core/graph/model.h"
@@ -31,6 +32,7 @@
 #include "core/session/m0_native_public_input_fixture_v1.h"
 #if defined(__ANDROID__) && defined(USE_WEBGPU) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
 #include <dlfcn.h>
+#include "ep/adapter/m0_core_context_queries_v1.h"
 #include "core/session/onnxruntime_cxx_api.h"
 #include "test/unittest_util/test_dynamic_plugin_ep.h"
 #endif
@@ -65,9 +67,12 @@ TEST(M0NativeBridge, ExecutableContextQueriesBelongToItsActualApiAndRejectMissin
   void* main=dlopen(nullptr,RTLD_NOW|RTLD_LOCAL);
   ASSERT_NE(main,nullptr);
   struct Close{void* handle;~Close(){dlclose(handle);}} close{main};
+  ep::adapter::m0_detail::M0CoreContextQueryLeaseV1<> lease;
   for(const char* name:{"OrtM0FullGpuExtentOwnerEpochV1","OrtM0FullGpuExtentRunIdV2","OrtM0FullGpuReadCancellationV1"}){
     SCOPED_TRACE(name);
-    void* symbol=dlsym(main,name);ASSERT_NE(symbol,nullptr);
+    void* symbol=lease.Lookup(reinterpret_cast<void*>(Ort::GetApi().KernelContext_GetSyncStream),name);
+    ASSERT_NE(symbol,nullptr);EXPECT_EQ(symbol,dlsym(main,name));
+    for(int i=0;i<256;++i)EXPECT_EQ(lease.Lookup(reinterpret_cast<void*>(Ort::GetApi().KernelContext_GetSyncStream),name),symbol);
     Dl_info actual{};ASSERT_NE(dladdr(symbol,&actual),0);EXPECT_EQ(actual.dli_fbase,api.dli_fbase);
     if(std::string(name)=="OrtM0FullGpuReadCancellationV1"){
       using Query=int (ORT_API_CALL*)(const OrtKernelContext*,uint32_t,uint32_t*) noexcept;
@@ -111,6 +116,31 @@ TEST(M0BackingProjection, AliasedRawPayloadPreservesCanonicalMetadataAndUnknownT
   EXPECT_TRUE(m0_internal::M0SameInitializerMetadataV1(parsed,changed));
   EXPECT_FALSE(m0_internal::M0SameInlineInitializerV1(parsed,changed));
   changed.set_name("substituted");EXPECT_FALSE(m0_internal::M0SameInitializerMetadataV1(parsed,changed));
+}
+TEST(M0BackingProjection, InlineAliasesKeepIndependentBackingAndMalformedEnvelopeDenials){
+  ONNX_NAMESPACE::TensorProto live;
+  live.set_name("retained_weight");live.set_data_type(ONNX_NAMESPACE::TensorProto::FLOAT);
+  live.add_dims(2048);live.set_raw_data(std::string(8192,'x'));
+  const auto sealed=live;
+  EXPECT_TRUE(m0_internal::M0SameInlineInitializerV1(live,live));
+  EXPECT_TRUE(m0_internal::M0SameInlineInitializerV1(sealed,live));
+  (*live.mutable_raw_data())[4096]='y';
+  EXPECT_TRUE(m0_internal::M0SameInlineInitializerV1(live,live));
+  EXPECT_FALSE(m0_internal::M0SameInlineInitializerV1(sealed,live));
+  EXPECT_TRUE(m0_internal::M0SameInitializerMetadataV1(sealed,live));
+  live.set_name("substituted");
+  EXPECT_FALSE(m0_internal::M0SameInitializerMetadataV1(sealed,live));
+  auto trailer=live;
+  *trailer.mutable_unknown_fields()+=std::string("\x4a\x01x",3);
+  EXPECT_TRUE(m0_internal::M0SameInlineInitializerV1(trailer,trailer));
+  EXPECT_FALSE(m0_internal::M0SameInitializerMetadataV1(live,trailer));
+  // A truncated unknown field still fails structural validation on the alias
+  // path, while a well-formed trailer above remains independently compared.
+  *trailer.mutable_unknown_fields()=std::string("\x4a\x05x",3);
+  EXPECT_THROW((void)m0_internal::M0SameInitializerMetadataV1(trailer,trailer),std::exception);
+  EXPECT_THROW((void)m0_internal::M0SameInlineInitializerV1(trailer,trailer),std::exception);
+  auto oversized=live;oversized.set_doc_string(std::string(8*1024*1024,'x'));
+  EXPECT_THROW((void)m0_internal::M0SameInlineInitializerV1(oversized,oversized),std::exception);
 }
 TEST(M0BackingProjection, EmptyKnownRawPresenceRemainsDistinct){
   for(bool present:{false,true}){
@@ -522,7 +552,7 @@ TEST_F(M0NativeLowering, RechecksCancellationAndClosedOptionsBeforePreparationAn
   for (const bool cached : {false, true}) {
     // Each denial uses a fresh source, so poison/retirement cannot hide a later
     // missing options check.
-    for (int fault = 0; fault < 4; ++fault) {
+    for (int fault = 0; fault < 7; ++fault) {
       InferenceSession session(NativeLoweringOptions(), GetEnvironment());
       ASSERT_NO_FATAL_FAILURE(Load(session));
       if (cached) ASSERT_STATUS_OK(M0NativeLoweringQualificationV1::Prepare(session, M0NativeLoweringCapacityV1::k1024));
@@ -531,6 +561,10 @@ TEST_F(M0NativeLowering, RechecksCancellationAndClosedOptionsBeforePreparationAn
       if (fault == 1) options.load_cancellation_flag.reset();
       if (fault == 2) ASSERT_STATUS_OK(options.config_options.AddConfigEntry("session.unreviewed_option", "1"));
       if (fault == 3) options.enable_profiling = true;
+      if (fault == 4) ASSERT_STATUS_OK(options.config_options.AddConfigEntry(kM0CapacityCeilingConfigV1, "0"));
+      if (fault == 5) ASSERT_STATUS_OK(options.config_options.AddConfigEntry(kM0CapacityCeilingConfigV1, "01024"));
+      // The explicit qualification geometry cannot bypass the requested bound.
+      if (fault == 6) ASSERT_STATUS_OK(options.config_options.AddConfigEntry(kM0CapacityCeilingConfigV1, "1"));
       const auto denied = Failure([&]() { return M0NativeLoweringQualificationV1::Prepare(session, M0NativeLoweringCapacityV1::k1024); });
       EXPECT_FALSE(denied.empty()) << "cached=" << cached << " fault=" << fault;
       EXPECT_NE(denied.find("RW07_"), std::string::npos);
@@ -798,6 +832,7 @@ TEST_F(M0NativeLowering, PrivateInitializationUploadsActualParametersConstructsA
   EXPECT_TRUE(receipt.plan_bound);
   EXPECT_TRUE(receipt.gpu_parameters);
   EXPECT_TRUE(receipt.replay_retained);
+  EXPECT_TRUE(receipt.boundary_source_lease_checked);
   EXPECT_TRUE(receipt.original_model_retained);
   EXPECT_TRUE(receipt.original_ports_retained);
   EXPECT_TRUE(receipt.session_uninitialized);
@@ -823,7 +858,11 @@ TEST_F(M0NativeLowering, SequentialPrivateSessionsRetainAuthenticatedCodeAndRecr
 TEST_F(M0NativeLowering, PrivateInitializedStateRejectsActualParameterPlanAndLateCopyMutationPermanently) {
   for (const auto fault : {M0NativeInitializedFaultV1::InitializerSubstitution,
                            M0NativeInitializedFaultV1::AllocationReuse,
-                           M0NativeInitializedFaultV1::LateCopy}) {
+                           M0NativeInitializedFaultV1::LateCopy,
+                           M0NativeInitializedFaultV1::SourceRawBytes,
+                           M0NativeInitializedFaultV1::SourceGraphPorts,
+                           M0NativeInitializedFaultV1::CapacityCeilingMutation,
+                           M0NativeInitializedFaultV1::BoundaryExecutionSubstitution}) {
     InferenceSession session(NativeLoweringOptions(), GetEnvironment());
     ASSERT_NO_FATAL_FAILURE(Load(session));
     const auto receipt = M0NativeLoweringQualificationV1::InitializedExecution(session, fault);

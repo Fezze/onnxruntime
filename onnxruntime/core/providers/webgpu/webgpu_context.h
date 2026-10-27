@@ -319,7 +319,7 @@ class WebGpuContext final {
     return found==m0_residual_blocks_.end()?0u:found->second;
   }
   void M0RememberResidualBlockV1(const std::string& key,uint32_t block) {
-    ORT_ENFORCE(block==1||block==2||block==4||block==8||block==16,"RW07 residual tuning block");
+    ORT_ENFORCE(block==1||block==2||block==4||block==8||block==16||block==32||block==64,"RW07 residual tuning block");
     std::lock_guard<std::mutex> lock(m0_residual_block_mutex_);
     if(m0_residual_blocks_.size()>=128)m0_residual_blocks_.clear();
     m0_residual_blocks_[key]=block;

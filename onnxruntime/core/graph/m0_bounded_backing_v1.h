@@ -186,13 +186,21 @@ inline bool M0SameInitializerMetadataV1(const ONNX_NAMESPACE::TensorProto& expec
                                        const ONNX_NAMESPACE::TensorProto& actual) {
   if (expected.has_raw_data() != actual.has_raw_data()) return false;
   const size_t raw_fields = expected.has_raw_data() ? 1 : 0;
-  return M0ProjectedBackingBytesV1(expected, {{9, raw_fields}}) ==
-         M0ProjectedBackingBytesV1(actual, {{9, raw_fields}});
+  const auto metadata = M0ProjectedBackingBytesV1(expected, {{9, raw_fields}});
+  // Projection also validates the wire envelope; retain that check even when
+  // the live graph and its backing refer to the very same protobuf object.
+  return &expected == &actual || metadata == M0ProjectedBackingBytesV1(actual, {{9, raw_fields}});
 }
 
 inline bool M0SameInlineInitializerV1(const ONNX_NAMESPACE::TensorProto& expected,
                                      const ONNX_NAMESPACE::TensorProto& actual) {
-  return expected.raw_data() == actual.raw_data() && M0SameInitializerMetadataV1(expected, actual);
+  const auto& left = expected.raw_data();
+  const auto& right = actual.raw_data();
+  // Source/graph inventories intentionally alias immutable payloads. Comparing
+  // their bytes to themselves adds no independent integrity evidence.
+  const bool same_payload = left.size() == right.size() &&
+                            (left.data() == right.data() || left == right);
+  return same_payload && M0SameInitializerMetadataV1(expected, actual);
 }
 
 template <typename SameInitializer>

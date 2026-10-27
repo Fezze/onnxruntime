@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 #include "core/session/m0_native_lowering_qualification_v1.h"
+#include "core/common/m0_capacity_ceiling_v1.h"
 
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && !defined(ORT_MINIMAL_BUILD)
 #include "core/session/m0_native_public_input_fixture_v1.h"
@@ -548,6 +549,25 @@ M0NativeInitializedReceiptV1 M0NativeLoweringQualificationV1::InitializedExecuti
         repeated.planned_sources.size() == receipt.planned_sources && repeated.uploaded.size() == receipt.uploaded &&
         !repeated.initialization_scope && !state->M0FullGpuExtentRunIdV2();
   }
+  if(fault==M0NativeInitializedFaultV1::None){
+    std::lock_guard<std::mutex> lock(session.session_mutex_);
+    uint64_t serial=0;
+    {
+      const auto proof=native.ValidateSourceBoundary();serial=native.active_source_boundary_;
+      bool overlap_denied=false;
+      try{const auto overlap=native.ValidateSourceBoundary();}catch(const std::exception&){overlap_denied=true;}
+      ORT_ENFORCE(overlap_denied&&serial,"RW07_NATIVE_BOUNDARY_QUALIFICATION_OVERLAP");
+      native.ValidateInitializerPlan(*state,&proof);native.ValidateExecutionModel(&proof);
+    }
+    ORT_ENFORCE(!native.active_source_boundary_,"RW07_NATIVE_BOUNDARY_QUALIFICATION_NOT_RETIRED");
+    {
+      const auto next=native.ValidateSourceBoundary();
+      native.ValidateExecutionModel(&next);
+      receipt.boundary_source_lease_checked=native.active_source_boundary_>serial;
+    }
+    ORT_ENFORCE(!native.active_source_boundary_&&receipt.boundary_source_lease_checked,
+      "RW07_NATIVE_BOUNDARY_QUALIFICATION_REUSED_SERIAL");
+  }
   if (fault != M0NativeInitializedFaultV1::None) {
     constexpr const char* name = "encoder.text_encoder.embedding.weight";
     int index = -1;
@@ -556,9 +576,20 @@ M0NativeInitializedReceiptV1 M0NativeLoweringQualificationV1::InitializedExecuti
     auto& allocations = const_cast<SequentialExecutionPlan*>(plan)->allocation_plan;
     const OrtValue original = initializers.at(index);
     const auto original_allocation = allocations.at(size_t(index));
+    auto& source_graph=const_cast<Graph&>(source->MainGraph());
+    auto* source_weight=const_cast<ONNX_NAMESPACE::TensorProto*>(source_graph.GetConstantInitializer(name,false));
+    ORT_ENFORCE(source_weight&&!source_weight->raw_data().empty(),"RW07_NATIVE_INIT_QUALIFICATION_SOURCE_WEIGHT");
+    const char original_byte=source_weight->raw_data()[0];
+    const auto original_config=session.session_options_.config_options;
+    const auto restore_source=[&](){
+      if(fault==M0NativeInitializedFaultV1::SourceRawBytes)(*source_weight->mutable_raw_data())[0]=original_byte;
+      if(fault==M0NativeInitializedFaultV1::SourceGraphPorts)source_graph.SetInputs(inputs);
+      if(fault==M0NativeInitializedFaultV1::CapacityCeilingMutation)session.session_options_.config_options=original_config;
+    };
     auto restore = gsl::finally([&]() noexcept {
       if (fault == M0NativeInitializedFaultV1::InitializerSubstitution) initializers.at(index) = original;
       if (fault == M0NativeInitializedFaultV1::AllocationReuse) allocations[size_t(index)] = original_allocation;
+      restore_source();
     });
     {
       std::lock_guard<std::mutex> lock(session.session_mutex_);
@@ -569,7 +600,14 @@ M0NativeInitializedReceiptV1 M0NativeLoweringQualificationV1::InitializedExecuti
         initializers.at(index) = other->second;
       } else if (fault == M0NativeInitializedFaultV1::AllocationReuse) {
         allocations[size_t(index)].alloc_kind = AllocKind::kReuse;
-      } else ORT_ENFORCE(fault == M0NativeInitializedFaultV1::LateCopy, "RW07_NATIVE_INIT_QUALIFICATION_UNKNOWN_FAULT");
+      } else if(fault==M0NativeInitializedFaultV1::SourceRawBytes){
+        (*source_weight->mutable_raw_data())[0]^=1;
+      } else if(fault==M0NativeInitializedFaultV1::SourceGraphPorts){
+        source_graph.SetInputs({});
+      } else if(fault==M0NativeInitializedFaultV1::CapacityCeilingMutation){
+        ORT_THROW_IF_ERROR(session.session_options_.config_options.AddConfigEntry(kM0CapacityCeilingConfigV1,"1"));
+      } else ORT_ENFORCE(fault == M0NativeInitializedFaultV1::LateCopy||fault==M0NativeInitializedFaultV1::BoundaryExecutionSubstitution,
+                        "RW07_NATIVE_INIT_QUALIFICATION_UNKNOWN_FAULT");
     }
     if (fault == M0NativeInitializedFaultV1::LateCopy) {
       try {
@@ -577,6 +615,32 @@ M0NativeInitializedReceiptV1 M0NativeLoweringQualificationV1::InitializedExecuti
         receipt.fault_denied = !state->M0BeforeImmutableInitializerV1(name, index, *proto, M0NativeInitializerVisitV1::Copy).IsOK();
       } catch (const std::exception&) { receipt.fault_denied = true; }
     } else {
+      if(fault==M0NativeInitializedFaultV1::BoundaryExecutionSubstitution){
+       {
+        std::lock_guard<std::mutex> lock(session.session_mutex_);
+        const auto proof=native.ValidateSourceBoundary();
+        // Keep the real model alive while substituting the live owner's pointer.
+        // The same proof must fail before any dereference of a foreign/missing
+        // execution model, and restoration cannot revive the poisoned owner.
+        auto execution=std::move(native.execution_model_);
+        auto restore_execution=gsl::finally([&]()noexcept{native.execution_model_=std::move(execution);});
+        bool denied=false;
+        try{native.ValidateExecutionModel(&proof);}catch(const std::exception&){denied=true;}
+        ORT_ENFORCE(denied,"RW07_NATIVE_BOUNDARY_QUALIFICATION_MISSED_SUBSTITUTION");
+       }
+       ORT_ENFORCE(!native.active_source_boundary_&&native.phase_==M0FullGpuNativeLoweringOwnerV1::Phase::Poisoned,
+        "RW07_NATIVE_BOUNDARY_QUALIFICATION_UNRETIRED_OR_REVIVED");
+      }
+      if(fault==M0NativeInitializedFaultV1::SourceRawBytes||fault==M0NativeInitializedFaultV1::SourceGraphPorts||fault==M0NativeInitializedFaultV1::CapacityCeilingMutation){
+        // Exercise the same boundary used by actual Run directly, before the
+        // replay entry point's additional source check can hide a regression.
+        bool boundary_denied=false;
+        {
+          std::lock_guard<std::mutex> lock(session.session_mutex_);
+          try{native.ValidateInitializedExecution();}catch(const std::exception&){boundary_denied=true;}
+        }
+        ORT_ENFORCE(boundary_denied,"RW07_NATIVE_INIT_QUALIFICATION_BOUNDARY_MISSED_SOURCE_MUTATION");
+      }
       try { receipt.fault_denied = !native.InitializeExecution(session).IsOK(); }
       catch (const std::exception&) { receipt.fault_denied = true; }
     }
@@ -584,6 +648,7 @@ M0NativeInitializedReceiptV1 M0NativeLoweringQualificationV1::InitializedExecuti
       std::lock_guard<std::mutex> lock(session.session_mutex_);
       initializers.at(index) = original;
       allocations[size_t(index)] = original_allocation;
+      restore_source();
       receipt.retired = native.phase_ == M0FullGpuNativeLoweringOwnerV1::Phase::Poisoned;
     }
     try { receipt.restored_replay_denied = !native.InitializeExecution(session).IsOK(); }
