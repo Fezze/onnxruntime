@@ -14,6 +14,7 @@
 #include "core/common/logging/logging.h"
 
 namespace onnxruntime {
+inline constexpr char kM0QueuedReferenceLimitConfigV1[] = "m0.fullgpu.queued_reference_limit_bytes_v1";
 inline constexpr uint64_t kM0MemoryReserveBytesV1 = 512ull * 1024 * 1024;
 #if defined(ORT_M0_ENFORCE_MEMORY_RESERVE)
 inline constexpr bool kM0EnforceMemoryReserveV1 = true;
@@ -75,6 +76,36 @@ inline uint64_t M0MemoryPlanningBudgetV1(uint64_t available, uint64_t future, ui
   // Preserve the explicit monitor fallback when a useful reading/estimate is
   // unavailable. Actual allocation, binding and queue checks still apply.
   return std::numeric_limits<uint64_t>::max();
+}
+
+struct M0BoundedMemoryPlanV1 {
+  uint64_t working_set_bytes;
+  uint64_t queued_reference_limit_bytes;
+};
+
+// A checked queue drains before admitting more references and immediately
+// completes a single command larger than its limit. Thus its retained previous
+// work needs this byte envelope, rather than another entire operator peak.
+// The caller must pass the returned limit to every actual bounded Run.
+inline M0BoundedMemoryPlanV1 M0BoundedMemoryPlanningBudgetV1(
+    uint64_t available, uint64_t future, uint64_t minimum, uint64_t device_queue_limit,
+    bool enforce = kM0EnforceMemoryReserveV1) {
+  const uint64_t reserve = enforce ? kM0MemoryReserveBytesV1 : 0;
+  if (available <= reserve || future >= available - reserve || !device_queue_limit) {
+    return {M0MemoryPlanningBudgetV1(available, future, minimum, enforce), 0};
+  }
+  const uint64_t usable = available - reserve - future;
+  if (usable <= minimum) {
+    return {M0MemoryPlanningBudgetV1(available, future, minimum, enforce), 0};
+  }
+  // Reserve has already been charged. Use the existing submission policy on
+  // this remaining memory and clamp it so the minimum working set still fits.
+  // Keep at least the old equal-split working set when the queue policy's
+  // minimum allocation envelope is larger than half this remaining memory.
+  const uint64_t queued = std::min({M0SubmissionBudgetV1(device_queue_limit, usable, true, false),
+                                    usable - minimum, usable / 2});
+  if (!queued) return {M0MemoryPlanningBudgetV1(available, future, minimum, enforce), 0};
+  return {usable - queued, queued};
 }
 
 // Output is assigned only after the complete bounded reading is validated.

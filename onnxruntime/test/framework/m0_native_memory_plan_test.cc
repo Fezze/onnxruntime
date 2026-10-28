@@ -7,6 +7,7 @@
 #include "gtest/gtest.h"
 #include "core/graph/model.h"
 #include "core/graph/m0_fullgpu_native_memory_plan_v1.h"
+#include "core/common/m0_memory_reserve_v1.h"
 #include "test/test_environment.h"
 
 namespace onnxruntime::test {
@@ -90,6 +91,54 @@ TEST(M0NativeMemoryPlan, ResidualWorkspaceBoundsActualTilesWithoutCountingRetain
     EXPECT_EQ(noise.peaks,small.peaks);
     for(size_t i=1;i<small.peaks.size();++i) EXPECT_GT(small.peaks[i],small.peaks[i-1]);
   }
+}
+
+TEST(M0NativeMemoryPlan, BoundedQueueReclaimsDuplicatePeakWithoutExceedingAvailableMemory) {
+  constexpr uint64_t mib=1024*1024;
+  for(bool enforce:{false,true})for(uint64_t available:std::array<uint64_t,3>{128*mib,1024*mib,2048*mib})
+    for(uint64_t future:std::array<uint64_t,3>{0,64*mib,512*mib})
+      for(uint64_t minimum:std::array<uint64_t,3>{1,8*mib,128*mib})
+        for(uint64_t device_limit:std::array<uint64_t,3>{1,256,256*mib}){
+        const auto plan=M0BoundedMemoryPlanningBudgetV1(available,future,minimum,device_limit,enforce);
+        if(!plan.queued_reference_limit_bytes){
+          EXPECT_EQ(plan.working_set_bytes,M0MemoryPlanningBudgetV1(available,future,minimum,enforce));
+          continue;
+        }
+        const uint64_t reserve=enforce?kM0MemoryReserveBytesV1:0;
+        ASSERT_GT(available,reserve);ASSERT_LT(future,available-reserve);
+        const uint64_t usable=available-reserve-future;
+        EXPECT_GE(plan.working_set_bytes,minimum);
+        EXPECT_GE(plan.working_set_bytes,M0MemoryPlanningBudgetV1(available,future,minimum,enforce));
+        EXPECT_EQ(plan.working_set_bytes+plan.queued_reference_limit_bytes,usable);
+        EXPECT_LE(plan.queued_reference_limit_bytes,device_limit);
+      }
+  // Actual capacity-selection snapshot from the rejected full sentence.
+  constexpr uint64_t observed_available=1520943104,observed_future_weights=649452931;
+  constexpr uint64_t observed_device_binding_limit=536870912;
+  const auto minimum=PlanResidual(128,3,false).peaks[0];
+  const auto plan=M0BoundedMemoryPlanningBudgetV1(observed_available,observed_future_weights,minimum,
+                                                observed_device_binding_limit,false);
+  EXPECT_GT(plan.working_set_bytes,M0MemoryPlanningBudgetV1(observed_available,observed_future_weights,minimum,false));
+  EXPECT_GT(plan.queued_reference_limit_bytes,0u);
+}
+
+TEST(M0NativeMemoryPlan, BoundedQueuePreservesFallbacksAndHandlesExhaustionWithoutWrapping) {
+  const auto maximum=std::numeric_limits<uint64_t>::max();
+  for(bool enforce:{false,true})for(uint64_t available:std::array<uint64_t,3>{0,1,maximum})
+    for(uint64_t future:std::array<uint64_t,3>{0,1,maximum})
+      for(uint64_t minimum:std::array<uint64_t,2>{1,maximum})
+        for(uint64_t device_limit:std::array<uint64_t,3>{0,1,maximum}){
+        const auto plan=M0BoundedMemoryPlanningBudgetV1(available,future,minimum,device_limit,enforce);
+        if(!plan.queued_reference_limit_bytes){
+          EXPECT_EQ(plan.working_set_bytes,M0MemoryPlanningBudgetV1(available,future,minimum,enforce));
+        }else{
+          const uint64_t reserve=enforce?kM0MemoryReserveBytesV1:0;
+          ASSERT_GT(available,reserve);ASSERT_LT(future,available-reserve);
+          EXPECT_LE(plan.working_set_bytes,available-reserve-future);
+          EXPECT_EQ(plan.queued_reference_limit_bytes,available-reserve-future-plan.working_set_bytes);
+          EXPECT_GE(plan.working_set_bytes,minimum);
+        }
+      }
 }
 }  // namespace
 }  // namespace onnxruntime::test

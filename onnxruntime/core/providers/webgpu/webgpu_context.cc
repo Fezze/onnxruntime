@@ -688,7 +688,8 @@ Status WebGpuContext::EncodeDeferredDispatches(CommandRecordingState& recording)
   return result;
 }
 
-Status WebGpuContext::RunWithCheckedCompletion(ComputeContextBase& context, const ProgramBase& program) {
+Status WebGpuContext::RunWithCheckedCompletion(ComputeContextBase& context, const ProgramBase& program,
+                                             uint64_t scheduled_products) {
   const auto& buffers = ComputeContextBase::BufferManagerAccessor::Get(context);
   auto& recording = ComputeContextBase::BufferManagerAccessor::GetRecording(context);
   const auto annotate = [&program](const Status& status, const char* phase) {
@@ -701,7 +702,7 @@ Status WebGpuContext::RunWithCheckedCompletion(ComputeContextBase& context, cons
   // have submitted prior work without waiting for its queue completion.
   ORT_RETURN_IF_ERROR(annotate(FlushAndWaitChecked(buffers, recording), "prior work"));
   // Recheck cancellation after the prior queue wait, through the actual caller.
-  ORT_RETURN_IF_ERROR(annotate(context.RunProgram(program), "enqueue"));
+  ORT_RETURN_IF_ERROR(annotate(context.RunProgram(program, scheduled_products), "enqueue"));
   return annotate(FlushAndWaitChecked(buffers, recording), "completion");
 }
 

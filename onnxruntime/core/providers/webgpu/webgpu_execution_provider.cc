@@ -3,6 +3,7 @@
 
 #include "core/providers/webgpu/webgpu_execution_provider.h"
 #include "core/common/m0_memory_reserve_v1.h"
+#include <algorithm>
 #if defined(_WIN32) && defined(ENABLE_D3D12_FILE_LOADING)
 #include "core/providers/webgpu/d3d12_external_data_loader.h"
 #endif
@@ -1068,6 +1069,15 @@ Status WebGpuExecutionProvider::OnRunStart(const onnxruntime::RunOptions& run_op
   const bool strict_ownership = run_options.config_options.GetConfigOrDefault("m0.fullgpu.extent_ownership_v2", "0") == "1";
   const auto bounded=run_options.config_options.GetConfigOrDefault("m0.fullgpu.bounded_submissions_v1","0");
   ORT_RETURN_IF_NOT(bounded=="0"||bounded=="1","RW07 invalid native submission profile");
+  const auto planned_queue = run_options.config_options.GetConfigOrDefault(
+      kM0QueuedReferenceLimitConfigV1, "");
+  uint64_t planned_queue_bytes = 0;
+  if (!planned_queue.empty()) {
+    ORT_RETURN_IF_NOT(bounded == "1" &&
+        std::all_of(planned_queue.begin(), planned_queue.end(), [](char c) { return c >= '0' && c <= '9'; }) &&
+        TryParseStringWithClassicLocale<uint64_t>(planned_queue, planned_queue_bytes) && planned_queue_bytes > 0,
+        "RW07 invalid planned queued-reference limit");
+  }
   const auto operator_profile = run_options.config_options.GetConfigOrDefault(
       "m0.fullgpu.operator_profile_v1", "0");
   ORT_RETURN_IF_NOT(operator_profile == "0" || operator_profile == "1", "RW07 invalid operator profile");
@@ -1103,6 +1113,7 @@ Status WebGpuExecutionProvider::OnRunStart(const onnxruntime::RunOptions& run_op
     ORT_RETURN_IF_NOT(!kM0EnforceMemoryReserveV1||available_bytes>kM0MemoryReserveBytesV1,"RW07 native submission memory reserve");
     submission_budget=M0SubmissionBudgetV1(submission_budget,available_bytes,reading.IsOK());
 #endif
+    if (planned_queue_bytes) submission_budget = std::min(submission_budget, planned_queue_bytes);
     ORT_RETURN_IF_NOT(submission_budget,"RW07 native submission zero budget");
   }else{
     ORT_RETURN_IF_NOT(!recording_->m0_submission_budget_bytes&&!recording_->m0_queued_scheduled_products&&!recording_->m0_queued_reference_bytes&&recording_->m0_unique_queued_buffers.Empty()&&!recording_->m0_uniform_current&&recording_->m0_uniform_batches.empty(),

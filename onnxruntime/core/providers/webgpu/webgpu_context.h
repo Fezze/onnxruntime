@@ -505,7 +505,7 @@ class WebGpuContext final {
   Status PopErrorScope();
 
   Status Run(ComputeContextBase& context, const ProgramBase& program, uint64_t scheduled_products=0);
-  Status RunWithCheckedCompletion(ComputeContextBase& context, const ProgramBase& program);
+  Status RunWithCheckedCompletion(ComputeContextBase& context, const ProgramBase& program, uint64_t scheduled_products = 0);
 
 #if defined(ENABLE_PIX_FOR_WEBGPU_EP)
   std::unique_ptr<WebGpuPIXFrameGenerator> CreatePIXFrameGenerator() {

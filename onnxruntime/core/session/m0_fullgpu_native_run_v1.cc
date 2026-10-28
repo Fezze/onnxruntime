@@ -5,6 +5,7 @@
 #include <cstring>
 #include <set>
 #include "core/common/m0_observation_options_v1.h"
+#include "core/common/m0_memory_reserve_v1.h"
 #include "core/session/m0_fullgpu_native_execution_state_v1.h"
 #include "core/session/m0_native_terminal_result_v1.h"
 #include "core/session/inference_session.h"
@@ -88,6 +89,9 @@ common::Status M0FullGpuNativeLoweringOwnerV1::RunExecution(
   };
   configure("m0.fullgpu.extent_ownership_v2","1");
   configure("m0.fullgpu.bounded_submissions_v1","1");
+  if(planned_queued_reference_limit_bytes_){
+   configure(kM0QueuedReferenceLimitConfigV1,std::to_string(planned_queued_reference_limit_bytes_));
+  }
   configure("m0.fullgpu.actual_session_v2",std::to_string(p.epoch));
   configure("m0.fullgpu.actual_run_v2",std::to_string(scope->Id()));
   configure("m0.fullgpu.fault_authorized_v2","0");configure("m0.fullgpu.diagnostic_fault_mode_v2","0");

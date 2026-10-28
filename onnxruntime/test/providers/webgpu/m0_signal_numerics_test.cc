@@ -941,7 +941,7 @@ class M0SpectrumNumerics : public M0SignalNumerics {
   }
 };
 
-TEST(M0StftWindowBudget, DeviceStorageCohortBindingAndGridDetermineEveryWindow) {
+TEST(M0StftWindowBudget, DeviceWorkBindingAndGridDetermineEveryWindow) {
   wgpu::Limits limits{};
   limits.maxComputeWorkgroupSizeX=limits.maxComputeInvocationsPerWorkgroup=m0_stft_detail::kOriginalBluesteinFftSamplesV1;
   limits.maxComputeWorkgroupsPerDimension=65535;limits.minStorageBufferOffsetAlignment=256;
@@ -949,12 +949,20 @@ TEST(M0StftWindowBudget, DeviceStorageCohortBindingAndGridDetermineEveryWindow) 
   constexpr auto bytes=m0_stft_detail::kOriginalBluesteinWorkgroupBytesV1;
   for(const uint32_t count:{1u,2u,7u,31u,63u}){
     limits.maxComputeWorkgroupStorageSize=count*bytes;
-    EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441),count);
+    // Shared memory is private to each group: additional groups do not consume
+    // the same group's limit. The real speech geometry fits one native window.
+    EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441),34441u);
     EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,1),1u);
     EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441,1),1u);
     EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,0),0u);
     EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441,0),0u);
   }
+  const uint64_t work_frames=kM0ScheduledProductsPerWindowV1/m0_stft_detail::kStftRealProductsPerFrameV1;
+  EXPECT_GT(work_frames,34441u);
+  EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,UINT32_MAX),work_frames);
+  EXPECT_LE(work_frames*m0_stft_detail::kStftRealProductsPerFrameV1,kM0ScheduledProductsPerWindowV1);
+  EXPECT_GT((work_frames+1)*m0_stft_detail::kStftRealProductsPerFrameV1,kM0ScheduledProductsPerWindowV1);
+  EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441,7),7u);
   limits.maxComputeWorkgroupStorageSize=bytes-1;
   EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441),0u);
   limits.maxComputeWorkgroupStorageSize=63*bytes;
@@ -967,6 +975,8 @@ TEST(M0StftWindowBudget, DeviceStorageCohortBindingAndGridDetermineEveryWindow) 
   limits.maxBufferSize=limits.maxStorageBufferBindingSize=uint64_t{1}<<27;
   limits.maxComputeWorkgroupsPerDimension=1;
   EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441),1u);
+  limits.maxComputeWorkgroupsPerDimension=3;
+  EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441),9u);
   limits.maxComputeWorkgroupsPerDimension=0;
   EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441),0u);
   limits.maxComputeWorkgroupsPerDimension=65535;
@@ -2022,6 +2032,34 @@ TEST_F(M0RecurrenceProjection, UniformArenaOwnsCommandPreparedAcrossAdmissionDra
 }
 TEST_F(M0RecurrenceProjection, CheckedWindowsReuseOneArenaWithoutChangingUniformValues){
   ASSERT_NO_FATAL_FAILURE(UniformUploads(false,false,true));
+}
+TEST_F(M0RecurrenceProjection, CheckedWindowsEnforceScheduledWorkBeforeWritingOutput){
+  ASSERT_NO_FATAL_FAILURE(BoundedProvider());
+  std::array<uint32_t,2> values{0x80000000u,0x80000001u};
+  auto buffer=Storage(values.data(),sizeof(values));
+  const OrtMemoryInfo memory(WEBGPU_BUFFER,OrtDeviceAllocator,WebGpuDevice(0),OrtMemTypeDefault);
+  Tensor output(DataTypeImpl::GetType<uint32_t>(),{2},buffer.get(),memory);
+  RunOptions options;
+  ASSERT_STATUS_OK(options.config_options.AddConfigEntry("m0.fullgpu.extent_ownership_v2","1"));
+  ASSERT_STATUS_OK(options.config_options.AddConfigEntry("m0.fullgpu.bounded_submissions_v1","1"));
+  ASSERT_STATUS_OK(Ep().OnRunStart(options));
+  bool active=true;auto cleanup=gsl::finally([&](){if(active)ORT_IGNORE_RETURN_VALUE(Ep().OnRunEnd(true,options));});
+  ASSERT_NO_FATAL_FAILURE(WithContext([&](ComputeContextBase& context){
+    const std::array<uint32_t,4> tag{100,200,300,400};
+    M0UniformProbeProgram program;
+    program.AddOutput({&output,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64).SetDispatchGroupSize(1)
+      .AddUniformVariables({0u,3u,gsl::span<const uint32_t>{tag.data(),tag.size()}});
+    const auto rejected=context.RunProgramWithCheckedCompletion(program,kM0ScheduledProductsPerWindowV1+1);
+    ASSERT_FALSE(rejected.IsOK());
+    EXPECT_NE(rejected.ErrorMessage().find("RW07 dispatch scheduled-work limit"),std::string::npos);
+    EXPECT_TRUE(Ep().Recording().deferred_dispatches.empty());
+    Ep().BufferManager().Download(Ep().Recording(),buffer.get(),values.data(),sizeof(values));
+    EXPECT_EQ(values[0],0x80000000u);EXPECT_EQ(values[1],0x80000001u);
+    ASSERT_STATUS_OK(context.RunProgramWithCheckedCompletion(program,kM0ScheduledProductsPerWindowV1));
+  }));
+  const auto ended=Ep().OnRunEnd(true,options);active=false;ASSERT_STATUS_OK(ended);
+  Ep().BufferManager().Download(Ep().Recording(),buffer.get(),values.data(),sizeof(values));
+  EXPECT_EQ(values[0],3u^100u^400u);EXPECT_EQ(values[1],0x80000001u);
 }
 TEST_F(M0RecurrenceProjection, UniformArenaSubmitsFullBlockBeforeAllocatingAnother){
   ASSERT_NO_FATAL_FAILURE(UniformUploads(false,true));

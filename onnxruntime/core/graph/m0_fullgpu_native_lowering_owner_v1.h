@@ -51,7 +51,8 @@ class M0FullGpuNativeLoweringOwnerV1 final {
       const Model& source,const InferenceSession& session,
       const ONNX_NAMESPACE::ModelProto& sealed_original,uint32_t capacity,bool device_capacity=false);
   M0FullGpuNativeLoweringOwnerV1(const Model& source,const InferenceSession& session,
-                                uint32_t capacity,bool device_capacity,uint32_t requested_ceiling);
+                                uint32_t capacity,bool device_capacity,uint32_t requested_ceiling,
+                                uint64_t queued_reference_limit_bytes);
   ~M0FullGpuNativeLoweringOwnerV1();
   void ResolveExecutionModel(const logging::Logger& logger);
   // Lexical proof for one synchronous validation boundary only. It never spans
@@ -143,7 +144,8 @@ class M0FullGpuNativeLoweringOwnerV1 final {
   std::unique_ptr<M0NativeGpuModuleV2,PreparedModuleDeleter> prepared_module_;
   static uint32_t SelectPhysicalCapacity(M0NativeGpuModuleV2& module,const ONNX_NAMESPACE::ModelProto& original,
       const Model& source,ExecutionOrder execution_order,uint32_t requested_ceiling,M0NativeDeviceLimitsV1& limits,uint64_t& initializer_bytes,
-      std::vector<std::string>& memory_order,uint64_t& available_bytes,uint64_t& peak_bytes);
+      std::vector<std::string>& memory_order,uint64_t& available_bytes,uint64_t& peak_bytes,
+      uint64_t& queued_reference_limit_bytes);
   void ValidatePhysicalCapacity(M0NativeGpuModuleV2& module)const;
   const Model* const source_;
   mutable uint64_t source_boundary_serial_=0;
@@ -152,6 +154,7 @@ class M0FullGpuNativeLoweringOwnerV1 final {
   const uint32_t capacity_;
   const bool device_capacity_;
   const uint32_t requested_capacity_ceiling_;
+  const uint64_t planned_queued_reference_limit_bytes_;
   M0NativeDeviceLimitsV1 device_limits_;
   uint64_t initializer_capacity_bytes_=0;
   std::vector<std::string> memory_plan_order_;

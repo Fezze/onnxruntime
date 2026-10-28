@@ -157,9 +157,9 @@ class ComputeContextBase {
   }
 
   // Isolate a costly dispatch from preceding and subsequent submissions.
-  inline Status RunProgramWithCheckedCompletion(const ProgramBase& program) {
+  inline Status RunProgramWithCheckedCompletion(const ProgramBase& program, uint64_t scheduled_products = 0) {
     ORT_RETURN_IF_ERROR(M0CheckCancellationV1());
-    return webgpu_context_.RunWithCheckedCompletion(*this, program);
+    return webgpu_context_.RunWithCheckedCompletion(*this, program, scheduled_products);
   }
 
  protected:
