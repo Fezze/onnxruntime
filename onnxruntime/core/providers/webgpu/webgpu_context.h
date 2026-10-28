@@ -4,6 +4,8 @@
 #pragma once
 #include "core/providers/webgpu/m0_fullgpu_resource_ownership.h"
 #include "core/providers/webgpu/m0_queued_buffer_budget_v1.h"
+#include "core/providers/webgpu/m0_dawn_artifact_cache_v1.h"
+#include "core/providers/webgpu/m0_host_costs_v1.h"
 #include "core/providers/webgpu/m0_fullgpu_fault_hooks.h"
 
 #include <atomic>
@@ -179,10 +181,39 @@ struct CommandRecordingState {
   std::vector<CapturedCommandInfo>* external_captured_commands = nullptr;
   // Keep uploaded blocks alive through Submit, including already encoded commands.
   std::shared_ptr<M0UniformUploadBatchV1> m0_uniform_current;
+  std::shared_ptr<M0UniformUploadBatchV1> m0_uniform_retired;
   std::vector<std::shared_ptr<M0UniformUploadBatchV1>> m0_uniform_batches;
   uint64_t m0_uniform_arena_uploads=0,m0_uniform_arena_bytes=0;
+  uint64_t m0_uniform_arena_allocations=0,m0_uniform_arena_recycled=0;
+  void M0RetireUniformUploadsV1(){
+    if(!m0_uniform_batches.empty()){
+      auto candidate=m0_uniform_batches.back();
+      m0_uniform_current.reset();
+      for(auto& command:deferred_dispatches)command.m0_uniform_upload.reset();
+      m0_uniform_batches.clear();
+      m0_uniform_retired.reset();
+      if(m0_submission_budget_bytes&&graph_capture_state==GraphCaptureState::Default&&candidate.use_count()==1)
+        m0_uniform_retired=std::move(candidate);
+    }
+    for(auto& command:deferred_dispatches)command.m0_uniform_upload.reset();
+    m0_uniform_batches.clear();
+  }
+  void M0RecycleUniformUploadsAfterCheckedCompletionV1(){
+    // Admission can drain while Run still owns a prospective command's block.
+    // Its uniforms are already packed, but its command has not been submitted.
+    // Sole ownership is therefore essential even after a successful queue wait.
+    if(m0_submission_budget_bytes&&graph_capture_state==GraphCaptureState::Default&&
+       m0_uniform_retired&&m0_uniform_retired.use_count()==1&&
+       m0_uniform_retired->packing.Sealed()){
+      m0_uniform_retired->packing.ResetAfterCheckedCompletion();
+      m0_uniform_current=std::move(m0_uniform_retired);
+      ++m0_uniform_arena_recycled;
+    }
+    m0_uniform_retired.reset();
+  }
   void M0ReleaseUniformUploadsV1(){
     m0_uniform_current.reset();
+    m0_uniform_retired.reset();
     for(auto& command:deferred_dispatches)command.m0_uniform_upload.reset();
     m0_uniform_batches.clear();
   }
@@ -341,6 +372,8 @@ class WebGpuContext final {
 
   const wgpu::AdapterInfo& AdapterInfo() const { return adapter_info_; }
   const wgpu::Limits& DeviceLimits() const { return device_limits_; }
+  const M0DawnArtifactCacheV1* M0ArtifactCacheV1()const{return m0_dawn_artifact_cache_;}
+  M0HostCostsV1& M0HostCosts()const{return m0_host_costs_;}
   bool DeviceHasFeature(wgpu::FeatureName feature) const { return device_features_.contains(feature); }
   const wgpu::AdapterPropertiesSubgroupMatrixConfigs& SubgroupMatrixConfigs() const { return subgroup_matrix_configs_; }
 
@@ -572,6 +605,9 @@ class WebGpuContext final {
   };
   std::shared_ptr<DeviceErrorState> device_error_state_{std::make_shared<DeviceErrorState>()};
   wgpu::Instance instance_;
+  // Non-owning process service: asynchronous Dawn callbacks can outlive a context.
+  M0DawnArtifactCacheV1* m0_dawn_artifact_cache_=nullptr;
+  mutable M0HostCostsV1 m0_host_costs_;
   wgpu::Device device_;
 
   webgpu::ValidationMode validation_mode_;

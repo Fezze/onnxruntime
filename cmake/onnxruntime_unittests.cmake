@@ -1358,6 +1358,7 @@ if(NOT onnxruntime_MINIMAL_BUILD)
   set_property(SOURCE
     "${TEST_SRC_DIR}/framework/m0_fullgpu_preinit_test.cc"
     "${TEST_SRC_DIR}/framework/m0_native_lowering_test.cc"
+    "${TEST_SRC_DIR}/framework/m0_isolated_programs_test.cc"
     "${TEST_SRC_DIR}/framework/m0_module_audit_test.cc"
     APPEND PROPERTY INCLUDE_DIRECTORIES "${ONNXRUNTIME_ROOT}/../model_package/src")
 endif()
@@ -1682,6 +1683,8 @@ block()
   # Match the non-plugin WebGPU test-source selection above.
   if (onnxruntime_USE_WEBGPU AND NOT onnxruntime_USE_EP_API_ADAPTERS)
     target_include_directories(${onnxruntime_provider_test_target} PRIVATE ${WGSL_GENERATED_ROOT})
+    set_property(SOURCE "${ONNXRUNTIME_ROOT}/test/providers/webgpu/m0_dawn_artifact_cache_test.cc"
+      APPEND PROPERTY INCLUDE_DIRECTORIES "${REPO_ROOT}/model_package/src")
   endif()
 
   if (NOT onnxruntime_provider_test_target STREQUAL "onnxruntime_provider_test")

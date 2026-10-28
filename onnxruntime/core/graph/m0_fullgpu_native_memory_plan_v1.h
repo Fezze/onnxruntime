@@ -162,9 +162,15 @@ class M0NativeMemoryPlanV1 final {
       if(node.op_type()=="GeneratorResidualExtentV1"||node.op_type()=="NoiseResidualAfter1600ExtentV1"){
         const auto branch=Attribute(node,"branch");
         const uint32_t channels=node.op_type()=="GeneratorResidualExtentV1"?(branch<3?256u:128u):(branch==0?256u:128u);
-        // The ordinary input/output scratch bound covers the full convolution
-        // accumulator plus an activation window no larger than that carrier.
-        // Fixed coefficients and packed columns/flags are additional allocations.
+        // These two production kernels allocate only an activation tile and a
+        // full convolution accumulator, plus the fixed workspace below. The
+        // tile has at most `channels` rows. Initializers are retained separately
+        // in InitializerBytes(), not copied into either temporary carrier.
+        // The generic input/output bound would count their twelve parameters
+        // a second time and needlessly shorten the supported utterance.
+        scratch=CapacityBytes(node,2*channels*sizeof(float));
+        // CapacityBytes includes one alignment tail; these are two allocations.
+        scratch+=Bytes{15,0};
         scratch+=Bytes{M0NativeResidualFixedScratchBytesV1(channels,M0OutputChannelTiledConvV1()),0};
       }
       if(node.op_type()=="RecurrenceExtentV2"&&M0LstmInputProjectionV1()){

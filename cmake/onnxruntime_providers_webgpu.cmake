@@ -403,6 +403,16 @@
     add_dependencies(onnxruntime_providers_webgpu onnxruntime_webgpu_wgsl_generation)
   endif()
 
+  # Reuse the existing dependency-free SHA-256 implementation for Dawn cache
+  # key/payload integrity; do not introduce a separate crypto dependency.
+  if(onnxruntime_MINIMAL_BUILD)
+    # Minimal builds do not create the standalone package target.
+    target_sources(onnxruntime_providers_webgpu PRIVATE "${REPO_ROOT}/model_package/src/sha256.cc")
+  else()
+    target_link_libraries(onnxruntime_providers_webgpu PRIVATE model_package)
+  endif()
+  target_include_directories(onnxruntime_providers_webgpu PRIVATE "${REPO_ROOT}/model_package/src")
+
   if (NOT onnxruntime_BUILD_SHARED_LIB)
     install(TARGETS onnxruntime_providers_webgpu EXPORT ${PROJECT_NAME}Targets
             ARCHIVE   DESTINATION ${CMAKE_INSTALL_LIBDIR}

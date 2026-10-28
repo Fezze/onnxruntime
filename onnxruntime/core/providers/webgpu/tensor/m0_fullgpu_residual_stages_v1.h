@@ -1492,9 +1492,9 @@ class DecoderPoolTile final : public Program<DecoderPoolTile> {
 };
 class DecoderConvTile final : public Program<DecoderConvTile> {
  public:
-  explicit DecoderConvTile(bool bias,bool finite=M0BatchHeavyProgramsV1(),bool four_time=true)
-      :Program{finite&&four_time?"RW07DecoderResidualConvFourTimeWindowV5":finite?"RW07DecoderResidualConvFiniteWindowV4":"RW07DecoderResidualConvOutputWindowV3"},
-       bias_(bias),finite_(finite),four_time_(finite&&four_time) {}
+  explicit DecoderConvTile(bool bias,bool finite=M0BatchHeavyProgramsV1(),bool four_time=true,bool vector_loads=true)
+      :Program{finite&&four_time?(vector_loads?"RW07DecoderResidualConvFourTimeGatherV6":"RW07DecoderResidualConvFourTimeWindowV5"):finite?"RW07DecoderResidualConvFiniteWindowV4":"RW07DecoderResidualConvOutputWindowV3"},
+       bias_(bias),finite_(finite),four_time_(finite&&four_time),vector_loads_(vector_loads) {}
   uint64_t WorkItems(uint32_t rows,uint32_t capacity)const{
     return uint64_t(rows)*(four_time_?capacity/4u+uint32_t(capacity%4u!=0):capacity);
   }
@@ -1531,14 +1531,7 @@ class DecoderConvTile final : public Program<DecoderConvTile> {
         <<"bad=0u;let d="<<e.GetByOffset("6u")<<";let first=workgroup_idx*64u;let last=min(first+63u,elements-1u);"
         <<"let first_row=first/uniforms.output_capacity;let last_row=last/uniforms.output_capacity;"
         <<"var lo=first%uniforms.output_capacity;var hi=last%uniforms.output_capacity;"
-        <<"if(first_row!=last_row){lo=0u;hi=uniforms.output_capacity-1u;}"
-        <<"if(lo<d){hi=min(hi,d-1u);let radius=uniforms.width/2u;"
-        <<"let first_pos=u32(max(0,i32(lo)-i32(radius)));let last_pos=min(d-1u,hi+radius);"
-        <<"let begin=select(first_pos,first_pos/2u,uniforms.nearest!=0u);"
-        <<"let end=min(uniforms.input_capacity-1u,select(last_pos,last_pos/2u,uniforms.nearest!=0u));"
-        <<"if(begin<=end){let span=end-begin+1u;for(var index=local_idx;index<uniforms.channel_count*span;index+=64u){"
-        <<"let value="<<x.GetByOffset("(index/span)*uniforms.input_capacity+begin+index%span")<<";"
-        <<"if((bitcast<u32>(value)&0x7fffffffu)>0x58800000u){bad=1u;}}}}"
+        <<InputSafetyScan(x)
         <<"let row_elements=uniforms.channel_count*uniforms.width;"
         <<"for(var index=local_idx;index<(last_row-first_row+1u)*row_elements;index+=64u){"
         <<"let row=uniforms.output_offset+first_row+index/row_elements;"
@@ -1581,6 +1574,23 @@ class DecoderConvTile final : public Program<DecoderConvTile> {
     return Status::OK();
   }
  private:
+  static std::string InputSafetyScan(const ShaderVariableHelper& x){
+    OStringStream code(1024);
+    // A group crossing one row boundary owns a suffix and a prefix, not the
+    // whole time axis. More than two rows includes a complete interior row.
+    code<<"for(var part=0u;part<2u;part++){var low=lo;var high=hi;"
+      <<"if(first_row==last_row){if(part!=0u){continue;}}"
+      <<"else if(last_row-first_row>1u){if(part!=0u){continue;}low=0u;high=uniforms.output_capacity-1u;}"
+      <<"else{if(part==0u){high=uniforms.output_capacity-1u;}else{low=0u;}}"
+      <<"if(low<d){high=min(high,d-1u);let radius=uniforms.width/2u;"
+      <<"let first_pos=u32(max(0,i32(low)-i32(radius)));let last_pos=min(d-1u,high+radius);"
+      <<"let begin=select(first_pos,first_pos/2u,uniforms.nearest!=0u);"
+      <<"let end=min(uniforms.input_capacity-1u,select(last_pos,last_pos/2u,uniforms.nearest!=0u));"
+      <<"if(begin<=end){let span=end-begin+1u;for(var index=local_idx;index<uniforms.channel_count*span;index+=64u){"
+      <<"let value="<<x.GetByOffset("(index/span)*uniforms.input_capacity+begin+index%span")<<";"
+      <<"if((bitcast<u32>(value)&0x7fffffffu)>0x58800000u){bad=1u;}}}}}";
+    return std::move(code).str();
+  }
   Status FourTimeShader(ShaderHelper& s,const ShaderVariableHelper& x,const ShaderVariableHelper& w,
       const ShaderVariableHelper* b,const ShaderVariableHelper& e,const ShaderVariableHelper& y)const{
     s.AdditionalImplementation()<<"var<workgroup> decoder_flags:array<u32,64>;var<workgroup> decoder_safe:u32;var<workgroup> decoder_enabled:u32;";
@@ -1595,13 +1605,7 @@ class DecoderConvTile final : public Program<DecoderConvTile> {
       <<"if(geometry){bad=0u;let d="<<e.GetByOffset("6u")<<";let first=workgroup_idx*64u;let last=min(first+63u,elements-1u);"
       <<"let first_row=first/vectors;let last_row=last/vectors;var lo=(first%vectors)*4u;"
       <<"var hi=min((last%vectors)*4u+3u,uniforms.output_capacity-1u);"
-      <<"if(first_row!=last_row){lo=0u;hi=uniforms.output_capacity-1u;}"
-      <<"if(lo<d){hi=min(hi,d-1u);let radius=uniforms.width/2u;let first_pos=u32(max(0,i32(lo)-i32(radius)));"
-      <<"let last_pos=min(d-1u,hi+radius);let begin=select(first_pos,first_pos/2u,uniforms.nearest!=0u);"
-      <<"let end=min(uniforms.input_capacity-1u,select(last_pos,last_pos/2u,uniforms.nearest!=0u));"
-      <<"if(begin<=end){let span=end-begin+1u;for(var index=local_idx;index<uniforms.channel_count*span;index+=64u){"
-      <<"let value="<<x.GetByOffset("(index/span)*uniforms.input_capacity+begin+index%span")<<";"
-      <<"if((bitcast<u32>(value)&0x7fffffffu)>0x58800000u){bad=1u;}}}}"
+      <<InputSafetyScan(x)
       <<"let row_elements=uniforms.channel_count*uniforms.width;for(var index=local_idx;index<(last_row-first_row+1u)*row_elements;index+=64u){"
       <<"let row=uniforms.output_offset+first_row+index/row_elements;let ic=uniforms.channel_offset+(index/uniforms.width)%uniforms.channel_count;"
       <<"let value="<<w.GetByOffset("(row*uniforms.input_channels+ic)*uniforms.width+index%uniforms.width")<<";"
@@ -1620,9 +1624,23 @@ class DecoderConvTile final : public Program<DecoderConvTile> {
     const auto dot=[&](bool fast){
       f<<"for(var local_ic=0u;local_ic<uniforms.channel_count;local_ic++){let ic=uniforms.channel_offset+local_ic;"
        <<"for(var k=0u;k<uniforms.width;k++){let weight="<<w.GetByOffset("(oc*uniforms.input_channels+ic)*uniforms.width+k")<<";"
-       <<"var value=vec4<f32>(0.0);for(var lane=0u;lane<4u;lane++){let pos=i32(t+lane)+i32(k)-i32(uniforms.width/2u);"
+       <<"var value=vec4<f32>(0.0);";
+      if(vector_loads_){
+        f<<"var gathered=false;let first_pos=i32(t)+i32(k)-i32(uniforms.width/2u);"
+          <<"if(t+3u<min(d,uniforms.output_capacity)&&first_pos>=0&&u32(first_pos)+3u<d){"
+          <<"let begin=select(u32(first_pos),u32(first_pos)/2u,uniforms.nearest!=0u);"
+          <<"let end=select(u32(first_pos)+3u,(u32(first_pos)+3u)/2u,uniforms.nearest!=0u);"
+          <<"if(end<uniforms.input_capacity){let base=local_ic*uniforms.input_capacity+begin;"
+          <<"let a="<<x.GetByOffset("base")<<";let b="<<x.GetByOffset("base+1u")<<";"
+          <<"if(uniforms.nearest==0u){value=vec4<f32>(a,b,"<<x.GetByOffset("base+2u")<<","<<x.GetByOffset("base+3u")<<");}"
+          <<"else if(u32(first_pos)%2u==0u){value=vec4<f32>(a,a,b,b);}"
+          <<"else{value=vec4<f32>(a,b,b,"<<x.GetByOffset("base+2u")<<");}gathered=true;}}"
+          <<"if(!gathered){";
+      }
+      f<<"for(var lane=0u;lane<4u;lane++){let pos=i32(t+lane)+i32(k)-i32(uniforms.width/2u);"
        <<"if(t+lane<min(d,uniforms.output_capacity)&&pos>=0&&u32(pos)<d){let source_t=select(u32(pos),u32(pos)/2u,uniforms.nearest!=0u);"
        <<"if(source_t<uniforms.input_capacity){value[lane]="<<x.GetByOffset("local_ic*uniforms.input_capacity+source_t")<<";}}}";
+      if(vector_loads_)f<<"}";
       if(fast)f<<"let product=value*vec4<f32>(weight);sum=sum+product;}}";
       else f<<"for(var lane=0u;lane<4u;lane++){let product=original_mul(value[lane],weight);sum[lane]=original_add(sum[lane],product);}}}";
     };
@@ -1634,7 +1652,7 @@ class DecoderConvTile final : public Program<DecoderConvTile> {
       <<y.SetByOffset("row*uniforms.output_capacity+t+lane","value")<<"}}";
     return Status::OK();
   }
-  const bool bias_,finite_,four_time_;
+  const bool bias_,finite_,four_time_,vector_loads_;
 };
 class DecoderResidualAdd final : public Program<DecoderResidualAdd> {
  public:

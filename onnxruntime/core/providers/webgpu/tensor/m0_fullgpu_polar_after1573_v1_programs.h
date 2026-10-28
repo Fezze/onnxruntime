@@ -3,6 +3,7 @@
 #pragma once
 #include "core/providers/webgpu/webgpu_kernel.h"
 #include "core/providers/webgpu/shader_helper.h"
+#include "m0_fullgpu_trig_v1.h"
 
 namespace onnxruntime::webgpu::m0_polar_detail {
 inline void ValidOutput(ShaderHelper& s, const ShaderVariableHelper& e) {
@@ -62,7 +63,7 @@ class Guard final : public Program<Guard> {
 };
 class Polar final : public Program<Polar> {
  public:
-  Polar() : Program{"RW07Original1575Through1597PolarTimeWindowV2"} {}
+  Polar() : Program{"RW07Original1575Through1597PolarTimeWindowV3"} {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"input_capacity", ProgramUniformVariableDataType::Uint32},
       {"output_capacity", ProgramUniformVariableDataType::Uint32},
@@ -76,6 +77,7 @@ class Polar final : public Program<Polar> {
     const auto& e = s.AddInput("extent", ShaderUsage::UseValueTypeAlias);
     const auto& y = s.AddOutput("polar", ShaderUsage::UseValueTypeAlias);
     ValidOutput(s, e);
+    s.AdditionalImplementation() << m0_trig_detail::Atan;
     s.AdditionalImplementation() << R"WGSL(
 fn original_f32_from_bits(bits:u32)->f32 {return bitcast<f32>(bits);}
 fn square(x:f32)->f32 {
@@ -96,7 +98,7 @@ fn original_atan(x:f32)->f32 {
  let bits=bitcast<u32>(x);let a=bits&0x7fffffffu;
  if(a>0x7f800000u){return original_f32_from_bits(0x7fc00000u);}
  if(a==0x7f800000u){return bitcast<f32>((bits&0x80000000u)|0x3fc90fdbu);}
- if(a==0u){return x;}return atan(x);
+ if(a==0u){return x;}return rw07_atan(x);
 }
 )WGSL";
     auto& f = s.MainFunctionBody();

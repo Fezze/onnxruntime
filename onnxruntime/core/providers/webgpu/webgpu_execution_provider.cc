@@ -480,6 +480,9 @@ KernelCreateInfo CreateM0FullGpuPredictorResidualTerminalPacketV1KernelInfo();
 KernelCreateInfo CreateM0PredictorLstmZeroStateV1KernelInfo();
 KernelCreateInfo CreateM0FullGpuSTFT1573DiagnosticV1KernelInfo();
 KernelCreateInfo CreateM0FullGpuSignalAfter1487ExtentV1KernelInfo();
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+KernelCreateInfo CreateM0QualificationSignalProgramProbeV1KernelInfo();
+#endif
 KernelCreateInfo CreateM0FullGpuSignalAfter1487TerminalPacketV1KernelInfo();
 KernelCreateInfo CreateM0FullGpuSTFT1573ExtentV1KernelInfo();
 KernelCreateInfo CreateM0BertEmbeddingMaskV1KernelInfo();
@@ -563,6 +566,9 @@ std::unique_ptr<KernelRegistry> RegisterKernels(bool enable_graph_capture, bool 
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0PredictorLstmZeroStateV1KernelInfo()));
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuSTFT1573DiagnosticV1KernelInfo()));
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuSignalAfter1487ExtentV1KernelInfo()));
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0QualificationSignalProgramProbeV1KernelInfo()));
+#endif
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuSignalAfter1487TerminalPacketV1KernelInfo()));
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0FullGpuSTFT1573ExtentV1KernelInfo()));
   ORT_THROW_IF_ERROR(kernel_registry->Register(CreateM0BertEmbeddingMaskV1KernelInfo()));
@@ -1053,6 +1059,12 @@ std::unique_ptr<profiling::EpProfiler> WebGpuExecutionProvider::GetProfiler() {
 }
 
 Status WebGpuExecutionProvider::OnRunStart(const onnxruntime::RunOptions& run_options) {
+  if(context_.M0HostCosts().Enabled()){
+    LOGS_DEFAULT(INFO)<<"M0_RW07_HOST_COSTS boundary=run_begin timeline="<<recording_.get()
+      <<" session="<<run_options.config_options.GetConfigOrDefault("m0.fullgpu.actual_session_v2","0")
+      <<" run="<<run_options.config_options.GetConfigOrDefault("m0.fullgpu.actual_run_v2","0")
+      <<" scope=context_lifetime inclusive_nested=1 counters="<<context_.M0HostCosts().Json();
+  }
   const bool strict_ownership = run_options.config_options.GetConfigOrDefault("m0.fullgpu.extent_ownership_v2", "0") == "1";
   const auto bounded=run_options.config_options.GetConfigOrDefault("m0.fullgpu.bounded_submissions_v1","0");
   ORT_RETURN_IF_NOT(bounded=="0"||bounded=="1","RW07 invalid native submission profile");
@@ -1261,6 +1273,7 @@ Status WebGpuExecutionProvider::OnRunEnd(bool sync_stream, const onnxruntime::Ru
   bool m0_end_scope_pending = context_.ValidationMode() >= ValidationMode::Basic;
   auto m0_end_failure = gsl::finally([&]() noexcept {
     if (!strict_ownership || m0_end_committed) return;
+    recording_->M0ReleaseUniformUploadsV1();
     try { context_.M0OwnershipV2().LogWorkload("failed_run_end"); } catch (...) {}
     context_.M0OwnershipV2().Poison();
     graph_buffer_mgr_active_ = false;
@@ -1302,10 +1315,27 @@ Status WebGpuExecutionProvider::OnRunEnd(bool sync_stream, const onnxruntime::Ru
   Status flush_status = strict_ownership
       ? context_.FlushAndWaitChecked(BufferManager(), *recording_, m0_fault_mode_v2_ == 22)
       : context_.Flush(BufferManager(), *recording_);
+  // Workspace recycling is confined to this Run; terminal publication/failure
+  // retains no arena, even though ordinary checked windows reuse its backing.
+  recording_->M0ReleaseUniformUploadsV1();
+  if(context_.M0HostCosts().Enabled()){
+    LOGS_DEFAULT(INFO)<<"M0_RW07_HOST_COSTS boundary=run_end timeline="<<recording_.get()
+      <<" session="<<run_options.config_options.GetConfigOrDefault("m0.fullgpu.actual_session_v2","0")
+      <<" run="<<run_options.config_options.GetConfigOrDefault("m0.fullgpu.actual_run_v2","0")
+      <<" scope=context_lifetime inclusive_nested=1 success="<<flush_status.IsOK()<<" counters="<<context_.M0HostCosts().Json();
+  }
   if (strict_ownership && flush_status.IsOK()) {
     LOGS_DEFAULT(INFO) << "M0_RW07_RUN_QUEUE_COMPLETE timeline=" << recording_.get()
       << " uniform_arena_uploads=" << recording_->m0_uniform_arena_uploads
-      << " uniform_arena_bytes=" << recording_->m0_uniform_arena_bytes;
+      << " uniform_arena_bytes=" << recording_->m0_uniform_arena_bytes
+      << " uniform_arena_allocations=" << recording_->m0_uniform_arena_allocations
+      << " uniform_arena_recycled=" << recording_->m0_uniform_arena_recycled;
+    if(const auto* cache=context_.M0ArtifactCacheV1()){
+      const auto cached=cache->Snapshot();
+      LOGS_DEFAULT(INFO)<<"M0_RW07_DAWN_ARTIFACT_CACHE scope=process_lifetime"
+          <<" hits="<<cached.hits<<" misses="<<cached.misses<<" stores="<<cached.stores
+          <<" corrupt="<<cached.corrupt<<" evicted="<<cached.evicted<<" loaded_bytes="<<cached.bytes_loaded;
+    }
     context_.M0OwnershipV2().LogWorkload("checked_run_end");
     const auto stats = context_.M0OwnershipV2().Statistics();
     LOGS_DEFAULT(INFO) << "M0_RW07_RESOURCE_REQUESTS phase=checked_end session="

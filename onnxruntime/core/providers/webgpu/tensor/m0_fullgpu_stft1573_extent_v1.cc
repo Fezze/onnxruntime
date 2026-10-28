@@ -26,7 +26,6 @@ using m0_stft_detail::OriginalWindow;
 using m0_stft_detail::Roots;
 using m0_stft_detail::OwnedStftGuard;
 using m0_stft_detail::ValidSpectrum;
-using m0_stft_detail::OwnedStftData;
 class OwnedStft final : public WebGpuKernel {
  public:
   explicit OwnedStft(const OpKernelInfo& info) : WebGpuKernel{info},
@@ -49,19 +48,14 @@ class OwnedStft final : public WebGpuKernel {
     const uint64_t elements = uint64_t(capacity_) * 22;
     const uint64_t limit = limits.maxComputeWorkgroupsPerDimension;
     ORT_RETURN_IF_NOT(limits.maxStorageBuffersPerShaderStage >= 5 && limits.maxComputeWorkgroupSizeX >= 64 &&
-                          limits.maxComputeInvocationsPerWorkgroup >= 64 && limit > 0 &&
+                          limits.maxComputeInvocationsPerWorkgroup >= m0_stft_detail::kOriginalBluesteinFftSamplesV1 &&
+                          limits.maxComputeWorkgroupStorageSize>=m0_stft_detail::kOriginalBluesteinWorkgroupBytesV1 && limit > 0 &&
                           elements <= UINT32_MAX && elements * sizeof(float) <= limits.maxBufferSize,
                       "RW07 owned STFT physical output/dispatch limits");
     const uint64_t alignment=limits.minStorageBufferOffsetAlignment;
     ORT_RETURN_IF_NOT(alignment>0&&alignment%sizeof(float)==0,"RW07 STFT window alignment");
-    const uint64_t prefix=alignment-sizeof(float);
-    ORT_RETURN_IF_NOT(prefix+22*sizeof(float)<=limits.maxStorageBufferBindingSize,"RW07 STFT minimum time window binding");
-    const uint64_t budget=std::min<uint64_t>(limits.maxStorageBufferBindingSize,
-        std::max<uint64_t>(8ull*1024*1024,prefix+22*sizeof(float)));
-    const uint32_t frames_per_window=static_cast<uint32_t>(std::min<uint64_t>(uint64_t(capacity_),
-        (budget-prefix)/(22*sizeof(float))));
-    const uint64_t groups=(uint64_t(frames_per_window)*11+63)/64;
-    ORT_RETURN_IF_NOT(frames_per_window>0&&groups<=limit*limit,"RW07 STFT time window dispatch limit");
+    const uint32_t frames_per_window=m0_stft_detail::StftFramesPerWindowV1(limits,uint32_t(capacity_));
+    ORT_RETURN_IF_NOT(frames_per_window>0,"RW07 STFT bounded work cohort");
     const uint32_t signal_capacity=uint32_t(x->Shape()[1]),frame_capacity=uint32_t(capacity_);
     const uint64_t session = c.KernelContext().M0FullGpuExtentOwnerEpochV1(), run = c.KernelContext().M0FullGpuExtentRunIdV2();
     M0FullGpuAllocationIdentity sid, data, pair;
@@ -111,16 +105,7 @@ class OwnedStft final : public WebGpuKernel {
         .AddOutput(Words(out)).SetWorkgroupSize(1).SetDispatchGroupSize(1)
         .AddUniformVariables({signal_capacity, frame_capacity, uint32_t(valid), span(source_words), span(words)});
     ORT_RETURN_IF_ERROR(c.RunProgram(guard));
-    for(uint32_t first=0;first<frame_capacity;first+=frames_per_window){
-      const uint32_t count=std::min(frames_per_window,frame_capacity-first);
-      const uint64_t current_groups=(uint64_t(count)*11+63)/64;
-      const uint64_t gx=std::min(current_groups,limit),gy=(current_groups+gx-1)/gx;
-      OwnedStftData data_program;
-      data_program.AddInput(signal_view(first,count)).AddInputs({{window,ProgramTensorMetadataDependency::None},Words(static_cast<const Tensor*>(out))})
-          .AddOutput(spectrum_view(first,count)).SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
-          .AddUniformVariables({signal_capacity,frame_capacity,first,count,uint32_t(signal_begin(first)),span(words)});
-      ORT_RETURN_IF_ERROR(c.RunProgram(data_program));
-    }
+    ORT_RETURN_IF_ERROR(m0_stft_detail::RunOwnedStftWindowsV1(c,*x,*window,*out,*y,span(words)));
     LOGS(c.Logger(), INFO) << "M0_RW07_STFT1573_EXTENT_V1 session=" << session << " run=" << run
         << " source_pair_valid=" << valid << " role=14 instance=1015 source_capacity=" << signal_capacity
         << " output_capacity=" << frame_capacity << " GPU_dispatches="<<(1+(frame_capacity+frames_per_window-1)/frames_per_window)

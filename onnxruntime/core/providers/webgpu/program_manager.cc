@@ -243,6 +243,7 @@ Status ProgramManager::Build(const ProgramBase& program,
                              std::vector<int>& shape_uniform_ranks,
                              wgpu::Future& future,
                              const std::shared_ptr<PipelineCallbackContext>& callback_context) const {
+  M0HostCostTimerV1 host_cost(webgpu_context_.M0HostCosts(),M0HostCostV1::ShaderBuildRequest);
   auto& device = webgpu_context_.Device();
   ShaderHelper shader_helper{program,
                              program_metadata,

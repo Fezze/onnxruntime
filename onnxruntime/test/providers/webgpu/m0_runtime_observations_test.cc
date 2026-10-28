@@ -2,14 +2,42 @@
 // Licensed under the MIT License.
 #if defined(ORT_M0_DESCRIPTOR_QUALIFICATION) && !defined(ORT_MINIMAL_BUILD)
 #include <limits>
+#include <thread>
 #include "gtest/gtest.h"
 #include "core/common/m0_memory_reserve_v1.h"
 #include "core/providers/webgpu/m0_fullgpu_resource_ownership.h"
+#include "core/providers/webgpu/m0_host_costs_v1.h"
 
 namespace onnxruntime::test {
 namespace {
 using webgpu::M0FullGpuResourceOwnership;
 using webgpu::M0WorkloadEventV1;
+
+TEST(M0RuntimeObservations, HostCostsSeparateNestedCategoriesAndDisabledScopes){
+  using namespace webgpu;
+  M0HostCostsV1 costs;
+  {M0HostCostTimerV1 timer(costs,M0HostCostV1::Allocation);}
+  costs.Observe(M0HostCostV1::Allocation,100);
+  EXPECT_EQ(costs.Read()[size_t(M0HostCostV1::Allocation)].calls,0u);
+  costs.Enable(true);
+  costs.Observe(M0HostCostV1::ProgramPrepare,100);
+  costs.Observe(M0HostCostV1::CompletionFence,30);
+  {M0HostCostTimerV1 timer(costs,M0HostCostV1::Allocation);}
+  const auto actual=costs.Read();
+  EXPECT_EQ(actual[size_t(M0HostCostV1::ProgramPrepare)].wall_ns,100u);
+  EXPECT_EQ(actual[size_t(M0HostCostV1::CompletionFence)].wall_ns,30u);
+  EXPECT_EQ(actual[size_t(M0HostCostV1::Allocation)].calls,1u);
+  EXPECT_NE(costs.Json().find("\"program_prepare\":{\"calls\":1,\"wall_ns\":100}"),std::string::npos);
+}
+
+TEST(M0RuntimeObservations, HostCostsPreserveConcurrentObservations){
+  using namespace webgpu;
+  M0HostCostsV1 costs(true);
+  const auto observe=[&](){for(size_t i=0;i<10000;++i)costs.Observe(M0HostCostV1::ShaderBuildRequest,7);};
+  std::thread first(observe),second(observe);first.join();second.join();
+  const auto actual=costs.Read()[size_t(M0HostCostV1::ShaderBuildRequest)];
+  EXPECT_EQ(actual.calls,20000u);EXPECT_EQ(actual.wall_ns,140000u);
+}
 
 TEST(M0RuntimeObservations, UniformPlanningIncludesRecordingAndPreparationLifetimes){
   EXPECT_EQ(M0NativePendingUniformBytesV1(false),17*512u);
@@ -137,7 +165,7 @@ TEST(M0RuntimeObservations, PlanningContinuesWhenOnlyQueuedSlackDoesNotFit) {
   const auto monitor=M0MemoryPlanningBudgetV1(available,future,minimum,false);
   EXPECT_LT(strict,minimum);
   EXPECT_GE(monitor,minimum);
-  EXPECT_EQ(monitor,available-kM0MemoryReserveBytesV1-future);
+  EXPECT_EQ(monitor,(available-future)/2);
 }
 
 TEST(M0RuntimeObservations, MissingHeadroomIsWarningNotArtificialCapacityRefusal) {
@@ -155,6 +183,42 @@ TEST(M0RuntimeObservations, LowRamRelaxesWarningReserveBeforeUsingHardwareOnlyCa
   EXPECT_EQ(M0MemoryPlanningBudgetV1(available,future,minimum,false),150u*1024*1024);
   EXPECT_LT(M0MemoryPlanningBudgetV1(available,future,minimum,true),minimum);
   EXPECT_EQ(M0MemoryPlanningBudgetV1(future+minimum,future,minimum,false),minimum);
+}
+
+TEST(M0RuntimeObservations, MoreAvailableMemoryNeverReducesSupportedMonitorWorkingSet) {
+  constexpr uint64_t mib=1024*1024,future=650*mib,minimum=119*mib;
+  uint64_t previous=minimum;
+  // Sweep both old reserve/slack switching thresholds, including individual
+  // bytes on either side. The working set must fit independently of queue slack.
+  for(uint64_t remaining=minimum;remaining<=2*kM0MemoryReserveBytesV1+2*minimum;remaining+=mib){
+    const auto target=M0MemoryPlanningBudgetV1(future+remaining,future,minimum,false);
+    EXPECT_GE(target,previous);EXPECT_GE(target,minimum);EXPECT_LE(target,remaining);
+    if(remaining>=2*minimum)EXPECT_LE(target,remaining/2);
+    previous=target;
+  }
+  for(const uint64_t center:{2*minimum,kM0MemoryReserveBytesV1+minimum,kM0MemoryReserveBytesV1+2*minimum}){
+    const auto left=M0MemoryPlanningBudgetV1(future+center-1,future,minimum,false);
+    const auto middle=M0MemoryPlanningBudgetV1(future+center,future,minimum,false);
+    const auto right=M0MemoryPlanningBudgetV1(future+center+1,future,minimum,false);
+    EXPECT_LE(left,middle);EXPECT_LE(middle,right);
+  }
+  // Actual tablet regression: more free RAM previously enabled a second queue
+  // allowance and reduced the supported whole-sentence duration instead.
+  constexpr uint64_t observed_future=649452931,observed_minimum=118707232;
+  const auto earlier=M0MemoryPlanningBudgetV1(1336692736,observed_future,observed_minimum,false);
+  const auto later=M0MemoryPlanningBudgetV1(1473048576,observed_future,observed_minimum,false);
+  EXPECT_GE(later,earlier);
+  EXPECT_EQ(later,(1473048576-observed_future)/2);
+}
+
+TEST(M0RuntimeObservations, EnforcedReserveRemainsIndependentOfMonitorCapacityFix) {
+  constexpr uint64_t future=649452931,minimum=118707232,reserve=kM0MemoryReserveBytesV1;
+  for(const uint64_t available:{uint64_t{0},future-1,future,future+reserve-1,future+reserve,
+      future+reserve+2*minimum-1,future+reserve+2*minimum,UINT64_MAX}){
+    const uint64_t headroom=available>=reserve&&future<=available-reserve?available-reserve-future:0;
+    const auto target=M0MemoryPlanningBudgetV1(available,future,minimum,true);
+    EXPECT_EQ(target,headroom/2);EXPECT_LE(target,headroom/2);
+  }
 }
 }  // namespace
 }  // namespace onnxruntime::test

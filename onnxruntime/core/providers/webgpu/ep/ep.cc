@@ -7,6 +7,7 @@
 #include <functional>
 #include "core/common/m0_observation_options_v1.h"
 #include "core/providers/webgpu/m0_numeric_trace_v1.h"
+#include "core/providers/webgpu/m0_fullgpu_extent_abi2.h"
 #include "core/providers/webgpu/compute_context.h"
 #include "core/providers/webgpu/allocator.h"
 #include "core/common/m0_ep_profiler_bridge_v1.h"
@@ -31,8 +32,8 @@ namespace ep {
 using onnxruntime::ep::Api;
 
 // Each EP owns its diagnostic buffer; no cross-session tensor or address cache.
-// Only unpaired FP32 outputs are covered in V1. Extent-bearing physical carriers
-// are explicitly skipped rather than treating inactive padding as audio data.
+// Paired FP32 carriers use authenticated GPU extents to exclude physical padding.
+// Only GPU-generated integer summaries cross the host boundary.
 class M0NumericTraceV1 final {
  public:
   explicit M0NumericTraceV1(WebGpuExecutionProvider& ep)
@@ -66,7 +67,7 @@ class M0NumericTraceV1 final {
       started_ = true; ++run_;
       file_ << "{\"event\":\"begin\",\"run\":" << run_
             << ",\"session\":\"" << session_ << "\",\"owner_run\":\"" << owner_run_
-            << "\",\"name_prefix_limit_bytes\":256,\"diagnostic_overhead\":true,\"scope\":\"unpaired_fp32_physical_outputs\"}\n";
+            << "\",\"name_prefix_limit_bytes\":256,\"diagnostic_overhead\":true,\"scope\":\"unpaired_fp32_and_paired_active_outputs\"}\n";
       file_.flush();
       ORT_RETURN_IF_NOT(file_.good(), "M0 numeric trace begin write failed");
     }
@@ -80,16 +81,35 @@ class M0NumericTraceV1 final {
       if (!tensor.DataRaw()) { row.skip = "unallocated"; rows_.push_back(std::move(row)); continue; }
       row.shape.assign(tensor.Shape().GetDims().begin(), tensor.Shape().GetDims().end());
       bool paired = false;
+      const Tensor* paired_extent=nullptr;
+      M0FullGpuAllocationIdentity paired_identity;
       for (const auto& other : outputs) {
         if (!other.DataRaw() || !other.IsDataType<uint32_t>() || other.Shape().Size() != 32) continue;
         M0FullGpuAllocationIdentity identity;
         if (ep_.BufferManager().M0OwnershipV2().DescribePair(
               reinterpret_cast<uintptr_t>(other.DataRaw()), reinterpret_cast<uintptr_t>(tensor.DataRaw()), identity)) {
-          paired = true; break;
+          paired = true; paired_extent=&other; paired_identity=identity; break;
         }
       }
+      const auto rank=tensor.Shape().NumDimensions();
+      const auto& limits=context.DeviceLimits();
+      bool active_supported=paired && paired_extent && rank>0 && rank<=kM0NumericTraceMaxRankV1 && tensor.Shape().Size()>0 &&
+          uint64_t(tensor.Shape().Size())<=UINT32_MAX && tensor.SizeInBytes()<=limits.maxStorageBufferBindingSize &&
+          tensor.SizeInBytes()<=limits.maxBufferSize && paired_extent->Location().device.Type()==OrtDevice::GPU &&
+          paired_identity.session==context.KernelContext().M0FullGpuExtentOwnerEpochV1() &&
+          paired_identity.run==context.KernelContext().M0FullGpuExtentRunIdV2();
+      std::array<uint32_t,kM0NumericTraceMaxRankV1> physical_shape{},physical_strides{};
+      uint64_t stride=1;
+      if(active_supported) for(size_t a=rank;a>0;){
+        --a;const auto dimension=tensor.Shape()[a];
+        if(dimension<=0||uint64_t(dimension)>UINT32_MAX){active_supported=false;break;}
+        physical_shape[a]=uint32_t(dimension);physical_strides[a]=uint32_t(stride);stride*=uint64_t(dimension);
+      }
+      const m0_extent_abi2::OpaqueOwnership owner{paired_identity.session,paired_identity.run,
+          paired_identity.generation,paired_identity.data_generation,paired_identity.producer_role,paired_identity.producer_instance};
+      active_supported=active_supported&&owner.Valid();
       const char* skip = M0NumericTraceSkipV1(tensor.Location().device.Type() == OrtDevice::GPU,
-                                             tensor.IsDataType<float>(), paired, tensor.Shape().Size(), hash_rows_);
+          tensor.IsDataType<float>(),paired,tensor.Shape().Size(),hash_rows_,active_supported);
       if (skip) { row.skip = skip; rows_.push_back(std::move(row)); continue; }
       if (!buffer_) {
         // Actual BufferManager admission/ownership/queue accounting remains active.
@@ -98,12 +118,22 @@ class M0NumericTraceV1 final {
       }
       const OrtMemoryInfo memory(WEBGPU_BUFFER, OrtDeviceAllocator, WebGpuDevice(ep_.GetDeviceId()), OrtMemTypeDefault);
       Tensor digest(DataTypeImpl::GetType<uint32_t>(), {kM0NumericTraceRowsV1 * kM0NumericTraceWordsV1}, buffer_.get(), memory);
-      M0NumericTraceProgramV1 program;
-      program.AddInput({&tensor, ProgramTensorMetadataDependency::None})
-          .AddOutput({&digest, ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64).SetDispatchGroupSize(1)
-          .AddUniformVariables({static_cast<uint32_t>(tensor.Shape().Size()), hash_rows_});
-      // Uses the actual context so cancellation and native dispatch admission are retained.
-      ORT_RETURN_IF_ERROR(context.RunProgram(program));
+      // Actual context preserves cancellation, ownership and dispatch admission.
+      if(paired){
+        const auto identity_words=owner.UniformWords();
+        M0NumericTraceActiveProgramV1 program;
+        program.AddInputs({{&tensor,ProgramTensorMetadataDependency::None},{paired_extent,ProgramTensorMetadataDependency::None}})
+            .AddOutput({&digest,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64).SetDispatchGroupSize(1)
+            .AddUniformVariables({uint32_t(rank),hash_rows_,gsl::span<const uint32_t>(physical_shape),
+                gsl::span<const uint32_t>(physical_strides),gsl::span<const uint32_t>(identity_words)});
+        ORT_RETURN_IF_ERROR(context.RunProgram(program));row.paired_active=true;
+      }else{
+        M0NumericTraceProgramV1 program;
+        program.AddInput({&tensor,ProgramTensorMetadataDependency::None})
+            .AddOutput({&digest,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64).SetDispatchGroupSize(1)
+            .AddUniformVariables({static_cast<uint32_t>(tensor.Shape().Size()),hash_rows_});
+        ORT_RETURN_IF_ERROR(context.RunProgram(program));
+      }
       row.hash_row = hash_rows_++; rows_.push_back(std::move(row));
       if (context.OpType() == "Transpose" && port == 0 && hash_rows_ < kM0NumericTraceRowsV1 && rows_.size() < 8192) {
         const auto* source = context.KernelContext().Input<Tensor>(0);
@@ -168,8 +198,13 @@ class M0NumericTraceV1 final {
       }
       else {
         const auto offset = row.hash_row * kM0NumericTraceWordsV1;
+        if(row.paired_active)file_<<",\"paired_active\":true";
+        if(row.paired_active&&digests[offset+3]==UINT32_MAX){
+          file_<<",\"skip\":\""<<(digests[offset+1]==2?"paired_logical_element_limit":"paired_invalid_extent")<<'"';
+        }else{
         file_ << ",\"xor\":" << digests[offset] << ",\"sum\":" << digests[offset + 1]
               << ",\"nonfinite\":" << digests[offset + 2] << ",\"elements\":" << digests[offset + 3];
+        }
       }
       file_ << "}\n";
     }
@@ -188,7 +223,7 @@ class M0NumericTraceV1 final {
     return result;
   }
   struct Row {
-    uint64_t ordinal = 0; size_t port = 0; uint32_t hash_row = 0; bool copy_check = false, copy_alias = false;
+    uint64_t ordinal = 0; size_t port = 0; uint32_t hash_row = 0; bool copy_check = false, copy_alias = false, paired_active = false;
     std::string node, op, skip; std::vector<int64_t> shape;
   };
   WebGpuExecutionProvider& ep_;

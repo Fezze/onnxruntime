@@ -306,6 +306,20 @@ TEST_F(M0SignalNumerics, LongToneMatchesOriginalCpuBeforeAndAfterSine) {
   Compare(std::vector<float>(514, 220.0f), 520);
 }
 
+TEST_F(M0SignalNumerics, OriginalSpeechPitchMatchesCpuWithExactPhaseAndPhysicalPadding) {
+  // Actual CPU node1487 output from the original model on document-002.
+  // The independent original CPU cut computes the phase/signal expectations.
+  const std::vector<uint32_t> words{
+#include "m0_signal_speech_f0_fixture_v1.inc"
+  };
+  std::vector<float> input;input.reserve(words.size());
+  for(const auto bits:words)input.push_back(std::bit_cast<float>(bits));
+  ASSERT_FALSE(input.empty());ASSERT_EQ(input.size()%2,0u);
+  ASSERT_TRUE(std::any_of(input.begin(),input.end(),[](float x){return x<0;}));
+  Compare(input,uint32_t(input.size()));
+  Compare(input,uint32_t(input.size()+1));
+}
+
 TEST_F(M0SignalNumerics, ReusedInterpolationCoefficientsPreserveEveryPhaseAndSignalBit){
   std::vector<std::vector<float>> cases{{0.0f,0.0f},{-0.0f,10.0f,10.0001f,-220.0f,24000.0f,1.0e10f},std::vector<float>(146),std::vector<float>(514,220.0f)};
   for(size_t i=0;i<cases[2].size();++i)cases[2][i]=i%19<3?0.0f:90.0f+float((i*37)%211)*0.25f;
@@ -844,18 +858,8 @@ class M0SpectrumNumerics : public M0SignalNumerics {
     Tensor x(DataTypeImpl::GetType<float>(),{1,sc},xb.get(),memory), y(DataTypeImpl::GetType<float>(),{1,capacity,11,2},yb.get(),memory);
     Tensor e(DataTypeImpl::GetType<uint32_t>(),{32},eb.get(),memory), w(DataTypeImpl::GetType<float>(),{20},wb.get(),memory);
     ASSERT_NO_FATAL_FAILURE(WithContext([&](ComputeContextBase& context){
-      const auto alignment=context.DeviceLimits().minStorageBufferOffsetAlignment;
       const auto words=gsl::span<const uint32_t>{identity.data(),identity.size()};
-      for(uint32_t first=0;first<capacity;first+=tile){
-        const auto count=std::min(tile,capacity-first),begin=5*first,samples=5*(count-1)+20;
-        m0_stft_detail::OwnedStftData program;
-        program.AddInput(ProgramInput::FloatBufferWindow(&x,ProgramTensorMetadataDependency::None,TensorShape{samples},begin,alignment))
-          .AddInputs({{&w,ProgramTensorMetadataDependency::None},{&e,ProgramTensorMetadataDependency::None}})
-          .AddOutput(ProgramOutput::FloatBufferWindow(&y,ProgramTensorMetadataDependency::None,TensorShape{count,11,2},22*first,alignment))
-          .SetWorkgroupSize(64).SetDispatchGroupSize((11*count+63)/64)
-          .AddUniformVariables({sc,capacity,first,count,begin,words});
-        ASSERT_STATUS_OK(context.RunProgram(program));
-      }
+      ASSERT_STATUS_OK(m0_stft_detail::RunOwnedStftWindowsV1(context,x,w,e,y,words,tile));
     }));
     Ep().BufferManager().Download(Ep().Recording(),yb.get(),result.data(),result.size()*4);
     output.assign(result.begin(),result.begin()+22*frames);
@@ -937,6 +941,47 @@ class M0SpectrumNumerics : public M0SignalNumerics {
   }
 };
 
+TEST(M0StftWindowBudget, DeviceStorageCohortBindingAndGridDetermineEveryWindow) {
+  wgpu::Limits limits{};
+  limits.maxComputeWorkgroupSizeX=limits.maxComputeInvocationsPerWorkgroup=m0_stft_detail::kOriginalBluesteinFftSamplesV1;
+  limits.maxComputeWorkgroupsPerDimension=65535;limits.minStorageBufferOffsetAlignment=256;
+  limits.maxBufferSize=limits.maxStorageBufferBindingSize=uint64_t{1}<<27;
+  constexpr auto bytes=m0_stft_detail::kOriginalBluesteinWorkgroupBytesV1;
+  for(const uint32_t count:{1u,2u,7u,31u,63u}){
+    limits.maxComputeWorkgroupStorageSize=count*bytes;
+    EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441),count);
+    EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,1),1u);
+    EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441,1),1u);
+    EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,0),0u);
+    EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441,0),0u);
+  }
+  limits.maxComputeWorkgroupStorageSize=bytes-1;
+  EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441),0u);
+  limits.maxComputeWorkgroupStorageSize=63*bytes;
+  limits.minStorageBufferOffsetAlignment=4;limits.maxStorageBufferBindingSize=3*22*sizeof(float);
+  EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441),3u);
+  limits.maxBufferSize=22*sizeof(float);
+  EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441),1u);
+  limits.maxBufferSize=22*sizeof(float)-1;
+  EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441),0u);
+  limits.maxBufferSize=limits.maxStorageBufferBindingSize=uint64_t{1}<<27;
+  limits.maxComputeWorkgroupsPerDimension=1;
+  EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441),1u);
+  limits.maxComputeWorkgroupsPerDimension=0;
+  EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441),0u);
+  limits.maxComputeWorkgroupsPerDimension=65535;
+  limits.maxComputeWorkgroupSizeX=m0_stft_detail::kOriginalBluesteinFftSamplesV1-1;
+  EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441),0u);
+  limits.maxComputeWorkgroupSizeX=m0_stft_detail::kOriginalBluesteinFftSamplesV1;
+  limits.maxComputeInvocationsPerWorkgroup=m0_stft_detail::kOriginalBluesteinFftSamplesV1-1;
+  EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441),0u);
+  limits.maxComputeInvocationsPerWorkgroup=m0_stft_detail::kOriginalBluesteinFftSamplesV1;
+  limits.maxComputeWorkgroupsPerDimension=65535;limits.minStorageBufferOffsetAlignment=0;
+  EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441),0u);
+  limits.minStorageBufferOffsetAlignment=3;
+  EXPECT_EQ(m0_stft_detail::StftFramesPerWindowV1(limits,34441),0u);
+}
+
 TEST_F(M0SpectrumNumerics, StftMatchesOriginalAtShortestAndHelloLength) {
   for(const uint32_t frames:{121u,8761u}){
     const auto input=SignalInput(frames);std::vector<float> cpu,gpu;
@@ -950,7 +995,7 @@ TEST_F(M0SpectrumNumerics, StftCapacityAndTimeWindowsPreserveSamples) {
   ASSERT_NO_FATAL_FAILURE(Stft(input,121,121,exact));
   ASSERT_NO_FATAL_FAILURE(Stft(input,120*232+1,120*232+1,padded));
   ASSERT_NO_FATAL_FAILURE(Close(padded,exact));
-  ASSERT_NO_FATAL_FAILURE(Stft(input,120*258+1,997,split));
+  ASSERT_NO_FATAL_FAILURE(Stft(input,120*258+1,7,split));
   ASSERT_NO_FATAL_FAILURE(Close(split,exact));
 }
 TEST_F(M0SpectrumNumerics, PolarMatchesOriginalQuadrantsAndZero) {
@@ -1516,7 +1561,10 @@ TEST(M0RecurrenceMemoryPlan, ResidualFixedScratchCoversWiderActivationWindowsAnd
     EXPECT_GE(M0NativeResidualFixedScratchBytesV1(channels,true),actual_fixed);
     for(uint32_t duration:{1024u,4096u}){
       const uint64_t outputs=uint64_t(channels)*20*duration*4+15+128;
-      EXPECT_EQ(plan.PeakBytes(duration),2*outputs+M0NativeResidualFixedScratchBytesV1(channels,M0OutputChannelTiledConvV1())+
+      // The output and descriptor stay live alongside two independent full
+      // temporary carriers, each with its own 16-byte allocation alignment tail.
+      const uint64_t temporary_carriers=2*(uint64_t(channels)*20*duration*sizeof(float)+15);
+      EXPECT_EQ(plan.PeakBytes(duration),outputs+temporary_carriers+M0NativeResidualFixedScratchBytesV1(channels,M0OutputChannelTiledConvV1())+
         M0NativePendingUniformBytesV1());
     }
   }
@@ -1684,7 +1732,7 @@ class M0RecurrenceProjection : public M0SpectrumNumerics {
   Ep().SetLogger(&DefaultLoggingManager().DefaultLogger());
   }
 
-  void UniformUploads(bool force_admission_drain,bool small_initial_block=false){
+  void UniformUploads(bool force_admission_drain,bool small_initial_block=false,bool checked_windows=false){
     ASSERT_TRUE(M0BatchHeavyProgramsV1());
     ASSERT_NO_FATAL_FAILURE(BoundedProvider());
     std::vector<uint32_t> values(320,0xffffffffu);
@@ -1698,7 +1746,17 @@ class M0RecurrenceProjection : public M0SpectrumNumerics {
     ASSERT_STATUS_OK(options.config_options.AddConfigEntry("m0.fullgpu.bounded_submissions_v1","1"));
     ASSERT_STATUS_OK(Ep().OnRunStart(options));
     const auto budget=recording.m0_submission_budget_bytes,uploads=recording.m0_uniform_arena_uploads;
+    const auto arena_allocations=recording.m0_uniform_arena_allocations;
+    const auto recycled=recording.m0_uniform_arena_recycled;
     bool active=true;auto cleanup=gsl::finally([&](){if(active)ORT_IGNORE_RETURN_VALUE(Ep().OnRunEnd(true,options));});
+    // The bounded upload must own its CPU snapshot and survive admission of
+    // deduplicated shader references. Keep one output word as a transfer canary.
+    for(uint32_t i=0;i<values.size();++i)values[i]=0x80000000u|i;
+    Ep().BufferManager().Upload(recording,values.data(),buffer.get(),values.size()*sizeof(uint32_t));
+    EXPECT_TRUE(recording.has_unsubmitted_work.load());
+    const uint64_t transfer_bytes=recording.m0_queued_reference_bytes;
+    EXPECT_GT(transfer_bytes,0u);
+    std::fill(values.begin(),values.end(),0u);
     if(small_initial_block){
       auto raw=Ep().BufferManager().Create(recording,1024,wgpu::BufferUsage::CopyDst|wgpu::BufferUsage::Uniform);
       auto rollback=gsl::finally([&](){if(raw)Ep().BufferManager().Release(raw,&recording);});
@@ -1706,13 +1764,16 @@ class M0RecurrenceProjection : public M0SpectrumNumerics {
       raw=nullptr;
     }
     ASSERT_NO_FATAL_FAILURE(WithContext([&](ComputeContextBase& context){
-      for(uint32_t i=0;i<320;++i){
+      for(uint32_t i=0;i+1<values.size();++i){
         const std::array<uint32_t,4> tag{i+100,i+200,i+300,i+400};
         M0UniformProbeProgram program;
         program.AddOutput({&output,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64).SetDispatchGroupSize(1)
           .AddUniformVariables({i,7u*i+3u,gsl::span<const uint32_t>{tag.data(),tag.size()}});
         if(force_admission_drain&&i%31==7)recording.m0_submission_budget_bytes=recording.m0_queued_reference_bytes;
-        ASSERT_STATUS_OK(context.RunProgram(program));
+        if(checked_windows)ASSERT_STATUS_OK(context.RunProgramWithCheckedCompletion(program));
+        else ASSERT_STATUS_OK(context.RunProgram(program));
+        if(i==0&&!checked_windows)EXPECT_EQ(recording.m0_queued_reference_bytes,
+            transfer_bytes+recording.m0_unique_queued_buffers.Bytes());
         recording.m0_submission_budget_bytes=budget;
         // Even with the smallest legal alignment, 33 records exceed 1024 bytes.
         // This proves exhaustion submitted before the ordinary 128-command limit.
@@ -1721,11 +1782,18 @@ class M0RecurrenceProjection : public M0SpectrumNumerics {
     }));
     const auto ended=Ep().OnRunEnd(true,options);active=false;ASSERT_STATUS_OK(ended);
     const auto writes=recording.m0_uniform_arena_uploads-uploads;
-    EXPECT_GT(writes,0u);EXPECT_LT(writes,80u);
+    EXPECT_GT(writes,0u);
+    if(checked_windows){
+      EXPECT_EQ(writes,values.size()-1);
+      EXPECT_EQ(recording.m0_uniform_arena_allocations-arena_allocations,1u);
+      EXPECT_EQ(recording.m0_uniform_arena_recycled-recycled,values.size()-1);
+    }else EXPECT_LT(writes,80u);
     EXPECT_TRUE(recording.m0_uniform_batches.empty());EXPECT_FALSE(recording.m0_uniform_current);
+    EXPECT_FALSE(recording.m0_uniform_retired);
     EXPECT_EQ(WebGpuContextFactory::GetContext(0).M0OwnershipV2().Statistics().live_allocations,allocations);
     Ep().BufferManager().Download(recording,buffer.get(),values.data(),values.size()*sizeof(uint32_t));
-    for(uint32_t i=0;i<320;++i)EXPECT_EQ(values[i],(7u*i+3u)^(i+100u)^(i+400u))<<i;
+    for(uint32_t i=0;i+1<values.size();++i)EXPECT_EQ(values[i],(7u*i+3u)^(i+100u)^(i+400u))<<i;
+    EXPECT_EQ(values.back(),0x80000000u|uint32_t(values.size()-1));
   }
 
   using Result=std::array<std::vector<float>,3>;
@@ -1952,6 +2020,9 @@ TEST_F(M0RecurrenceProjection, UniformArenaPreservesChangingValuesAcrossSubmissi
 TEST_F(M0RecurrenceProjection, UniformArenaOwnsCommandPreparedAcrossAdmissionDrain){
   ASSERT_NO_FATAL_FAILURE(UniformUploads(true));
 }
+TEST_F(M0RecurrenceProjection, CheckedWindowsReuseOneArenaWithoutChangingUniformValues){
+  ASSERT_NO_FATAL_FAILURE(UniformUploads(false,false,true));
+}
 TEST_F(M0RecurrenceProjection, UniformArenaSubmitsFullBlockBeforeAllocatingAnother){
   ASSERT_NO_FATAL_FAILURE(UniformUploads(false,true));
 }
@@ -2152,12 +2223,14 @@ TEST_F(M0RecurrenceProjection, DecoderConvolutionSharedPredicateRetainsSplitAccu
 TEST_F(M0RecurrenceProjection, DecoderFiniteWindowsKeepSerialSeedsNearestPaddingExceptionsAndCanaries){
   constexpr uint32_t inputs=67,outputs=9,rows=5,offset=4;
   const OrtMemoryInfo memory(WEBGPU_BUFFER,OrtDeviceAllocator,WebGpuDevice(0),OrtMemTypeDefault);
-  for(uint32_t scenario=0;scenario<3;++scenario)for(uint32_t fault=0;fault<9;++fault){
+  for(uint32_t scenario=0;scenario<5;++scenario)for(uint32_t fault=0;fault<9;++fault){
     SCOPED_TRACE(scenario);
     SCOPED_TRACE(fault);
-    const uint32_t capacity=scenario==0?1u:scenario==1?17u:65u;
-    const uint32_t length=scenario==0?1u:scenario==1?8u:63u,width=scenario==0?1u:3u;
-    const bool nearest=scenario==1,bias_enabled=scenario!=0;
+    // Two four-time workgroups plus an odd tail force groups spanning two rows
+    // to own disjoint suffix/prefix intervals rather than the complete row.
+    const uint32_t capacity=scenario==0?1u:scenario==1?17u:scenario==2?65u:2u*64u*4u+1u;
+    const uint32_t length=scenario==0?1u:scenario==1?8u:scenario==2?63u:capacity-2u,width=scenario==0?1u:3u;
+    const bool nearest=scenario==1||scenario==4,bias_enabled=scenario!=0;
     const uint32_t source_capacity=nearest?(capacity+1)/2:capacity;
     std::vector<float> source(inputs*source_capacity),weights(outputs*inputs*width),bias(outputs);
     for(size_t i=0;i<source.size();++i)source[i]=float(int(i*37%97)-48)/64;
@@ -2181,13 +2254,13 @@ TEST_F(M0RecurrenceProjection, DecoderFiniteWindowsKeepSerialSeedsNearestPadding
       w(DataTypeImpl::GetType<float>(),{outputs,inputs,width},wb.get(),memory),
       b(DataTypeImpl::GetType<float>(),{outputs},bb.get(),memory),e(DataTypeImpl::GetType<uint32_t>(),{32},eb.get(),memory);
     std::vector<float> serial;
-    for(uint32_t variant:{0u,1u,2u}){
+    for(uint32_t variant:{0u,1u,2u,3u}){
       std::vector<float> actual(rows*capacity+16,-12345.0f);auto yb=Storage(actual.data(),actual.size()*4);
       Tensor y(DataTypeImpl::GetType<float>(),{1,rows,capacity},yb.get(),memory);
       ASSERT_NO_FATAL_FAILURE(WithContext([&](ComputeContextBase& context){
         for(uint32_t first:{0u,64u}){
           const uint32_t count=std::min(64u,inputs-first);
-          m0_decoder_stages::DecoderConvTile program(bias_enabled,variant!=0,variant==2);
+          m0_decoder_stages::DecoderConvTile program(bias_enabled,variant!=0,variant>=2,variant!=2);
           program.AddInput(ProgramInput::FloatBufferWindow(&x,ProgramTensorMetadataDependency::None,
               TensorShape{1,count,source_capacity},first*source_capacity,context.DeviceLimits().minStorageBufferOffsetAlignment))
             .AddInput({&w,ProgramTensorMetadataDependency::None});
@@ -2787,15 +2860,16 @@ TEST_F(M0GeneratorNormalization, UnsafeFiniteParallelRowsRetainSerialClassificat
 }
 class M0TrigProgram final : public Program<M0TrigProgram> {
  public:
-  M0TrigProgram() : Program{"M0ActualPortableTrigUnitV1"} {}
+  M0TrigProgram() : Program{"M0ActualPortableTrigUnitV2"} {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"count",ProgramUniformVariableDataType::Uint32});
   Status GenerateShaderCode(ShaderHelper& s) const override {
     const auto& x=s.AddInput("bits",ShaderUsage::UseValueTypeAlias);
     const auto& y=s.AddOutput("values",ShaderUsage::UseValueTypeAlias);
-    s.AdditionalImplementation()<<m0_trig_detail::Trig;
+    s.AdditionalImplementation()<<m0_trig_detail::Trig<<m0_trig_detail::Atan;
     s.MainFunctionBody()<<"if(global_idx>=uniforms.count){return;}let value=rw07_sincos(bitcast<f32>("
-      <<x.GetByOffset("global_idx")<<"));"<<y.SetByOffset("2u*global_idx","value.x")
-      <<y.SetByOffset("2u*global_idx+1u","value.y");
+      <<x.GetByOffset("global_idx")<<"));"<<y.SetByOffset("3u*global_idx","value.x")
+      <<y.SetByOffset("3u*global_idx+1u","value.y")
+      <<y.SetByOffset("3u*global_idx+2u","rw07_atan(bitcast<f32>("+x.GetByOffset("global_idx")+"))");
     return Status::OK();
   }
 };
@@ -2805,11 +2879,11 @@ class M0PortableTrig : public M0SpectrumNumerics {
   static float Float(uint32_t bits) {float x;std::memcpy(&x,&bits,sizeof(x));return x;}
   void CompareTrig(const std::vector<uint32_t>& bits) {
     ASSERT_FALSE(bits.empty());const uint32_t count=static_cast<uint32_t>(bits.size());
-    std::vector<float> result(2*count,-12345.0f);
+    std::vector<float> result(3*count,-12345.0f);
     auto xb=Storage(bits.data(),bits.size()*4),yb=Storage(result.data(),result.size()*4);
     const OrtMemoryInfo memory(WEBGPU_BUFFER,OrtDeviceAllocator,WebGpuDevice(0),OrtMemTypeDefault);
     Tensor x(DataTypeImpl::GetType<uint32_t>(),{count},xb.get(),memory);
-    Tensor y(DataTypeImpl::GetType<float>(),{count,2},yb.get(),memory);
+    Tensor y(DataTypeImpl::GetType<float>(),{count,3},yb.get(),memory);
     ASSERT_NO_FATAL_FAILURE(WithContext([&](ComputeContextBase& context){
       M0TrigProgram program;
       program.AddInput({&x,ProgramTensorMetadataDependency::None}).AddOutput({&y,ProgramTensorMetadataDependency::None})
@@ -2819,16 +2893,16 @@ class M0PortableTrig : public M0SpectrumNumerics {
     Ep().BufferManager().Download(Ep().Recording(),yb.get(),result.data(),result.size()*4);
     for(size_t i=0;i<bits.size();++i){
       const float x=Float(bits[i]);
-      if(!std::isfinite(x)){
-        ASSERT_TRUE(std::isnan(result[2*i]));ASSERT_TRUE(std::isnan(result[2*i+1]));continue;
-      }
-      const std::array<double,2> expected{std::sin(double(x)),std::cos(double(x))};
-      for(size_t component=0;component<2;++component){
-        const auto actual=result[2*i+component];
+      const std::array<double,3> expected{std::sin(double(x)),std::cos(double(x)),std::atan(double(x))};
+      for(size_t component=0;component<3;++component){
+        const auto actual=result[3*i+component];
+        if(std::isnan(expected[component])){ASSERT_TRUE(std::isnan(actual));continue;}
         ASSERT_TRUE(std::isfinite(actual)&&std::abs(double(actual)-expected[component])<=5e-7)
           <<"input bits="<<bits[i]<<" component="<<component<<" CPU="<<expected[component]<<" GPU="<<actual;
       }
-      if((bits[i]&0x7fffffffu)==0u){EXPECT_EQ(Bits(result[2*i]),bits[i]);EXPECT_EQ(result[2*i+1],1.0f);}
+      if((bits[i]&0x7fffffffu)==0u){
+        EXPECT_EQ(Bits(result[3*i]),bits[i]);EXPECT_EQ(result[3*i+1],1.0f);EXPECT_EQ(Bits(result[3*i+2]),bits[i]);
+      }
     }
   }
   void SpectralProjection(const std::vector<float>& magnitude,const std::vector<float>& phase,
@@ -2906,6 +2980,21 @@ TEST_F(M0PortableTrig, LargePhaseAndQuadrantNeighboursMatchCpu) {
       bits.push_back(Bits(value));bits.push_back(Bits(-value));}
   }
   for(uint32_t i=0;i<8192;++i){const float phase=float(i)*371.751f;bits.push_back(Bits(phase));bits.push_back(Bits(-phase));}
+  CompareTrig(bits);
+}
+TEST_F(M0PortableTrig, AtanReductionNeighboursAndDenseRatiosMatchCpu) {
+  std::vector<uint32_t> bits;
+  for(const double boundary:{std::sqrt(2.0)-1.0,std::sqrt(2.0)+1.0}){
+    const float center=static_cast<float>(boundary);
+    for(int neighbour=-8;neighbour<=8;++neighbour){
+      float value=center;
+      for(int i=0;i<std::abs(neighbour);++i)value=std::nextafter(value,neighbour<0?-INFINITY:INFINITY);
+      bits.push_back(Bits(value));bits.push_back(Bits(-value));
+    }
+  }
+  // Dense signed ratios across every range-reduction branch; spacing is a
+  // binary fraction so the reference input itself has no decimal conversion.
+  for(int numerator=-65536;numerator<=65536;++numerator)bits.push_back(Bits(float(numerator)/8192.0f));
   CompareTrig(bits);
 }
 TEST_F(M0PortableTrig, ActualSpectralProjectionMatchesOriginalCpuWithLargePhases) {
@@ -3149,6 +3238,8 @@ TEST_F(M0GeneratorUpsample, PartialChannelWindowsMatchWholeBufferAndOriginalCpu)
 
 TEST(M0NumericTrace, CoverageRefusesPaddingHostDtypesAndBoundOverruns) {
   EXPECT_EQ(M0NumericTraceSkipV1(true,true,false,65,0),nullptr);
+  EXPECT_EQ(M0NumericTraceSkipV1(true,true,true,kM0NumericTraceMaxElementsV1+1,0,true),nullptr);
+  EXPECT_STREQ(M0NumericTraceSkipV1(true,true,true,65,0,false),"paired_physical_padding");
   EXPECT_STREQ(M0NumericTraceSkipV1(true,true,true,65,0),"paired_physical_padding");
   EXPECT_STREQ(M0NumericTraceSkipV1(false,true,false,65,0),"host_output");
   EXPECT_STREQ(M0NumericTraceSkipV1(true,false,false,65,0),"non_fp32");
@@ -3205,6 +3296,73 @@ TEST_F(M0SignalNumerics, NumericTraceFingerprintsActualGpuBitsAndCountsNonfinite
     EXPECT_NE(original,check(input));
     input[count-1]=std::numeric_limits<float>::infinity();check(input);
     input[count-1]=std::bit_cast<float>(uint32_t{0x7fc00001u});check(input);
+  }
+}
+
+TEST_F(M0SignalNumerics, ActiveTraceExcludesPoisonedPaddingAndRejectsUntrustedExtents) {
+  auto& ep=Ep();ConfigOptions options;
+  Model metadata("active_trace_unit",false,DefaultLoggingManager().DefaultLogger());
+  auto& node=metadata.MainGraph().AddNode("active_trace","Identity","",{},{});
+  auto definition=KernelDefBuilder().SetName("Identity").Provider(kWebGpuExecutionProvider).SinceVersion(1).Build();
+  const std::unordered_map<int,OrtValue> initializers;const OrtValueNameIdxMap values;
+  const DataTransferManager transfers;const AllocatorMap allocators;
+  OpKernelInfo info(node,*definition,ep,initializers,values,transfers,allocators,options);
+  SignalTestKernel kernel(info);ComputeContextBase context(WebGpuContextFactory::GetContext(0),ep,kernel);
+  const OrtMemoryInfo memory(WEBGPU_BUFFER,OrtDeviceAllocator,WebGpuDevice(0),OrtMemTypeDefault);
+  const std::array<std::vector<uint32_t>,3> physical{{{129},{2,3,5},{2,1,1,2,1,1,3,5}}};
+  const std::array<std::vector<uint32_t>,3> logical{{{65},{2,2,3},{2,1,1,1,1,1,2,3}}};
+  for(size_t which=0;which<physical.size();++which){
+    const uint32_t rank=uint32_t(physical[which].size());SCOPED_TRACE(rank);
+    std::array<uint32_t,8> shape{},strides{};uint32_t size=1,count=1;
+    for(size_t a=rank;a>0;){--a;shape[a]=physical[which][a];strides[a]=size;size*=shape[a];count*=logical[which][a];}
+    std::array<uint32_t,10> identity{};for(uint32_t i=0;i<10;++i)identity[i]=i+1;
+    std::array<uint32_t,32> extent{};extent[0]=2;extent[1]=rank;extent[18]=count;extent[21]=63;
+    for(size_t a=0;a<rank;++a)extent[2+2*a]=logical[which][a];
+    std::copy(identity.begin(),identity.end(),extent.begin()+22);
+    std::vector<float> data(size,std::numeric_limits<float>::quiet_NaN());
+    std::vector<uint32_t> offsets(count);
+    for(uint32_t i=0;i<count;++i){
+      uint32_t remaining=i,offset=0;
+      for(size_t a=rank;a>0;){--a;const auto d=logical[which][a];offset+=(remaining%d)*strides[a];remaining/=d;}
+      offsets[i]=offset;data[offset]=float(i+1)*0.125f;
+    }
+    const auto fingerprint=[&](const std::array<uint32_t,32>& descriptor){
+      std::vector<uint32_t> output(12,0x12345678u);
+      auto xb=Storage(data.data(),data.size()*sizeof(float)),eb=Storage(descriptor.data(),sizeof(descriptor)),
+           yb=Storage(output.data(),output.size()*sizeof(uint32_t));
+      Tensor x(DataTypeImpl::GetType<float>(),{size},xb.get(),memory);
+      Tensor e(DataTypeImpl::GetType<uint32_t>(),{32},eb.get(),memory),y(DataTypeImpl::GetType<uint32_t>(),{12},yb.get(),memory);
+      M0NumericTraceActiveProgramV1 program;
+      program.AddInputs({{&x,ProgramTensorMetadataDependency::None},{&e,ProgramTensorMetadataDependency::None}})
+          .AddOutput({&y,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64).SetDispatchGroupSize(1)
+          .AddUniformVariables({rank,1u,gsl::span<const uint32_t>(shape),gsl::span<const uint32_t>(strides),
+              gsl::span<const uint32_t>(identity)});
+      ORT_THROW_IF_ERROR(context.RunProgram(program));
+      ep.BufferManager().Download(ep.Recording(),yb.get(),output.data(),output.size()*sizeof(uint32_t));
+      for(size_t i=0;i<output.size();++i)if(i<4||i>=8)EXPECT_EQ(output[i],0x12345678u)<<i;
+      return (std::array<uint32_t,4>{output[4],output[5],output[6],output[7]});
+    };
+    const auto check=[&]{
+      std::array<uint32_t,4> expected{};
+      for(uint32_t i=0;i<count;++i){const auto bits=std::bit_cast<uint32_t>(data[offsets[i]]);const auto h=M0NumericTraceMixV1(bits,i);
+        expected[0]^=h;expected[1]+=h;expected[2]+=uint32_t((bits&0x7fffffffu)>=0x7f800000u);++expected[3];}
+      EXPECT_EQ(fingerprint(extent),expected);
+    };
+    check();data[offsets.back()]=std::numeric_limits<float>::infinity();check();
+    data[offsets.back()]=std::bit_cast<float>(uint32_t{0x7fc00001u});check();
+    for(const uint32_t word:{0u,1u,3u,18u,19u,20u,21u,22u,31u}){
+      auto bad=extent;bad[word]^=0xffffffffu;
+      EXPECT_EQ(fingerprint(bad),(std::array<uint32_t,4>{0,1,0,UINT32_MAX}))<<word;
+    }
+    auto bad=extent;bad[2]=0;EXPECT_EQ(fingerprint(bad),(std::array<uint32_t,4>{0,1,0,UINT32_MAX}));
+    bad=extent;bad[2]=shape[0]+1;EXPECT_EQ(fingerprint(bad),(std::array<uint32_t,4>{0,1,0,UINT32_MAX}));
+    if(rank<8){bad=extent;bad[2+2*rank]=1;EXPECT_EQ(fingerprint(bad),(std::array<uint32_t,4>{0,1,0,UINT32_MAX}));}
+    if(rank==1){
+      // A descriptor exceeding the diagnostic work bound must not read the
+      // deliberately tiny carrier even when its shape uniform advertises room.
+      shape[0]=kM0NumericTraceMaxElementsV1+1;bad=extent;bad[2]=shape[0];bad[18]=shape[0];
+      EXPECT_EQ(fingerprint(bad),(std::array<uint32_t,4>{0,2,0,UINT32_MAX}));
+    }
   }
 }
 

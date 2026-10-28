@@ -85,4 +85,36 @@ fn rw07_sincos(x:f32)->vec2<f32> {
 fn rw07_sin(x:f32)->f32 {return rw07_sincos(x).x;}
 fn rw07_cos(x:f32)->f32 {return rw07_sincos(x).y;}
 )WGSL";
+
+// WGSL's builtin atan permits4096ULP: it cannot guarantee the original
+// absolute1e-4 operator tolerance. Reduce to |r|<=tan(pi/8), then evaluate
+// the alternating Taylor polynomial through r^19. Its truncation bound is
+// tan(pi/8)^21/21; FP32 evaluation is checked by the numerical test corpus.
+// https://www.w3.org/TR/WGSL/#floating-point-accuracy
+inline constexpr const char* Atan = R"WGSL(
+// A runtime bitcast permits nonfinite results; a WGSL constant expression does not.
+fn rw07_atan_f32(bits:u32)->f32 {return bitcast<f32>(bits);}
+fn rw07_atan(x:f32)->f32 {
+ let bits=bitcast<u32>(x);let magnitude=bits&0x7fffffffu;let sign=bits&0x80000000u;
+ if(magnitude>0x7f800000u){return rw07_atan_f32(0x7fc00000u);}
+ if(magnitude==0x7f800000u){return bitcast<f32>(sign|0x3fc90fdbu);}
+ // For |x|<2^-12, |atan(x)-x|<|x|^3/3. Preserve zeros/subnormals bitwise.
+ if(magnitude<0x39800000u){return x;}
+ // Rounded FLOAT values of sqrt(2)-1 and sqrt(2)+1, in dimensionless radians.
+ let tan_pi_over_eight=bitcast<f32>(0x3ed413cdu);
+ let tan_three_pi_over_eight=bitcast<f32>(0x401a827au);
+ let a=bitcast<f32>(magnitude);var r=a;var offset=0.0;
+ if(a>tan_three_pi_over_eight){
+  r=-1.0/a;offset=bitcast<f32>(0x3fc90fdbu);
+ }else if(a>tan_pi_over_eight){
+  r=(a-1.0)/(a+1.0);offset=bitcast<f32>(0x3f490fdbu);
+ }
+ let z=r*r;var p=-1.0/19.0;
+ p=p*z+1.0/17.0;p=p*z-1.0/15.0;p=p*z+1.0/13.0;
+ p=p*z-1.0/11.0;p=p*z+1.0/9.0;p=p*z-1.0/7.0;
+ p=p*z+1.0/5.0;p=p*z-1.0/3.0;
+ let reduced=r+(r*z)*p;let result=offset+reduced;
+ return bitcast<f32>(bitcast<u32>(result)|sign);
+}
+)WGSL";
 }  // namespace onnxruntime::webgpu::m0_trig_detail

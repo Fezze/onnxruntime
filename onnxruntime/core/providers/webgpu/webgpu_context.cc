@@ -7,6 +7,7 @@
 #include <memory>
 #include <limits>
 #include <mutex>
+#include <span>
 #include <string>
 #include <vector>
 #include "core/common/m0_memory_reserve_v1.h"
@@ -74,6 +75,7 @@ WebGpuContext::~WebGpuContext() = default;
 
 void WebGpuContext::Initialize(const WebGpuContextConfig& config) {
   std::call_once(init_flag_, [this, config]() {
+    m0_host_costs_.Enable(M0GpuOperatorProfileV1()||M0WorkloadObservationsV1());
     max_num_pending_dispatches_ = config.max_num_pending_dispatches;
     enable_robustness_ = config.enable_robustness;
     adapter_index_ = config.adapter_index;
@@ -300,6 +302,29 @@ void WebGpuContext::Initialize(const WebGpuContextConfig& config) {
       auto disabled_device_toggles = GetDisabledDeviceToggles();
       device_toggles_desc.disabledToggleCount = disabled_device_toggles.size();
       device_toggles_desc.disabledToggles = disabled_device_toggles.data();
+#if !defined(USE_EXTERNAL_DAWN)
+      wgpu::DawnCacheDeviceDescriptor artifact_cache_desc;
+      m0_dawn_artifact_cache_=M0DawnArtifactCacheV1::ProcessCache();
+      if(m0_dawn_artifact_cache_){
+        artifact_cache_desc.isolationKey="org.localtts.m0.compiled-artifacts.v1";
+        artifact_cache_desc.SetDawnLoadCacheDataCallback(
+            [](std::span<const std::byte> key,std::span<std::byte> value,
+               M0DawnArtifactCacheV1* cache)noexcept{
+              return cache->Load(key.size(),reinterpret_cast<const uint8_t*>(key.data()),
+                                 value.size(),reinterpret_cast<uint8_t*>(value.data()));
+            },
+            m0_dawn_artifact_cache_);
+        artifact_cache_desc.SetDawnStoreCacheDataCallback(
+            [](std::span<const std::byte> key,std::span<const std::byte> value,
+               M0DawnArtifactCacheV1* cache)noexcept{
+              cache->Store(key.size(),reinterpret_cast<const uint8_t*>(key.data()),
+                            value.size(),reinterpret_cast<const uint8_t*>(value.data()));
+            },
+            m0_dawn_artifact_cache_);
+        artifact_cache_desc.nextInChain=device_desc.nextInChain;
+        device_desc.nextInChain=&artifact_cache_desc;
+      }
+#endif
 #endif
 
       std::vector<wgpu::FeatureName> required_features = GetAvailableRequiredFeatures(adapter);
@@ -573,7 +598,10 @@ Status WebGpuContext::WaitForDeferredPipelineBuilds(CommandRecordingState& recor
                          << " program=" << build.name << " future=" << build.future.id
                          << " key=" << dispatch.program_key;
     }
-    Status wait_status = Wait(build.future);
+    Status wait_status = [&](){
+      M0HostCostTimerV1 cost(m0_host_costs_,M0HostCostV1::PipelineWait);
+      return Wait(build.future);
+    }();
     if (ValidationMode() >= ValidationMode::Full) {
       LOGS_DEFAULT(INFO) << "M0_RW07_PIPELINE_WAIT_END timeline=" << &recording
                          << " program=" << build.name << " future=" << build.future.id
@@ -678,6 +706,7 @@ Status WebGpuContext::RunWithCheckedCompletion(ComputeContextBase& context, cons
 }
 
 Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& program, uint64_t scheduled_products) {
+  M0HostCostTimerV1 host_cost(m0_host_costs_,M0HostCostV1::ProgramPrepare);
   ORT_RETURN_IF_NOT(scheduled_products<=kM0ScheduledProductsPerWindowV1,"RW07 dispatch scheduled-work limit");
   const auto& inputs = program.Inputs();
   const auto& outputs = program.Outputs();
@@ -971,6 +1000,7 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
   uint64_t uniform_offset=0;
   std::shared_ptr<webgpu::M0UniformUploadBatchV1> uniform_batch;
   if (uniform_buffer_total_size > 0) {
+    M0HostCostTimerV1 cost(m0_host_costs_,M0HostCostV1::UniformPrepare);
     std::vector<uint8_t> uniform_data_buffer(uniform_buffer_total_size);
     for (auto const& [uniform, offset] : uniform_and_offsets) {
       memcpy(uniform_data_buffer.data() + offset, uniform.data.data(), uniform.data.size());
@@ -994,6 +1024,7 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
         uniform_batch=std::make_shared<webgpu::M0UniformUploadBatchV1>(buffer_mgr,recording,raw,size_t(arena_capacity));
         raw=nullptr;
         recording.m0_uniform_current=uniform_batch;
+        ++recording.m0_uniform_arena_allocations;
       }
       uniform_offset=uniform_batch->packing.Append(uniform_data_buffer.data(),uniform_buffer_total_size,size_t(alignment));
       uniform_buffer=uniform_batch->buffer;
@@ -1427,6 +1458,7 @@ void WebGpuContext::EndProfiling(TimePoint /* tp */, profiling::Events& events) 
 void WebGpuContext::PushErrorScope(wgpu::ErrorFilter filter) { device_.PushErrorScope(filter); }
 
 Status WebGpuContext::PopErrorScope() {
+  M0HostCostTimerV1 host_cost(m0_host_costs_,M0HostCostV1::ErrorScopeWait);
   // A failed WaitAny does not cancel the callback. Let Dawn retain its result until it fires.
   struct ScopeResult { Status status; bool callback_exception = false; };
   auto result = std::make_shared<ScopeResult>();
@@ -1480,6 +1512,7 @@ bool WebGpuContext::M0DescribeStorageAllocationV1(uintptr_t handle,uint64_t requ
 }
 
 Status WebGpuContext::CheckDeviceStatus() const {
+  M0HostCostTimerV1 host_cost(m0_host_costs_,M0HostCostV1::DeviceStatusCheck);
   // Queue work-done and error-scope callbacks can both succeed on an already-lost device.
   // Poll the existing lost future without replacing externally supplied device callbacks.
   const auto wait_status = instance_.WaitAny(device_.GetLostFuture(), 0);
@@ -1493,14 +1526,20 @@ Status WebGpuContext::CheckDeviceStatus() const {
 Status WebGpuContext::M0DrainOnMemoryPressureV1(const webgpu::BufferManager& buffer_mgr,
                                               CommandRecordingState& recording,
                                               uint64_t allocation_bytes) {
-  if (!recording.m0_submission_budget_bytes) return M0CheckMemoryReserveV1(allocation_bytes);
+  if (!recording.m0_submission_budget_bytes){
+    M0HostCostTimerV1 cost(m0_host_costs_,M0HostCostV1::MemoryProbe);
+    return M0CheckMemoryReserveV1(allocation_bytes);
+  }
   ORT_RETURN_IF_NOT(M0BoundedSubmissionsActiveV1() && !M0OwnershipV2().Poisoned(),
                     "RW07 native allocation recording inactive or poisoned");
   const auto now=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count());
   if(!m0_memory_probe_window_.Probe(now,allocation_bytes)) return Status::OK();
   uint64_t available=0;
-  const auto reading=M0ReadMemoryAvailableV1(available);
+  const auto reading=[&](){
+    M0HostCostTimerV1 cost(m0_host_costs_,M0HostCostV1::MemoryProbe);
+    return M0ReadMemoryAvailableV1(available);
+  }();
   if(reading.IsOK() && M0MemoryPressureNeedsDrainV1(available,allocation_bytes) &&
       recording.has_unsubmitted_work.load(std::memory_order_relaxed)) {
     LOGS_DEFAULT(INFO) << "M0_RW07_MEMORY_PRESSURE_DRAIN phase=begin allocation_bytes=" << allocation_bytes
@@ -1508,6 +1547,7 @@ Status WebGpuContext::M0DrainOnMemoryPressureV1(const webgpu::BufferManager& buf
     ORT_RETURN_IF_ERROR(FlushAndWaitChecked(buffer_mgr, recording));
     LOGS_DEFAULT(INFO) << "M0_RW07_MEMORY_PRESSURE_DRAIN phase=done allocation_bytes=" << allocation_bytes;
   }
+  M0HostCostTimerV1 cost(m0_host_costs_,M0HostCostV1::MemoryProbe);
   return M0CheckMemoryReserveV1(allocation_bytes);
 }
 
@@ -1532,11 +1572,19 @@ Status WebGpuContext::M0BeforeEnqueueUniqueV1(const webgpu::BufferManager& buffe
   ORT_RETURN_IF_NOT(recording.m0_submission_budget_bytes&&M0BoundedSubmissionsActiveV1()&&!M0OwnershipV2().Poisoned(),
                     "RW07 unique queued buffer profile inactive or poisoned");
   auto& retained=recording.m0_unique_queued_buffers;
-  if(retained.NeedsDrain(recording.m0_submission_budget_bytes,references)){
+  ORT_RETURN_IF_NOT(recording.m0_queued_reference_bytes>=retained.Bytes(),
+                    "RW07 queued transfer accounting underflow");
+  // Upload/copy commands also retain backing buffers. They use conservative
+  // byte charges, which must survive the next deduplicated shader admission.
+  uint64_t transfers=recording.m0_queued_reference_bytes-retained.Bytes();
+  if(retained.NeedsDrain(recording.m0_submission_budget_bytes,references,transfers)){
     ORT_RETURN_IF_ERROR(FlushAndWaitChecked(buffer_mgr,recording));
+    transfers=0;
   }
   retained.Track(references);
-  recording.m0_queued_reference_bytes=retained.Bytes();
+  ORT_RETURN_IF_NOT(transfers<=std::numeric_limits<uint64_t>::max()-retained.Bytes(),
+                    "RW07 queued transfer accounting overflow");
+  recording.m0_queued_reference_bytes=transfers+retained.Bytes();
   return Status::OK();
 }
 
@@ -1552,6 +1600,7 @@ Status WebGpuContext::M0FlushIfBudgetReachedV1(const webgpu::BufferManager& buff
 Status WebGpuContext::FlushAndWaitChecked(const webgpu::BufferManager& buffer_mgr,
                                           CommandRecordingState& recording,
                                           bool diagnostic_zero_deadline) {
+  M0HostCostTimerV1 host_cost(m0_host_costs_,M0HostCostV1::CompletionFence);
   ORT_RETURN_IF_NOT(HasDevice(), "WebGPU checked completion requires a device.");
 
   PushErrorScope(wgpu::ErrorFilter::Internal);
@@ -1607,7 +1656,10 @@ Status WebGpuContext::FlushAndWaitChecked(const webgpu::BufferManager& buffer_mg
     }
     // A deadline refusal does not authorize retirement while work is pending.
     // Drain this same actual future before releasing the recording/resources.
-    const auto wait_status = Wait(future);
+    const auto wait_status = [&](){
+      M0HostCostTimerV1 cost(m0_host_costs_,M0HostCostV1::QueueCompletionWait);
+      return Wait(future);
+    }();
     if (diagnostic_zero_deadline) {
       LOGS_DEFAULT(INFO) << "M0_RW07_ACTUAL_QUEUE_DEADLINE_DRAIN checked=" << wait_status.IsOK()
                         << " queue_callback_ok=" << completion_status->IsOK();
@@ -1630,8 +1682,14 @@ Status WebGpuContext::FlushAndWaitChecked(const webgpu::BufferManager& buffer_mg
   record_failure(CheckDeviceStatus());
   if(recording.m0_submission_budget_bytes&&M0OwnershipV2().Poisoned())
     record_failure(ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07 native submission context already poisoned"));
-  if(result.IsOK()){recording.m0_queued_reference_bytes=0;recording.m0_queued_scheduled_products=0;recording.m0_unique_queued_buffers.Reset();}
-  else if(recording.m0_submission_budget_bytes)M0OwnershipV2().Poison();
+  if(result.IsOK()){
+    recording.m0_queued_reference_bytes=0;recording.m0_queued_scheduled_products=0;
+    recording.m0_unique_queued_buffers.Reset();
+    recording.M0RecycleUniformUploadsAfterCheckedCompletionV1();
+  }else{
+    recording.M0ReleaseUniformUploadsV1();
+    if(recording.m0_submission_budget_bytes)M0OwnershipV2().Poison();
+  }
   return result;
 }
 
@@ -1646,7 +1704,7 @@ Status WebGpuContext::Flush(const webgpu::BufferManager& buffer_mgr,
     }
   };
 
-  auto release_uniforms=gsl::finally([&](){recording.M0ReleaseUniformUploadsV1();});
+  auto release_uniforms=gsl::finally([&](){recording.M0RetireUniformUploadsV1();});
   for(const auto& batch:recording.m0_uniform_batches){
     if(!batch->packing.Sealed()){
       const auto& bytes=batch->packing.Bytes();
@@ -1730,6 +1788,7 @@ wgpu::BindGroup WebGpuContext::CreateBindGroup(const std::vector<WGPUBuffer>& bi
                                                uint64_t uniform_buffer_bytes,
                                                const wgpu::BindGroupLayout& bind_group_layout,
                                                std::string_view label) const {
+  M0HostCostTimerV1 host_cost(m0_host_costs_,M0HostCostV1::BindGroupCreate);
   ORT_ENFORCE(bind_buffers.size() == bind_buffers_segments.size() &&
                   bind_buffers.size() == bind_buffer_offsets.size() && bind_buffers.size() == bind_buffer_sizes.size() &&
                   (!uniform_buffer_bytes || !bind_buffers.empty()), "Invalid bind group buffer inventory.");

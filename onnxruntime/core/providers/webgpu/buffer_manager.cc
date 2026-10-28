@@ -5,6 +5,7 @@
 #include "core/providers/webgpu/buffer_manager.h"
 #include "core/providers/webgpu/webgpu_context.h"
 #include "core/common/m0_memory_reserve_v1.h"
+#include "core/common/m0_observation_options_v1.h"
 #include <gsl/gsl>
 
 namespace onnxruntime {
@@ -522,6 +523,7 @@ bool BufferManager::M0NonRetainingCachesV1() const {
 }
 
 void BufferManager::Upload(CommandRecordingState& recording, void* src, WGPUBuffer dst, size_t size) const {
+  M0HostCostTimerV1 host_cost(context_.M0HostCosts(),M0HostCostV1::Upload);
   LOGS_DEFAULT(INFO) << "M0_RW02_UPLOAD timeline=" << &recording << " bytes=" << size << " dst=" << dst;
   if(size==0)return;
   ORT_ENFORCE(src&&dst&&size<=std::numeric_limits<size_t>::max()-3,"Invalid GPU upload size or pointer.");
@@ -568,7 +570,11 @@ void BufferManager::Upload(CommandRecordingState& recording, void* src, WGPUBuff
     if(chunked){
       ORT_THROW_IF_ERROR(context_.FlushAndWaitChecked(*this,recording));
     }else{
-      ORT_THROW_IF_ERROR(context_.Flush(*this,recording));
+      // The encoder owns the immutable staging copy after this function returns.
+      // Native initialization/Run fences the complete bounded window; submitting
+      // every small initializer/feed separately only adds queue/driver overhead.
+      if(!recording.m0_submission_budget_bytes||!M0BatchHeavyProgramsV1())
+        ORT_THROW_IF_ERROR(context_.Flush(*this,recording));
       ORT_THROW_IF_ERROR(context_.M0FlushIfBudgetReachedV1(*this,recording));
     }
     offset+=payload;
@@ -609,6 +615,7 @@ void BufferManager::MemCpyRange(CommandRecordingState& recording,WGPUBuffer src,
 WGPUBuffer BufferManager::Create(CommandRecordingState& recording, size_t size, wgpu::BufferUsage usage,
                                  bool initialize_to_zero,
                                  bool submit_zero_initialize) const {
+  M0HostCostTimerV1 host_cost(context_.M0HostCosts(),M0HostCostV1::Allocation);
   size_t buffer_size;
   WGPUBuffer buffer;
   {
@@ -718,6 +725,7 @@ void BufferManager::Release(WGPUBuffer buffer, const CommandRecordingState* reco
 }
 
 void BufferManager::Download(CommandRecordingState& recording, WGPUBuffer src, void* dst, size_t size) const {
+  M0HostCostTimerV1 host_cost(context_.M0HostCosts(),M0HostCostV1::Download);
   LOGS_DEFAULT(INFO) << "M0_RW02_DOWNLOAD_BEGIN timeline=" << &recording << " bytes=" << size << " src=" << src;
   if(size>0){
     ORT_ENFORCE(src&&dst&&size<=std::numeric_limits<size_t>::max()-15,"Invalid GPU download size or pointer.");

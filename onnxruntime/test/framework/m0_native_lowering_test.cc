@@ -372,7 +372,7 @@ TEST_F(M0NumericTraceIntegration, RecordsRealLongShortLongOutputsAfterCheckedQue
   std::ifstream file(path);ASSERT_TRUE(file.good());
   std::array<std::map<std::pair<uint64_t,uint64_t>,Json>,3> runs;
   std::array<size_t,3> starts{},ends{};std::array<uint64_t,3> first_nonfinite{};
-  size_t skipped=0,copy_checks=0;uint64_t first_copy_mismatch=0;std::string line;
+  size_t skipped=0,copy_checks=0,paired_rows=0,invalid_paired=0;uint64_t first_copy_mismatch=0;std::string line;
   while(std::getline(file,line)){
     const auto row=Json::parse(line);const uint64_t run=row.at("run").get<uint64_t>();
     ASSERT_GE(run,1u);ASSERT_LE(run,3u);const size_t i=run-1;
@@ -385,7 +385,8 @@ TEST_F(M0NumericTraceIntegration, RecordsRealLongShortLongOutputsAfterCheckedQue
       EXPECT_EQ(row.at("omitted_outputs").get<size_t>(),0u);continue;
     }
     ASSERT_EQ(event,"output");
-    if(row.contains("skip")){++skipped;continue;}
+    if(row.contains("skip")){++skipped;if(row.at("skip")=="paired_invalid_extent")++invalid_paired;continue;}
+    if(row.value("paired_active",false))++paired_rows;
     if(row.contains("copy_mismatches")){
       ++copy_checks;
       if(row.at("copy_mismatches").get<uint64_t>()&&!first_copy_mismatch)
@@ -399,6 +400,7 @@ TEST_F(M0NumericTraceIntegration, RecordsRealLongShortLongOutputsAfterCheckedQue
   }
   for(size_t i=0;i<3;++i){EXPECT_EQ(starts[i],1u);EXPECT_EQ(ends[i],1u);EXPECT_FALSE(runs[i].empty());}
   EXPECT_GT(copy_checks,0u);
+  EXPECT_GT(paired_rows,0u);EXPECT_EQ(invalid_paired,0u);
   RecordProperty("first_transpose_copy_mismatch_ordinal",std::to_string(first_copy_mismatch));
   EXPECT_EQ(first_copy_mismatch,0u)<<"GPU transpose violated exact copy/permutation invariant";
   EXPECT_GT(skipped,0u); // Non-FP32/extent data must not be interpreted as floats.
@@ -411,7 +413,7 @@ TEST_F(M0NumericTraceIntegration, RecordsRealLongShortLongOutputsAfterCheckedQue
   }
   RecordProperty("first_changed_traced_ordinal",std::to_string(first_changed));
   for(size_t i=0;i<3;++i)RecordProperty("first_nonfinite_traced_run"+std::to_string(i+1),std::to_string(first_nonfinite[i]));
-  RecordProperty("trace_scope","unpaired_fp32_physical_outputs; padding and oversized outputs explicitly skipped");
+  RecordProperty("trace_scope","unpaired_fp32_and_paired_active_outputs; GPU-only extent validation/indexing; oversized diagnostics explicitly skipped");
   RecordProperty("pcm_difference",receipt.difference.SameBits()?"same_bits":"different_bits_diagnostic_only");
   // A trace test validates observation. It does not replace the original full
   // execution/PCM qualification or establish acceptable perceptual quality.

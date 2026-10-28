@@ -131,7 +131,7 @@ uint32_t M0FullGpuNativeLoweringOwnerV1::SelectPhysicalCapacity(M0NativeGpuModul
  const uint64_t planning_budget=M0MemoryPlanningBudgetV1(available_bytes,future_weights,minimum_peak);
  if(!reading.IsOK()||(planning_budget>=minimum_peak&&
     (available_bytes<kM0MemoryReserveBytesV1||future_weights>available_bytes-kM0MemoryReserveBytesV1||
-     minimum_peak>(available_bytes-kM0MemoryReserveBytesV1-future_weights)/2))) {
+     planning_budget>(available_bytes-kM0MemoryReserveBytesV1-future_weights)/2))) {
   LOGS_DEFAULT(WARNING)<<"M0_RW07_MEMORY_WARNING phase=capacity policy=monitor available_bytes="<<available_bytes
    <<" future_weight_bytes="<<future_weights<<" minimum_peak_bytes="<<minimum_peak
    <<" planning_budget_bytes="<<planning_budget;
@@ -150,9 +150,7 @@ uint32_t M0FullGpuNativeLoweringOwnerV1::SelectPhysicalCapacity(M0NativeGpuModul
   " minimum_peak_bytes=",memory.PeakBytes(1));
  memory_order=memory.Order();peak_bytes=memory.PeakBytes(low);
  const uint64_t remaining=available_bytes>=future_weights?available_bytes-future_weights:0;
- const uint64_t reserved=remaining>=kM0MemoryReserveBytesV1?remaining-kM0MemoryReserveBytesV1:0;
- const bool queued_slack=kM0EnforceMemoryReserveV1||minimum_peak<=reserved/2||
-  (minimum_peak>reserved&&minimum_peak<=remaining/2);
+ const bool queued_slack=kM0EnforceMemoryReserveV1||peak_bytes<=remaining/2;
  LOGS_DEFAULT(INFO)<<"M0_RW07_MEMORY_CAPACITY selected_duration="<<low<<" available_bytes="<<available_bytes
   <<" requested_ceiling="<<requested_ceiling<<" reserve_bytes="<<kM0MemoryReserveBytesV1<<" future_weight_bytes="<<future_weights
   <<" estimated_live_and_scratch_bytes="<<peak_bytes<<" queued_slack_bytes="<<(queued_slack?peak_bytes:0)

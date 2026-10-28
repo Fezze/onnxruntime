@@ -64,11 +64,16 @@ inline uint64_t M0MemoryPlanningBudgetV1(uint64_t available, uint64_t future, ui
                                        bool enforce = kM0EnforceMemoryReserveV1) {
   const uint64_t headroom = available >= kM0MemoryReserveBytesV1 &&
       future <= available - kM0MemoryReserveBytesV1 ? available - kM0MemoryReserveBytesV1 - future : 0;
-  if (enforce || minimum <= headroom / 2) return headroom / 2;
-  if (minimum <= headroom) return headroom;
+  if (enforce) return headroom / 2;
   const uint64_t remaining = available >= future ? available - future : 0;
-  if (minimum <= remaining / 2) return remaining / 2;
-  if (minimum <= remaining) return remaining;
+  // Monitor's reserve is a warning, not a smaller utterance limit. Reserve
+  // one active working set and one equally bounded queued working set from
+  // actual remaining memory. If only the minimum fits, retain that minimum;
+  // grow queue slack afterward instead of halving capacity at a threshold.
+  // This target is monotone whenever the detected memory can fit the model.
+  if (minimum <= remaining) return std::max(minimum, remaining / 2);
+  // Preserve the explicit monitor fallback when a useful reading/estimate is
+  // unavailable. Actual allocation, binding and queue checks still apply.
   return std::numeric_limits<uint64_t>::max();
 }
 

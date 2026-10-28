@@ -652,5 +652,22 @@ inline void RegisterM0FullGpuExtentSchemasV1() {
   ONNX_NAMESPACE::RegisterSchema(std::move(alignment_v2),0,true,true);
   ONNX_NAMESPACE::RegisterSchema(std::move(alignment), 0, true, true);
   ONNX_NAMESPACE::RegisterSchema(std::move(terminal), 0, true, true);
+#if defined(ORT_M0_DESCRIPTOR_QUALIFICATION)
+  // Standalone CPU-oracle Program tests. This domain is absent from the closed
+  // original-model lowering/catalog and cannot extend an owned native Run.
+  constexpr const char* probe_domain="org.localtts.m0.qualification";
+  ONNX_NAMESPACE::OpSchemaRegistry::DomainToVersionRange::Instance().AddDomainToVersion(probe_domain,1,1);
+  auto probe=OpSchema().SetName("SignalProgramProbeV1").SetDomain(probe_domain).SinceVersion(1)
+      .SetDoc("Isolated production signal/polar Programs; qualification only; no active native Run")
+      .Input(0,"x","Independent CPU-oracle input","tensor(float)")
+      .Input(1,"extent","Synthetic test descriptor, never an actual-model sidecar","tensor(uint32)")
+      .Input(2,"weight","Original signal weight","tensor(float)",OpSchema::Optional)
+      .Input(3,"bias","Original signal bias","tensor(float)",OpSchema::Optional)
+      .Output(0,"primary","Signal phase or polar output","tensor(float)")
+      .Output(1,"signal","Signal waveform for stage1","tensor(float)",OpSchema::Optional)
+      .Attr("stage","1:original signal;2:original polar;3:original STFT;5:isolated STFT input/guard summary",AttributeProto::INT)
+      .Attr("reuse_coefficients","Signal interpolation coefficient reuse",AttributeProto::INT,int64_t{1});
+  ONNX_NAMESPACE::RegisterSchema(std::move(probe),0,true,true);
+#endif
 }
 }  // namespace onnxruntime

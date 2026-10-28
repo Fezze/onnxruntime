@@ -624,9 +624,14 @@ M0NativeInitializedReceiptV1 M0NativeLoweringQualificationV1::InitializedExecuti
         // execution model, and restoration cannot revive the poisoned owner.
         auto execution=std::move(native.execution_model_);
         auto restore_execution=gsl::finally([&]()noexcept{native.execution_model_=std::move(execution);});
-        bool denied=false;
-        try{native.ValidateExecutionModel(&proof);}catch(const std::exception&){denied=true;}
-        ORT_ENFORCE(denied,"RW07_NATIVE_BOUNDARY_QUALIFICATION_MISSED_SUBSTITUTION");
+        bool initializer_denied=false,execution_denied=false;
+        try{native.ValidateInitializerPlan(*state,&proof);}catch(const std::exception& error){
+         initializer_denied=std::string(error.what()).find("RW07_NATIVE_BOUNDARY_SOURCE_SUBSTITUTION")!=std::string::npos;
+        }
+        try{native.ValidateExecutionModel(&proof);}catch(const std::exception& error){
+         execution_denied=std::string(error.what()).find("RW07_NATIVE_BOUNDARY_SOURCE_SUBSTITUTION")!=std::string::npos;
+        }
+        ORT_ENFORCE(initializer_denied&&execution_denied,"RW07_NATIVE_BOUNDARY_QUALIFICATION_MISSED_SUBSTITUTION");
        }
        ORT_ENFORCE(!native.active_source_boundary_&&native.phase_==M0FullGpuNativeLoweringOwnerV1::Phase::Poisoned,
         "RW07_NATIVE_BOUNDARY_QUALIFICATION_UNRETIRED_OR_REVIVED");

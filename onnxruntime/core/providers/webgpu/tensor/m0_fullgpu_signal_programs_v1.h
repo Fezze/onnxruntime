@@ -26,7 +26,7 @@ inline void ValidOutput(ShaderHelper& s, const ShaderVariableHelper& e) {
 
 class Prefix final : public Program<Prefix> {
  public:
-  Prefix() : Program{"RW07SignalOriginal1514Prefix1526V1"} {}
+  Prefix() : Program{"RW07SignalOriginal1514Prefix1526ExactV2"} {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"input_capacity", ProgramUniformVariableDataType::Uint32},
       {"output_capacity", ProgramUniformVariableDataType::Uint32},
@@ -38,10 +38,18 @@ class Prefix final : public Program<Prefix> {
     s.AdditionalImplementation() << ::rw07::DurationExactFp32;
     ValidOutput(s, e);
     auto& a = s.AdditionalImplementation();
-    a << "fn radians(h:u32,t:u32,len:u32)->f32 {"
+    a << "fn rw07_signal_f32(bits:u32)->f32 {return bitcast<f32>(bits);}\n"
+      << "fn radians(h:u32,t:u32,len:u32)->f32 {"
       << "let q=min(u32(floor(rw07_div(f32(t),300.0))),len-1u);"
-      << "let harmonic:f32=" << x.GetByOffset("q") << "*f32(h+1u);"
-      << "let normalized:f32=harmonic/24000.0;return normalized-floor(normalized);}\n";
+      // Pinned original model sampling rate, in samples per second.
+      << "let original_sample_rate_hz=24000.0;let source=" << x.GetByOffset("q") << ";"
+      // WGSL division is allowed2.5ULP. A one-bit pitch-normalization error can
+      // accumulate into phase jumps before the high-frequency sine. Preserve
+      // the original FLOAT Mul/Div/Sub rounding, using existing finite helpers.
+      << "if((bitcast<u32>(source)&0x7fffffffu)>=0x7f800000u){return rw07_signal_f32(0x7fc00000u);}"
+      << "let harmonic=rw07_mul(source,f32(h+1u));"
+      << "if((bitcast<u32>(harmonic)&0x7fffffffu)>=0x7f800000u){return rw07_signal_f32(0x7fc00000u);}"
+      << "let normalized=rw07_div(harmonic,original_sample_rate_hz);return rw07_add(normalized,-floor(normalized));}\n";
     auto& f = s.MainFunctionBody();
     f << "if(global_idx>=9u){return;}let h=global_idx;"
       << "for(var t=0u;t<uniforms.input_capacity;t++){" << phase.SetByOffset("h*uniforms.input_capacity+t", "0.0") << "}"
@@ -53,11 +61,21 @@ class Prefix final : public Program<Prefix> {
       << "if(lo==hi){dx1=0.5;dx2=0.5;}let nh=min(h+1u,8u);"
       << "let dy1=select(0.0,0.5,h==nh);let dy2=select(1.0,0.5,h==nh);"
       << "let a=radians(h,lo,len);let b=radians(h,hi,len);let c=radians(nh,lo,len);let d=radians(nh,hi,len);"
-      << "var value:f32=dx2*dy2*0.5*a;value=value+dx1*dy2*0.5*b;"
+      << "var value:f32=0.0;"
+      << "if((bitcast<u32>(a)&0x7fffffffu)<0x7f800000u&&(bitcast<u32>(b)&0x7fffffffu)<0x7f800000u&&"
+      << "(bitcast<u32>(c)&0x7fffffffu)<0x7f800000u&&(bitcast<u32>(d)&0x7fffffffu)<0x7f800000u){"
+      << "let p0=rw07_mul(rw07_mul(rw07_mul(dx2,dy2),0.5),a);"
+      << "let p1=rw07_mul(rw07_mul(rw07_mul(dx1,dy2),0.5),b);"
+      << "let p2=rw07_mul(rw07_mul(rw07_mul(dx2,dy1),0.5),c);"
+      << "let p3=rw07_mul(rw07_mul(rw07_mul(dx1,dy1),0.5),d);"
+      << "value=rw07_add(rw07_add(rw07_add(p0,p1),p2),p3);"
+      << "value=rw07_add(rw07_add(rw07_add(rw07_add(value,p0),p1),p2),p3);"
+      << "}else{value=dx2*dy2*0.5*a;value=value+dx1*dy2*0.5*b;"
       << "value=value+dx2*dy1*0.5*c;value=value+dx1*dy1*0.5*d;"
       << "value=value+dx2*dy2*0.5*a;value=value+dx1*dy2*0.5*b;"
-      << "value=value+dx2*dy1*0.5*c;value=value+dx1*dy1*0.5*d;"
-      << "if(t==0u){prefix=value;}else{prefix=prefix+value;}"
+      << "value=value+dx2*dy1*0.5*c;value=value+dx1*dy1*0.5*d;}"
+      << "if(t==0u){prefix=value;}else if((bitcast<u32>(prefix)&0x7fffffffu)<0x7f800000u&&"
+      << "(bitcast<u32>(value)&0x7fffffffu)<0x7f800000u){prefix=rw07_add(prefix,value);}else{prefix=prefix+value;}"
       << "let doubled:f32=prefix*2.0;let angle:f32=doubled*bitcast<f32>(0x40490fdbu);"
       << "var scaled:f32=angle*300.0;"
       // Preserve the three original Mul node rounding boundaries instead of

@@ -1,10 +1,23 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 #pragma once
+#include <algorithm>
+#include <array>
+#include <limits>
+#include "core/providers/webgpu/compute_context.h"
 #include "core/providers/webgpu/webgpu_kernel.h"
 #include "core/providers/webgpu/shader_helper.h"
+#include "m0_duration_exact_fp32.h"
+#include "m0_fullgpu_stft20_bluestein_constants_v1.h"
 
 namespace onnxruntime::webgpu::m0_stft_detail {
+// Bluestein next_pow2(2*20-1), from the original STFT frame length in samples.
+inline constexpr uint32_t kOriginalBluesteinFftSamplesV1=64;
+// Tint's SPIR-V writer rounds each workgroup global to16bytes (std430
+// upper-bound accounting, spirv/writer/printer/printer.cc EmitVar).
+inline constexpr uint32_t kStftWorkgroupVariableAlignmentBytesV1=16;
+inline constexpr uint32_t kOriginalBluesteinWorkgroupBytesV1=
+    kOriginalBluesteinFftSamplesV1*2*sizeof(float)+kStftWorkgroupVariableAlignmentBytesV1;
 inline const char* OriginalWindow() {
   return "const original_window=array<u32,20>(0u,1019771126u,1036226829u,1045630416u,"
          "1051780163u,1056964608u,1059556830u,1061895308u,1063751134u,1064942648u,"
@@ -93,7 +106,7 @@ inline void ValidSpectrum(ShaderHelper& s, const ShaderVariableHelper& e) {
 }
 class OwnedStftData final : public Program<OwnedStftData> {
  public:
-  OwnedStftData() : Program{"RW07STFT1573OwnedTimeWindowDataV2"} {}
+  OwnedStftData() : Program{"RW07STFT1573OwnedBluesteinTimeWindowDataV3"} {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"signal_capacity", ProgramUniformVariableDataType::Uint32},
       {"frame_capacity", ProgramUniformVariableDataType::Uint32},
@@ -106,19 +119,117 @@ class OwnedStftData final : public Program<OwnedStftData> {
     const auto& window = s.AddInput("window", ShaderUsage::UseValueTypeAlias);
     const auto& e = s.AddInput("extent", ShaderUsage::UseValueTypeAlias);
     const auto& y = s.AddOutput("spectrum", ShaderUsage::UseValueTypeAlias);
-    Roots(s);
-    ValidSpectrum(s, e);
-    auto& f = s.MainFunctionBody();
-    f << "if(global_idx>=11u*uniforms.frame_count){return;}let at=2u*global_idx;"
-      << y.SetByOffset("at", "0.0") << y.SetByOffset("at+1u", "0.0")
-      << "if(!valid_spectrum()){return;}let frame=uniforms.first_frame+global_idx/11u;let bin=global_idx%11u;"
-      << "if(frame>=" << e.GetByOffset("4u") << "){return;}"
-      << "if(5u*frame+19u>=uniforms.signal_capacity){return;}var re:f32=0.0;var im:f32=0.0;"
-      << "for(var n=0u;n<20u;n++){let sample:f32=" << x.GetByOffset("5u*frame+n-uniforms.signal_begin") << "*"
-      << window.GetByOffset("n") << ";let root=(bin*n)%20u;let rp:f32=sample*cosine[root];"
-      << "let ip:f32=sample*(-sine[root]);re=re+rp;im=im+ip;}"
-      << y.SetByOffset("at", "re") << y.SetByOffset("at+1u", "im");
+    s.AdditionalImplementation()<<::rw07::DurationExactFp32<<OriginalBluesteinCoefficients;
+    ValidSpectrum(s,e);
+    s.AdditionalImplementation()<<R"WGSL(
+var<workgroup> stft_values:array<vec2<f32>,64>;
+var<workgroup> stft_active:u32;
+fn stft_finite(x:f32)->bool{return (bitcast<u32>(x)&0x7fffffffu)<0x7f800000u;}
+fn stft_mul(a:f32,b:f32)->f32{if(stft_finite(a)&&stft_finite(b)){return rw07_mul(a,b);}return a*b;}
+fn stft_add(a:f32,b:f32)->f32{if(stft_finite(a)&&stft_finite(b)){return rw07_add(a,b);}return a+b;}
+fn stft_complex(a:vec2<f32>,b:vec2<f32>)->vec2<f32>{
+ let rr=stft_mul(a.x,b.x);let ii=stft_mul(a.y,b.y);
+ let ri=stft_mul(a.x,b.y);let ir=stft_mul(a.y,b.x);
+ return vec2<f32>(stft_add(rr,-ii),stft_add(ri,ir));
+}
+fn stft_sum(a:vec2<f32>,b:vec2<f32>)->vec2<f32>{return vec2<f32>(stft_add(a.x,b.x),stft_add(a.y,b.y));}
+)WGSL";
+    auto& f=s.MainFunctionBody();
+    // One complete64-point transform per workgroup, one complex lane per
+    // invocation. All butterflies retain CPU order and both independent roots.
+    f<<"if(workgroup_idx>=uniforms.frame_count){return;}let frame=uniforms.first_frame+workgroup_idx;"
+     <<"if(local_idx<11u){"<<y.SetByOffset("22u*workgroup_idx+2u*local_idx","0.0")
+     <<y.SetByOffset("22u*workgroup_idx+2u*local_idx+1u","0.0")<<"}"
+     <<"if(local_idx==0u){stft_active=select(0u,1u,valid_spectrum()&&frame<"<<e.GetByOffset("4u")
+     <<"&&5u*frame+19u<uniforms.signal_capacity);}workgroupBarrier();"
+     // The broadcast establishes uniform control flow before FFT barriers.
+     <<"let frame_enabled=workgroupUniformLoad(&stft_active);if(frame_enabled==0u){return;}"
+     <<"let n=reverseBits(local_idx)>>26u;var value=vec2<f32>(0.0);"
+     <<"if(n<20u){let windowed=stft_mul("<<x.GetByOffset("5u*frame+n-uniforms.signal_begin")<<","<<window.GetByOffset("n")<<");"
+     <<"value=stft_complex(vec2<f32>(windowed,0.0),bitcast<vec2<f32>>(stft_chirp[n]));}"
+     <<"stft_values[local_idx]=stft_complex(vec2<f32>(1.0,0.0),value);workgroupBarrier();"
+     <<"for(var transform=0u;transform<2u;transform++){"
+     <<"for(var size=2u;size<=64u;size*=2u){let fft_midpoint=size/2u;let lane=local_idx%size;"
+     <<"let even_index=(local_idx/size)*size+lane%fft_midpoint;"
+     <<"let even=stft_values[even_index];let odd=stft_values[even_index+fft_midpoint];"
+     <<"let root=bitcast<vec2<f32>>(stft_roots[lane*(64u/size)]);"
+     <<"value=stft_sum(even,stft_complex(root,odd));workgroupBarrier();"
+     <<"stft_values[local_idx]=value;workgroupBarrier();}"
+     <<"if(transform==0u){let index=reverseBits(local_idx)>>26u;"
+     <<"value=stft_complex(stft_values[index],bitcast<vec2<f32>>(stft_chirp_spectrum[index]));"
+     <<"value=stft_complex(vec2<f32>(1.0,0.0),value);workgroupBarrier();"
+     <<"stft_values[local_idx]=value;workgroupBarrier();}}"
+     // CPU inverse reuses cached forward roots, divides by64, then undoes
+     // reversal when selecting bins before its final chirp multiplication.
+     <<"if(local_idx<11u){let index=(64u-local_idx)%64u;let source=stft_values[index];"
+     <<"var scaled=source/64.0;if(stft_finite(source.x)&&stft_finite(source.y)){"
+     <<"scaled=vec2<f32>(rw07_div(source.x,64.0),rw07_div(source.y,64.0));}"
+     <<"let result=stft_complex(scaled,bitcast<vec2<f32>>(stft_chirp[local_idx]));"
+     <<y.SetByOffset("22u*workgroup_idx+2u*local_idx","result.x")
+     <<y.SetByOffset("22u*workgroup_idx+2u*local_idx+1u","result.y")<<"}";
     return Status::OK();
   }
 };
+
+// A dispatch cohort fits the total local-storage demand of its independent
+// frames into one device-advertised workgroup-storage envelope. This is a
+// conservative scheduling policy, not an API limit on total dispatch work.
+// It uses actual capabilities and the FFT's528-byte padded per-frame workspace,
+// rather than a device name, measured failing size or fixed time-window count.
+inline uint32_t StftFramesPerWindowV1(const wgpu::Limits& limits,uint32_t capacity,
+                                    uint32_t requested=std::numeric_limits<uint32_t>::max()) {
+  constexpr uint64_t float_bytes=sizeof(float),window_samples=20,hop_samples=5,complex_bins=22;
+  const uint64_t alignment=limits.minStorageBufferOffsetAlignment;
+  if(!capacity||!requested||!alignment||alignment%float_bytes||
+     limits.maxComputeWorkgroupSizeX<kOriginalBluesteinFftSamplesV1||
+     limits.maxComputeInvocationsPerWorkgroup<kOriginalBluesteinFftSamplesV1||
+     !limits.maxComputeWorkgroupsPerDimension)return 0;
+  const uint64_t cohort=limits.maxComputeWorkgroupStorageSize/kOriginalBluesteinWorkgroupBytesV1;
+  const uint64_t binding=std::min(limits.maxBufferSize,limits.maxStorageBufferBindingSize);
+  const uint64_t prefix=alignment-float_bytes;
+  if(!cohort||binding<=prefix||binding-prefix<complex_bins*float_bytes)return 0;
+  const uint64_t samples=(binding-prefix)/float_bytes;
+  if(samples<window_samples)return 0;
+  const uint64_t input_frames=(samples-window_samples)/hop_samples+1;
+  const uint64_t output_frames=(binding-prefix)/(complex_bins*float_bytes);
+  const uint64_t groups=limits.maxComputeWorkgroupsPerDimension;
+  return uint32_t(std::min({uint64_t(capacity),uint64_t(requested),cohort,input_frames,output_frames,groups*groups}));
+}
+
+inline Status RunOwnedStftWindowsV1(ComputeContextBase& context,const Tensor& signal,const Tensor& window,
+    const Tensor& extent,Tensor& spectrum,gsl::span<const uint32_t> identity,
+    uint32_t requested=std::numeric_limits<uint32_t>::max()) {
+  ORT_RETURN_IF_NOT(signal.Location().device.Type()==OrtDevice::GPU&&window.Location().device.Type()==OrtDevice::GPU&&
+      extent.Location().device.Type()==OrtDevice::GPU&&spectrum.Location().device.Type()==OrtDevice::GPU&&
+      signal.IsDataType<float>()&&signal.Shape().NumDimensions()==2&&signal.Shape()[0]==1&&
+      signal.Shape()[1]>=20&&uint64_t(signal.Shape()[1])<=UINT32_MAX&&
+      window.IsDataType<float>()&&window.Shape()==TensorShape{20}&&
+      extent.IsDataType<uint32_t>()&&extent.Shape()==TensorShape{32}&&
+      spectrum.IsDataType<float>()&&spectrum.Shape().NumDimensions()==4&&spectrum.Shape()[0]==1&&
+      spectrum.Shape()[1]>0&&uint64_t(spectrum.Shape()[1])<=UINT32_MAX&&
+      spectrum.Shape()[2]==11&&spectrum.Shape()[3]==2&&uint64_t(spectrum.Shape().Size())<=UINT32_MAX&&identity.size()==10,
+      "RW07_STFT_COHORT_PHYSICAL_SHAPES");
+  const auto& limits=context.DeviceLimits();
+  const uint32_t signal_capacity=uint32_t(signal.Shape()[1]),frame_capacity=uint32_t(spectrum.Shape()[1]);
+  const uint32_t frames=StftFramesPerWindowV1(limits,frame_capacity,requested);
+  ORT_RETURN_IF_NOT(frames>0,"RW07_STFT_COHORT_DEVICE_ENVELOPE");
+  const uint32_t alignment=limits.minStorageBufferOffsetAlignment;
+  for(uint32_t first=0;first<frame_capacity;){
+    const uint32_t count=std::min(frames,frame_capacity-first);
+    const uint32_t begin=uint32_t(std::min<uint64_t>(5ull*first,uint64_t(signal_capacity)-1));
+    const uint32_t samples=uint32_t(std::min<uint64_t>(5ull*(count-1)+20,uint64_t(signal_capacity)-begin));
+    const uint32_t dx=std::min(count,limits.maxComputeWorkgroupsPerDimension),dy=(count+dx-1)/dx;
+    OwnedStftData program;
+    program.AddInput(ProgramInput::FloatBufferWindow(&signal,ProgramTensorMetadataDependency::None,TensorShape{samples},begin,alignment))
+        .AddInputs({{&window,ProgramTensorMetadataDependency::None},{&extent,ProgramTensorMetadataDependency::None}})
+        .AddOutput(ProgramOutput::FloatBufferWindow(&spectrum,ProgramTensorMetadataDependency::None,TensorShape{count,11,2},22u*first,alignment))
+        .SetWorkgroupSize(kOriginalBluesteinFftSamplesV1).SetDispatchGroupSize(dx,dy)
+        .AddUniformVariables({signal_capacity,frame_capacity,first,count,begin,identity});
+    // Completion fences prevent independent cohorts accumulating into the
+    // same oversized device submission. This downloads no tensor payload.
+    ORT_RETURN_IF_ERROR(context.RunProgramWithCheckedCompletion(program));
+    first+=count;
+  }
+  return Status::OK();
+}
 }  // namespace onnxruntime::webgpu::m0_stft_detail

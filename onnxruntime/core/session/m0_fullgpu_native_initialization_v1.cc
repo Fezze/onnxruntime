@@ -41,13 +41,13 @@ void M0FullGpuNativeLoweringOwnerV1::BeginInitialization(SessionState& state){
  // A real private original-model initialization is the only caller. Observed
  // qualification plans cannot be upgraded, replayed or substituted here.
  ORT_THROW_IF_ERROR(session_->M0ValidateOriginalSelectionOptionsV1());
- // ValidateInitializerPlan first authenticates the full original source.
- // Keep that check before walking execution metadata, once per boundary.
+ // Authenticate the full original source before walking execution metadata.
  LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=initialization_plan_check_begin"<<" mono_us="<<M0MonotonicMicrosecondsV1();
  {
   const auto proof=ValidateSourceBoundary();
-  ValidateInitializerPlan(state,&proof);ValidateExecutionModel(&proof);ValidateResourcePlan(state);
+  ValidateInitializerPlan(state,&proof);ValidateExecutionModel(&proof);
  }
+ ValidateResourcePlan(state);
  LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=initialization_plan_check_done"<<" mono_us="<<M0MonotonicMicrosecondsV1();
  ORT_ENFORCE(ExecutionPlanFingerprint(state)==p.plan_sha256,"RW07_NATIVE_INITIALIZATION_CHANGED_PLAN");
  p.initialization_thread=M0NativeInitializationThreadV1();
@@ -191,12 +191,12 @@ void M0FullGpuNativeLoweringOwnerV1::ValidateInitializedExecution(uint64_t activ
   "RW07_NATIVE_INITIALIZED_ACTUAL_STATE");
  ORT_THROW_IF_ERROR(session_->M0ValidateOriginalSelectionOptionsV1());
  LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=completion_source_check_begin"<<" mono_us="<<M0MonotonicMicrosecondsV1();
- // ValidateInitializerPlan first authenticates the full original source.
- // Keep that check before walking execution metadata, once per boundary.
+ // Retire the source proof before resource validation calls into the provider.
  {
   const auto proof=ValidateSourceBoundary();
-  ValidateInitializerPlan(state,&proof);ValidateExecutionModel(&proof);ValidateResourcePlan(state);
+  ValidateInitializerPlan(state,&proof);ValidateExecutionModel(&proof);
  }
+ ValidateResourcePlan(state);
  LOGS(*session_->session_logger_,INFO)<<"M0_NATIVE_INIT phase=completion_source_check_done"<<" mono_us="<<M0MonotonicMicrosecondsV1();
  ORT_ENFORCE(ExecutionPlanFingerprint(state)==p.plan_sha256,"RW07_NATIVE_INITIALIZED_CHANGED_PLAN");
  const auto device=p.module->Provider().GetOrtDeviceByMemType(OrtMemTypeDefault);

@@ -48,9 +48,13 @@ class M0QueuedBufferBudgetV1 {
     if (added > std::numeric_limits<uint64_t>::max() - bytes_) throw std::overflow_error("RW07 queued buffer total");
     return added;
   }
-  bool NeedsDrain(uint64_t budget, const std::vector<Reference>& references) const {
+  bool NeedsDrain(uint64_t budget, const std::vector<Reference>& references,
+                  uint64_t separately_retained_bytes = 0) const {
     const auto added = Additional(references);
-    return !Empty() && (bytes_ >= budget || added > budget - bytes_);
+    if (separately_retained_bytes > std::numeric_limits<uint64_t>::max() - bytes_)
+      throw std::overflow_error("RW07 queued transfer and buffer total");
+    const auto retained = bytes_ + separately_retained_bytes;
+    return retained != 0 && (retained >= budget || added > budget - retained);
   }
   void Track(const std::vector<Reference>& references) {
     const auto added = Additional(references);
@@ -98,6 +102,13 @@ class M0UniformPackingV1 {
     return offset;
   }
   void Seal(){sealed_=true;}
+  // The caller must hold the sole block reference after checked queue completion.
+  // An encoded/submitted command may still refer to every previous offset.
+  void ResetAfterCheckedCompletion(){
+    if(!sealed_)throw std::logic_error("RW07 unsubmitted uniform block recycle");
+    bytes_.clear();
+    sealed_=false;
+  }
   bool Sealed()const{return sealed_;}
   const std::vector<uint8_t>& Bytes()const{return bytes_;}
  private:
