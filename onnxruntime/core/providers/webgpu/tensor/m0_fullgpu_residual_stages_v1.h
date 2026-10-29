@@ -608,6 +608,32 @@ inline bool ResidualPackedSupportedV1(const wgpu::Limits& limits) {
     limits.maxStorageBuffersPerShaderStage>=7&&limits.maxBindingsPerBindGroup>=8;
 }
 
+// WGSL permits either adjacent f16 result for an inexact conversion. Choose
+// IEEE round-to-nearest/ties-to-even once during packing, independently of the
+// driver rounding mode. The final bitcast introduces no additional rounding.
+inline void ResidualHalfConversionV1(ShaderHelper& s) {
+  s.AdditionalImplementation()<<R"(
+const residual_half_max:f32=65504.0;
+fn residual_half_bits(value:f32)->u32 {
+  let raw=bitcast<u32>(value);let sign=(raw>>16u)&0x8000u;let mag=raw&0x7fffffffu;
+  if(mag>0x477fe000u){return 0u;}
+  // Binary16 normal exponent floor 2^-14; discard 23-10 significand bits.
+  if(mag>=0x38800000u){return sign|(((mag+0xfffu+((mag>>13u)&1u))>>13u)-0x1c000u);}
+  // Values below half of the least binary16 subnormal round to signed zero.
+  if(mag<0x33000000u){return sign;}
+  let shift=126u-(mag>>23u);let mantissa=(mag&0x7fffffu)|0x800000u;
+  let kept=mantissa>>shift;let discarded=mantissa&((1u<<shift)-1u);let halfway=1u<<(shift-1u);
+  let increment=select(0u,1u,discarded>halfway||(discarded==halfway&&(kept&1u)!=0u));
+  return sign|(kept+increment);
+}
+fn residual_half4(value:vec4<f32>)->vec4<f16> {
+  let x=residual_half_bits(value.x);let y=residual_half_bits(value.y);
+  let z=residual_half_bits(value.z);let w=residual_half_bits(value.w);
+  return bitcast<vec4<f16>>(vec2u(x|(y<<16u),z|(w<<16u)));
+}
+)";
+}
+
 // Physical weights: [row block64][K4][64rows][4K]. Physical columns:
 // [K4][time block32][4K][32times]. A group reads compact adjacent K/row/time
 // tiles, rather than striding across all padded rows or the whole time window.
@@ -615,7 +641,7 @@ inline bool ResidualPackedSupportedV1(const wgpu::Limits& limits) {
 class ResidualPackedWeightFlagsV1 final : public Program<ResidualPackedWeightFlagsV1> {
  public:
   explicit ResidualPackedWeightFlagsV1(bool pack=false,bool mixed=false)
-      :Program{mixed?"RW07ResidualPackHalfWeightsV1":pack?"RW07ResidualPackWeightsAndFlagsV5":"RW07ResidualPackedWeightFlagsV1"},pack_weights_(pack),mixed_(mixed){}
+      :Program{mixed?"RW07ResidualPackHalfWeightsRneV2":pack?"RW07ResidualPackWeightsAndFlagsV5":"RW07ResidualPackedWeightFlagsV1"},pack_weights_(pack),mixed_(mixed){}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(M0_RESIDUAL_TILE_UNIFORMS_V1,
     {"row_begin",ProgramUniformVariableDataType::Uint32},{"row_count",ProgramUniformVariableDataType::Uint32},
     {"weight_flag_offset",ProgramUniformVariableDataType::Uint32});
@@ -625,7 +651,7 @@ class ResidualPackedWeightFlagsV1 final : public Program<ResidualPackedWeightFla
     const auto* packed=pack_weights_?&s.AddOutput("packed_weight",ShaderUsage::UseValueTypeAlias):nullptr;
     const auto& flags=s.AddOutput("flags",ShaderUsage::UseValueTypeAlias);
     ValidOutput(s,e,true);
-    if(mixed_)s.AdditionalImplementation()<<"const residual_half_max:f32=65504.0;";
+    if(mixed_)ResidualHalfConversionV1(s);
     s.AdditionalImplementation()<<"var<workgroup> weight_unsafe:array<u32,64>;";
     auto& f=s.MainFunctionBody();
     if(pack_weights_){
@@ -638,7 +664,7 @@ class ResidualPackedWeightFlagsV1 final : public Program<ResidualPackedWeightFla
         <<"for(var lane=0u;lane<4u;lane++){if(k*4u+lane<inner){value[lane]="
         <<w.GetByOffset("(at+lane)/4u")<<"[(at+lane)%4u];}}}"
         <<packed->SetByOffset("((row/64u)*vectors+k)*64u+row%64u",mixed_?
-            "vec4<f16>(select(vec4<f32>(0.0),value,abs(value)<=vec4<f32>(residual_half_max)))":"value")
+            "residual_half4(value)":"value")
         <<"if(any((bitcast<vec4<u32>>(value)&vec4u(0x7fffffffu))>vec4u("<<(mixed_?"bitcast<u32>(residual_half_max)":"0x58800000u")<<"))){bad=1u;}}";
     }else{
     f<<"let row_base=workgroup_idx*32u;if(row_base>=uniforms.output_channel_count){return;}"
@@ -658,7 +684,7 @@ class ResidualPackedWeightFlagsV1 final : public Program<ResidualPackedWeightFla
 };
 class ResidualPackColumnsV1 final : public Program<ResidualPackColumnsV1> {
  public:
-  explicit ResidualPackColumnsV1(bool skip_inactive=false,bool mixed=false):Program{mixed?"RW07ResidualPackHalfColumnsV1":skip_inactive?"RW07ResidualPackActiveColumnsGridV7":"RW07ResidualPackColumnsGridV7"},skip_inactive_(skip_inactive),mixed_(mixed){}
+  explicit ResidualPackColumnsV1(bool skip_inactive=false,bool mixed=false):Program{mixed?"RW07ResidualPackHalfColumnsRneV2":skip_inactive?"RW07ResidualPackActiveColumnsGridV7":"RW07ResidualPackColumnsGridV7"},skip_inactive_(skip_inactive),mixed_(mixed){}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(M0_RESIDUAL_TILE_UNIFORMS_V1,
     {"row_begin",ProgramUniformVariableDataType::Uint32},{"row_count",ProgramUniformVariableDataType::Uint32},
     {"weight_flag_offset",ProgramUniformVariableDataType::Uint32});
@@ -668,7 +694,7 @@ class ResidualPackColumnsV1 final : public Program<ResidualPackColumnsV1> {
     const auto& col=s.AddOutput("columns",ShaderUsage::UseValueTypeAlias);
     const auto& flag=s.AddOutput("flags",ShaderUsage::UseValueTypeAlias);
     ValidOutput(s,e,true);
-    if(mixed_)s.AdditionalImplementation()<<"const residual_half_max:f32=65504.0;";
+    if(mixed_)ResidualHalfConversionV1(s);
     s.AdditionalImplementation()<<"var<workgroup> pack_flags:array<u32,64>;";
     if(skip_inactive_)s.AdditionalImplementation()<<"var<workgroup> skip_tail:u32;";
     auto& f=s.MainFunctionBody();
@@ -694,7 +720,7 @@ class ResidualPackColumnsV1 final : public Program<ResidualPackColumnsV1> {
       <<"if(t<n&&pos>=0&&pos<i32(n)&&pos<i32(uniforms.input_capacity)){value[lane]="
       <<x.GetByOffset("ic*uniforms.input_capacity+u32(pos)")<<";}}}"
       <<col.SetByOffset("((row/4u)*time_tiles+local_t/32u)*32u+(row%4u)*8u+(local_t%32u)/4u",mixed_?
-          "vec4<f16>(select(vec4<f32>(0.0),value,abs(value)<=vec4<f32>(residual_half_max)))":"value")<<"}"
+          "residual_half4(value)":"value")<<"}"
       <<"pack_flags[local_idx]=select(0u,1u,any((bitcast<vec4<u32>>(value)&vec4u(0x7fffffffu))>vec4u("<<(mixed_?"bitcast<u32>(residual_half_max)":"0x58800000u")<<")));"
       <<"workgroupBarrier();if(local_idx==0u){var bad=0u;for(var i=0u;i<64u;i++){bad|=pack_flags[i];}"
       <<flag.SetByOffset("physical_group","bad")<<"}";
@@ -1422,7 +1448,7 @@ inline Status RunResidualConvolutionV1(ComputeContextBase& c,const ProgramInput&
           finish,dispatches,true,0,&half_weights,trial?nullptr:indirect,true);
     };
     uint32_t precision=forced==128?2u:0u;
-    const std::string precision_key="mixed-half-storage-f32-accum-v1:"+std::to_string(chosen)+":"+
+    const std::string precision_key="mixed-half-storage-f32-accum-v2:"+std::to_string(chosen)+":"+
         std::to_string(spec.channels)+":"+std::to_string(spec.channel_count)+":"+
         std::to_string(spec.output_channel_count)+":"+std::to_string(spec.kernel)+":"+std::to_string(spec.dilation);
     if(!precision)precision=c.M0ResidualBlockChoiceV1(precision_key);

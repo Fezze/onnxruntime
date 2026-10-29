@@ -405,7 +405,8 @@ Status ComputeMatMul(ComputeContext* context,
         .SetDispatchGroupSize(charge_work?uint32_t(window_groups):dispatch_x,
                               charge_work?1u:dispatch_y,charge_work?1u:dispatch_z)
         .SetWorkgroupSize(MatMul::MATMUL_PACKED_WORKGROUP_SIZE_X, MatMul::MATMUL_PACKED_WORKGROUP_SIZE_Y, MatMul::MATMUL_PACKED_WORKGROUP_SIZE_Z)
-        .AddOutput(std::move(output));
+        // Every window needs the original packed shape; moving it empties later views.
+        .AddOutput(ProgramOutput(output));
     // Activation uniforms must remain last because definitions and values are matched by index.
     AppendActivationUniformsData(activation, matmul_program);
   
