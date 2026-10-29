@@ -79,6 +79,11 @@ inline bool M0CoalescedRecurrenceWeightsV1() {
   static const bool enabled = [](){const char* value=std::getenv("M0_COALESCED_RECURRENCE_WEIGHTS");return value&&std::strcmp(value,"1")==0;}();
   return enabled;
 }
+// Explicit process option allows same-binary FP32/mixed Android comparisons.
+inline bool M0MixedPrecisionConvolutionV1() {
+  static const bool enabled=[](){const char* value=std::getenv("M0_MIXED_PRECISION_CONVOLUTION");return value&&std::strcmp(value,"1")==0;}();
+  return enabled;
+}
 inline bool M0OutputChannelTiledConvV1() {
   static const bool enabled=[](){const char* value=std::getenv("M0_OUTPUT_CHANNEL_TILED_CONVOLUTION");return value&&std::strcmp(value,"1")==0;}();
   return enabled;

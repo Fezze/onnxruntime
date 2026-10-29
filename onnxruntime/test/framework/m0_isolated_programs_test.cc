@@ -15,6 +15,7 @@
 #include "gtest/gtest.h"
 #include "sha256.h"
 #include "core/session/inference_session.h"
+#include "core/common/float16.h"
 #include "test/test_environment.h"
 #include "test/util/include/asserts.h"
 #include "test/util/include/default_providers.h"
@@ -335,6 +336,80 @@ TEST(M0IsolatedPrograms, ParallelResidualIndirectGridMatchesCpuAcrossActiveAndPa
     ASSERT_NO_FATAL_FAILURE(RunProgramProbe(6,variant,{input,weight,bias},extent,{expected}));
   }
   RecordProperty("qualification_scope","actual production packed/register FMA4/8 and GPU indirect argument reuse; independent serial CPU conv; poisoned inactive input and zero output padding across physical windows");
+}
+// FP16 conversion is independently performed by ORT's IEEE binary16 helper.
+// Keep the existing FP32 convolution tolerance against the quantized reference.
+TEST(M0IsolatedPrograms, MixedResidualHalfOperandsF32AccumulationMatchesQuantizedCpu) {
+  for(const uint32_t channels:{8u,128u,256u})for(const uint32_t active:{1u,17u,65u})
+  for(const uint32_t capacity:{96u,2080u}) {
+    SCOPED_TRACE(channels);
+    SCOPED_TRACE(active);
+    SCOPED_TRACE(capacity);
+    constexpr uint32_t kernel=3;
+    ProgramOracle input{{1,channels,capacity},std::vector<float>(channels*capacity,12345.0f)};
+    ProgramOracle weight{{channels,channels,kernel},std::vector<float>(channels*channels*kernel)};
+    ProgramOracle bias{{channels},std::vector<float>(channels)};
+    for(uint32_t c=0;c<channels;++c)for(uint32_t t=0;t<active;++t)
+      input.values[c*capacity+t]=float(int((c*13+t*7)%29)-14)*0.01f;
+    for(size_t i=0;i<weight.values.size();++i)weight.values[i]=float(int(i%19)-9)*0.01f;
+    for(uint32_t c=0;c<channels;++c)bias.values[c]=float(c)*0.001f;
+    ProgramOracle expected{{1,channels,capacity},std::vector<float>(channels*capacity,0.0f)};
+    for(uint32_t oc=0;oc<channels;++oc)for(uint32_t t=0;t<active;++t){
+      float sum=0;
+      for(uint32_t ic=0;ic<channels;++ic)for(uint32_t k=0;k<kernel;++k){
+        const int64_t pos=int64_t(t)+k-1;
+        if(pos>=0&&pos<active)sum+=MLFloat16(input.values[ic*capacity+size_t(pos)]).ToFloat()*
+            MLFloat16(weight.values[(oc*channels+ic)*kernel+k]).ToFloat();
+      }
+      expected.values[oc*capacity+t]=sum+bias.values[oc];
+    }
+    auto extent=ProbeExtent(3,active);extent[4]=channels;extent[18]=channels*active;
+    ASSERT_NO_FATAL_FAILURE(RunProgramProbe(6,2,{input,weight,bias},extent,{expected}));
+  }
+  RecordProperty("qualification_scope","forced actual ShaderF16 packed weights/columns,64x32 shared GEMM,FP32 products/accumulation/output; independent quantized CPU oracle; active/padded/partial tiles");
+}
+TEST(M0IsolatedPrograms, MixedResidualOutOfRangeRetainsOriginalFp32Operands) {
+  constexpr uint32_t channels=8,active=17,capacity=96,kernel=3;
+  for(const bool oversized_weight:{false,true}) {
+    SCOPED_TRACE(oversized_weight);
+    ProgramOracle input{{1,channels,capacity},std::vector<float>(channels*capacity,12345.0f)};
+    ProgramOracle weight{{channels,channels,kernel},std::vector<float>(channels*channels*kernel,0.125f)};
+    ProgramOracle bias{{channels},std::vector<float>(channels,0.03125f)};
+    for(uint32_t c=0;c<channels;++c)for(uint32_t t=0;t<active;++t)
+      input.values[c*capacity+t]=float(int((c+t)%7)-3)*0.03125f;
+    if(oversized_weight)weight.values[0]=65536.0f;else input.values[0]=65536.0f;
+    ProgramOracle expected{{1,channels,capacity},std::vector<float>(channels*capacity,0.0f)};
+    for(uint32_t oc=0;oc<channels;++oc)for(uint32_t t=0;t<active;++t){
+      float sum=0;
+      for(uint32_t ic=0;ic<channels;++ic)for(uint32_t k=0;k<kernel;++k){
+        const int64_t pos=int64_t(t)+k-1;
+        if(pos>=0&&pos<active)sum+=input.values[ic*capacity+size_t(pos)]*weight.values[(oc*channels+ic)*kernel+k];
+      }
+      expected.values[oc*capacity+t]=sum+bias.values[oc];
+    }
+    auto extent=ProbeExtent(3,active);extent[4]=channels;extent[18]=channels*active;
+    ASSERT_NO_FATAL_FAILURE(RunProgramProbe(6,2,{input,weight,bias},extent,{expected}));
+  }
+}
+TEST(M0IsolatedPrograms, ResidualAutomaticDirectWarmupThenIndirectMatchesCpu) {
+  constexpr uint32_t channels=128,active=65,capacity=2080,kernel=3;
+  ProgramOracle input{{1,channels,capacity},std::vector<float>(channels*capacity,12345.0f)};
+  ProgramOracle weight{{channels,channels,kernel},std::vector<float>(channels*channels*kernel)};
+  ProgramOracle bias{{channels},std::vector<float>(channels,0.03125f)};
+  for(uint32_t c=0;c<channels;++c)for(uint32_t t=0;t<active;++t)
+    input.values[c*capacity+t]=float(int((c+t)%17)-8)/64;
+  for(size_t i=0;i<weight.values.size();++i)weight.values[i]=float(int(i%13)-6)/256;
+  ProgramOracle expected{{1,channels,capacity},std::vector<float>(channels*capacity,0.0f)};
+  for(uint32_t oc=0;oc<channels;++oc)for(uint32_t t=0;t<active;++t){
+    float sum=0;
+    for(uint32_t ic=0;ic<channels;++ic)for(uint32_t k=0;k<kernel;++k){
+      const int64_t pos=int64_t(t)+k-1;
+      if(pos>=0&&pos<active)sum+=input.values[ic*capacity+size_t(pos)]*weight.values[(oc*channels+ic)*kernel+k];
+    }
+    expected.values[oc*capacity+t]=sum+bias.values[oc];
+  }
+  auto extent=ProbeExtent(3,active);extent[4]=channels;extent[18]=channels*active;
+  ASSERT_NO_FATAL_FAILURE(RunProgramProbe(6,3,{input,weight,bias},extent,{expected}));
 }
 TEST(M0IsolatedPrograms, TiledRecurrenceProjectionMatchesCpuWithInactiveFramesAndBothWeightLayouts){
   for(const uint32_t capacity:{9u,25u})for(const int64_t coalesced:{0,1}){

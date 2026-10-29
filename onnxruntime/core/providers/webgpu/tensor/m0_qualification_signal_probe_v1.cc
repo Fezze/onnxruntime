@@ -98,7 +98,7 @@ class SignalProgramProbe final : public WebGpuKernel {
     ORT_RETURN_IF_NOT(c.KernelContext().M0FullGpuExtentOwnerEpochV1()!=0&&
                           c.KernelContext().M0FullGpuExtentRunIdV2()==0,
                       "M0_PROGRAM_PROBE_REQUIRES_ISOLATED_SESSION");
-    ORT_RETURN_IF_NOT((stage_==1||stage_==2||stage_==3||stage_==5||stage_==6||stage_==7||stage_==8)&&(reuse_==0||reuse_==1),"M0_PROGRAM_PROBE_STAGE");
+    ORT_RETURN_IF_NOT((stage_==1||stage_==2||stage_==3||stage_==5||stage_==6||stage_==7||stage_==8)&&(reuse_==0||reuse_==1||(stage_==6&&(reuse_==2||reuse_==3))),"M0_PROGRAM_PROBE_STAGE");
     const auto* x=c.Input<Tensor>(0);const auto* e=c.Input<Tensor>(1);
     const auto& limits=c.DeviceLimits();
     const auto storage=[&](const Tensor* tensor){
@@ -167,7 +167,7 @@ class SignalProgramProbe final : public WebGpuKernel {
           0u,channels,0u,channels,words};
       uint64_t dispatches=0;
       return m0_residual_stages::RunResidualConvolutionV1(c,{x,ProgramTensorMetadataDependency::None},
-          {output,ProgramTensorMetadataDependency::None},e,weight,bias,&columns,&flags,spec,dispatches,true,reuse_?64u:32u,&weights,&args);
+          {output,ProgramTensorMetadataDependency::None},e,weight,bias,&columns,&flags,spec,dispatches,true,reuse_==2?128u:reuse_==3?0u:reuse_?64u:32u,&weights,&args);
     }
     if(stage_==7){
       const auto* speed=c.Input<Tensor>(2);

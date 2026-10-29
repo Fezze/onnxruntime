@@ -58,7 +58,8 @@ Status MakeMatMulPackedVec4Source(ShaderHelper& shader,
                                   bool split_k = false,
                                   uint32_t split_dim_inner = 32,
                                   bool use_f32_accumulation = false,
-                                  const std::string& workgroup_index = "workgroup_idx");
+                                  const std::string& workgroup_index = "workgroup_idx",
+                                  bool use_f32_output = false);
 
 Status MakeMatMulPackedSource(ShaderHelper& shader,
                               const InlinedVector<int64_t>& elements_per_thread,
