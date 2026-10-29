@@ -1,8 +1,13 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 #pragma once
+#include <cstdint>
 
 namespace onnxruntime::webgpu::m0_trig_detail {
+// Conservative source-level product count: both16-digit2/pi integer products,
+// three fractional reconstruction products and14 sine/cosine polynomial products.
+// This is a scheduling envelope, not measured hardware instructions or FLOPs.
+inline constexpr uint32_t kSincosProductsPerElementV1=2*16+3+14;
 // WGSL only bounds builtin sin/cos accuracy on [-pi, pi]. Original phase
 // accumulation and Snake activations are not restricted to that interval.
 // Use an exact-product split pi/2 reduction for bounded arguments and an

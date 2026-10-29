@@ -16,6 +16,7 @@ namespace {
 struct ResidualPlan {
   uint64_t initializers;
   std::array<uint64_t, 4> peaks;
+  std::array<uint64_t, 4> references;
 };
 
 ResidualPlan PlanResidual(uint32_t channels, uint32_t kernel, bool noise) {
@@ -60,16 +61,19 @@ ResidualPlan PlanResidual(uint32_t channels, uint32_t kernel, bool noise) {
   branch->set_name("branch");
   branch->set_i(noise ? (channels == 256 ? 0 : 1) : (channels == 256 ? 0 : 3)+(kernel == 11 ? 2 : 0));
   m0_internal::M0NativeMemoryPlanV1 plan(graph, original.MainGraph(), ExecutionOrder::DEFAULT);
-  ResidualPlan result{plan.InitializerBytes(), {}};
+  ResidualPlan result{plan.InitializerBytes(), {}, {}};
   constexpr std::array<uint32_t,4> durations{1,129,514,m0_internal::M0NativeMemoryPlanV1::kLogicalCapacity};
   for (size_t i = 0; i < durations.size(); ++i) {
     const uint64_t frames = uint64_t(frames_per_duration)*durations[i]+frame_tail;
     result.peaks[i] = plan.PeakBytes(durations[i]);
+    result.references[i]=plan.PeakReferenceBytes(durations[i]);
     // All graph inputs and both outputs remain live at this point. The two
     // temporaries can each have at most `channels` full rows. Exercise every
     // legal activation-tile row count, including the full-carrier worst case.
     const uint64_t live = channels*sizeof(float)+32*sizeof(uint32_t)+256*sizeof(float)+
                           channels*frames*sizeof(float)+32*sizeof(uint32_t);
+    EXPECT_GE(result.references[i],live+result.initializers+
+        M0NativeResidualFixedScratchBytesV1(channels,M0OutputChannelTiledConvV1())+M0NativePendingUniformBytesV1());
     for (uint32_t tile_rows = 1; tile_rows <= channels; ++tile_rows) {
       const uint64_t temporaries = (tile_rows+channels)*frames*sizeof(float)+
           M0NativeResidualFixedScratchBytesV1(channels,M0OutputChannelTiledConvV1());
@@ -89,7 +93,10 @@ TEST(M0NativeMemoryPlan, ResidualWorkspaceBoundsActualTilesWithoutCountingRetain
     // scheme, even though its immutable weights and lineage are independent.
     const auto noise = PlanResidual(channels,channels==256?7:3,true);
     EXPECT_EQ(noise.peaks,small.peaks);
-    for(size_t i=1;i<small.peaks.size();++i) EXPECT_GT(small.peaks[i],small.peaks[i-1]);
+    for(size_t i=1;i<small.peaks.size();++i){
+      EXPECT_GT(small.peaks[i],small.peaks[i-1]);
+      EXPECT_GT(small.references[i],small.references[i-1]);
+    }
   }
 }
 

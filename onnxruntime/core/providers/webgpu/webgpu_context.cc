@@ -688,6 +688,51 @@ Status WebGpuContext::EncodeDeferredDispatches(CommandRecordingState& recording)
   return result;
 }
 
+// Only opaque tuning choices are persisted; no model values or run authority.
+std::string WebGpuContext::M0ResidualPersistentKeyV1(const std::string& key)const{
+  return std::string("M0TUNE:parallel-fp32-v1:")+std::string(std::string_view(adapter_info_.vendor))+":"+
+      std::string(std::string_view(adapter_info_.architecture))+":"+
+      std::string(std::string_view(adapter_info_.device))+":"+
+      std::string(std::string_view(adapter_info_.description))+":"+
+      std::to_string(static_cast<uint32_t>(adapter_info_.backendType))+":"+
+      std::to_string(device_limits_.maxComputeWorkgroupStorageSize)+":"+key;
+}
+uint32_t WebGpuContext::M0ResidualBlockChoiceV1(const std::string& key)const{
+  {std::lock_guard<std::mutex> lock(m0_residual_block_mutex_);
+   const auto found=m0_residual_blocks_.find(key);if(found!=m0_residual_blocks_.end())return found->second;}
+  if(!m0_dawn_artifact_cache_)return 0;
+  const auto disk_key=M0ResidualPersistentKeyV1(key);uint8_t bytes[4]{};
+  if(m0_dawn_artifact_cache_->Load(disk_key.size(),reinterpret_cast<const uint8_t*>(disk_key.data()),sizeof(bytes),bytes)!=sizeof(bytes))return 0;
+  const uint32_t choice=bytes[0];
+  if(bytes[1]||bytes[2]||bytes[3]||choice==0||choice>64||(choice&(choice-1)))return 0;
+  {std::lock_guard<std::mutex> lock(m0_residual_block_mutex_);if(m0_residual_blocks_.size()>=128)m0_residual_blocks_.clear();m0_residual_blocks_[key]=choice;}
+  return choice;
+}
+void WebGpuContext::M0RememberResidualBlockV1(const std::string& key,uint32_t choice){
+  ORT_ENFORCE(choice&&choice<=64&&!(choice&(choice-1)),"RW07 residual tuning choice");
+  {std::lock_guard<std::mutex> lock(m0_residual_block_mutex_);if(m0_residual_blocks_.size()>=128)m0_residual_blocks_.clear();m0_residual_blocks_[key]=choice;}
+  if(m0_dawn_artifact_cache_){
+    const auto disk_key=M0ResidualPersistentKeyV1(key);const uint8_t bytes[]{static_cast<uint8_t>(choice),0,0,0};
+    m0_dawn_artifact_cache_->Store(disk_key.size(),reinterpret_cast<const uint8_t*>(disk_key.data()),sizeof(bytes),bytes);
+  }
+}
+bool WebGpuContext::M0CheckedQueueCurrentV1(const CommandRecordingState& recording)const{
+  std::lock_guard<std::mutex> lock(m0_queue_epoch_mutex_);
+  return m0_queue_epoch_!=0&&m0_queue_epoch_==m0_checked_queue_epoch_&&
+      !recording.command_encoder&&recording.deferred_dispatches.empty()&&
+      !recording.has_unsubmitted_work.load(std::memory_order_relaxed);
+}
+
+Status WebGpuContext::RunWithQueuedCompletion(ComputeContextBase& context,const ProgramBase& program,uint64_t scheduled_products){
+  const auto& buffers=ComputeContextBase::BufferManagerAccessor::Get(context);
+  auto& recording=ComputeContextBase::BufferManagerAccessor::GetRecording(context);
+  // RunProgram applies the same unique-byte, product, device and cancellation
+  // admission as production. Validate the entire related group at completion.
+  ORT_RETURN_IF_ERROR(context.RunProgram(program,scheduled_products));
+  const auto status=FlushAndWaitChecked(buffers,recording);
+  return status.IsOK()?status:ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"WebGPU queued program completion [",program.Name(),"]: ",status.ErrorMessage());
+}
+
 Status WebGpuContext::RunWithCheckedCompletion(ComputeContextBase& context, const ProgramBase& program,
                                              uint64_t scheduled_products) {
   const auto& buffers = ComputeContextBase::BufferManagerAccessor::Get(context);
@@ -700,13 +745,19 @@ Status WebGpuContext::RunWithCheckedCompletion(ComputeContextBase& context, cons
   };
   // Wait even when the recording is empty: an ordinary automatic Flush may
   // have submitted prior work without waiting for its queue completion.
-  ORT_RETURN_IF_ERROR(annotate(FlushAndWaitChecked(buffers, recording), "prior work"));
+  if(!M0CheckedQueueCurrentV1(recording)){
+    ORT_RETURN_IF_ERROR(annotate(FlushAndWaitChecked(buffers, recording), "prior work"));
+  }else{
+    ORT_RETURN_IF_ERROR(annotate(CheckDeviceStatus(),"prior checked device"));
+  }
   // Recheck cancellation after the prior queue wait, through the actual caller.
   ORT_RETURN_IF_ERROR(annotate(context.RunProgram(program, scheduled_products), "enqueue"));
   return annotate(FlushAndWaitChecked(buffers, recording), "completion");
 }
 
 Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& program, uint64_t scheduled_products) {
+  const char* preparation_phase="metadata";
+  try {
   M0HostCostTimerV1 host_cost(m0_host_costs_,M0HostCostV1::ProgramPrepare);
   ORT_RETURN_IF_NOT(scheduled_products<=kM0ScheduledProductsPerWindowV1,"RW07 dispatch scheduled-work limit");
   const auto& inputs = program.Inputs();
@@ -816,6 +867,7 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
                 "Only one of SetIndirectDispatchTensor and SetDispatchGroupSize should be called for program", program.Name());
   }
 
+  preparation_phase="program cache key";
   auto key = CalculateProgramCacheKey(program, inputs_segments, outputs_segments);
 
   LOGS(context.Logger(), INFO) << "Starting program \"" << key << "\" (" << x << ", " << y << ", " << z << ")";
@@ -839,6 +891,7 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
       auto& build = pending_build.emplace();
       build.name = program.Name();
       build.callback_context = std::make_shared<PipelineCallbackContext>();
+      preparation_phase="shader source/pipeline build";
       ORT_RETURN_IF_ERROR(program_mgr_->Build(program, metadata, inputs_segments, outputs_segments,
                                               key, x, y, z,
                                               build.bind_group_layout,
@@ -854,6 +907,7 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
     cached_pipeline = program_artifact->compute_pipeline;
   }
 
+  preparation_phase="uniform packing";
   // prepare shape uniforms for shader variables (if any) and user defined uniforms
   // On a deferred cache miss, use the ranks produced while starting the pending build; otherwise
   // use the cached artifact's ranks.
@@ -1031,7 +1085,10 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
       uniform_buffer=uniform_batch->buffer;
     }else{
       uniform_buffer=buffer_mgr.Create(recording,uniform_buffer_total_size,wgpu::BufferUsage::CopyDst|wgpu::BufferUsage::Uniform);
+      {std::lock_guard<std::mutex> queue_lock(m0_queue_epoch_mutex_);
+      ORT_ENFORCE(m0_queue_epoch_!=UINT64_MAX,"RW07 queue epoch overflow");
       device_queue_.WriteBuffer(uniform_buffer,0,uniform_data_buffer.data(),uniform_buffer_total_size);
+      ++m0_queue_epoch_;}
     }
   }
 
@@ -1124,6 +1181,7 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
     // Byte admission may itself drain the queue. Charge new work only afterward.
     recording.m0_queued_scheduled_products+=scheduled_products;
   }
+  preparation_phase="enqueue";
   recording.has_unsubmitted_work.store(true,std::memory_order_relaxed);
   // Admission above may have sealed/released the recording's current block.
   // The command's own reference preserves its bytes until its eventual Submit.
@@ -1142,6 +1200,9 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
     ORT_RETURN_IF_ERROR(M0FlushIfBudgetReachedV1(buffer_mgr,recording));
   }
   return Status::OK();
+} catch(const std::exception& error){
+  ORT_THROW("WebGPU program [",program.Name(),"] phase=",preparation_phase," failed: ",error.what());
+  }
 }
 
 std::vector<const char*> WebGpuContext::GetEnabledAdapterToggles() const {
@@ -1609,6 +1670,7 @@ Status WebGpuContext::FlushAndWaitChecked(const webgpu::BufferManager& buffer_mg
   PushErrorScope(wgpu::ErrorFilter::Validation);
 
   Status result;
+  uint64_t observed_queue_epoch=0;
   const auto record_failure = [&result](const Status& status) {
     if (status.IsOK()) {
       return;
@@ -1631,7 +1693,10 @@ Status WebGpuContext::FlushAndWaitChecked(const webgpu::BufferManager& buffer_mg
 
   ORT_TRY {
     auto completion_status = std::make_shared<Status>();
-    const auto future = device_queue_.OnSubmittedWorkDone(
+    const auto future = [&](){
+      std::lock_guard<std::mutex> queue_lock(m0_queue_epoch_mutex_);
+      observed_queue_epoch=m0_queue_epoch_;
+      return device_queue_.OnSubmittedWorkDone(
         wgpu::CallbackMode::WaitAnyOnly,
         [completion_status](wgpu::QueueWorkDoneStatus status, wgpu::StringView message) noexcept {
           if (status != wgpu::QueueWorkDoneStatus::Success) {
@@ -1639,6 +1704,7 @@ Status WebGpuContext::FlushAndWaitChecked(const webgpu::BufferManager& buffer_mg
                                                  static_cast<uint32_t>(status), ". ", std::string_view{message});
           }
         });
+    }();
     if (diagnostic_zero_deadline) {
       // Probe the actual submitted queue future, never the device-lost future
       // or a fabricated wait result. Completion may already have happened.
@@ -1684,6 +1750,8 @@ Status WebGpuContext::FlushAndWaitChecked(const webgpu::BufferManager& buffer_mg
   if(recording.m0_submission_budget_bytes&&M0OwnershipV2().Poisoned())
     record_failure(ORT_MAKE_STATUS(ONNXRUNTIME,FAIL,"RW07 native submission context already poisoned"));
   if(result.IsOK()){
+    {std::lock_guard<std::mutex> queue_lock(m0_queue_epoch_mutex_);
+     m0_checked_queue_epoch_=std::max(m0_checked_queue_epoch_,observed_queue_epoch);}
     recording.m0_queued_reference_bytes=0;recording.m0_queued_scheduled_products=0;
     recording.m0_unique_queued_buffers.Reset();
     recording.M0RecycleUniformUploadsAfterCheckedCompletionV1();
@@ -1710,7 +1778,10 @@ Status WebGpuContext::Flush(const webgpu::BufferManager& buffer_mgr,
     if(!batch->packing.Sealed()){
       const auto& bytes=batch->packing.Bytes();
       ORT_RETURN_IF_NOT(!bytes.empty(),"RW07 empty uniform upload block");
+      {std::lock_guard<std::mutex> queue_lock(m0_queue_epoch_mutex_);
+      ORT_ENFORCE(m0_queue_epoch_!=UINT64_MAX,"RW07 queue epoch overflow");
       device_queue_.WriteBuffer(batch->buffer,0,bytes.data(),bytes.size());
+      ++m0_queue_epoch_;}
       batch->packing.Seal();
       ++recording.m0_uniform_arena_uploads;
       recording.m0_uniform_arena_bytes+=bytes.size();
@@ -1764,7 +1835,10 @@ Status WebGpuContext::Flush(const webgpu::BufferManager& buffer_mgr,
   }
   auto command_buffer = recording.command_encoder.Finish();
   LOGS_DEFAULT(INFO) << "M0_RW02_SUBMIT timeline=" << &recording << " device=" << device_.Get() << " pending_dispatches=" << recording.num_pending_dispatches;
-  device_queue_.Submit(1, &command_buffer);
+  {std::lock_guard<std::mutex> queue_lock(m0_queue_epoch_mutex_);
+      ORT_ENFORCE(m0_queue_epoch_!=UINT64_MAX,"RW07 queue epoch overflow");
+      device_queue_.Submit(1, &command_buffer);
+      ++m0_queue_epoch_;}
   refresh_pending_buffers();
 #if defined(_WIN32) && defined(ENABLE_D3D12_FILE_LOADING)
   std::vector<std::function<void()>> pending_release_callbacks;
@@ -1862,6 +1936,7 @@ void WebGpuContext::DispatchCommand(const webgpu::CapturedCommandInfo& command,
   LOGS_DEFAULT(INFO) << "M0_RW02_DISPATCH timeline=" << &recording << " program=" << command.program_key << " groups=" << command.dispatch_group[0] << "," << command.dispatch_group[1] << "," << command.dispatch_group[2];
   ORT_ENFORCE(command.compute_pipeline.has_value());
   ORT_ENFORCE(command.bind_group != nullptr);
+  if(command.indirect_buffer)EndComputePass(recording);
   const auto& compute_pass_encoder = GetComputePassEncoder(recording);
   WriteTimestamp(recording, recording.num_pending_dispatches * 2);
   compute_pass_encoder.SetPipeline(*command.compute_pipeline);
@@ -1884,6 +1959,7 @@ void WebGpuContext::DispatchCommand(const webgpu::CapturedCommandInfo& command,
       ? webgpu::M0WorkloadEventV1::IndirectDispatch : webgpu::M0WorkloadEventV1::Dispatch,groups,uint64_t(saturated));
   if(ordinal%128==0)M0OwnershipV2().LogWorkload("dispatch_encoded");
   WriteTimestamp(recording, recording.num_pending_dispatches * 2 + 1);
+  if(command.indirect_buffer)EndComputePass(recording);
   ++recording.num_pending_dispatches;
   if (recording.num_pending_dispatches >= max_num_pending_dispatches_ ||
       (is_profiling_ && query_type_ == TimestampQueryType::AtPasses)) {

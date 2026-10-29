@@ -152,6 +152,7 @@ class M0NativeMemoryPlanV1 final {
         live += values_.at(name);
         scratch += values_.at(name);
       }
+      Bytes references=scratch;  // graph inputs/outputs, including immutable bindings
       // Tail keeps three full 256-channel buffers and two 64-channel tiles.
       if (node.op_type() == "PredictorTailExtentV1") {
         auto tail = CapacityBytes(node, (3 * 256 + 2 * 64) * sizeof(float));
@@ -173,6 +174,14 @@ class M0NativeMemoryPlanV1 final {
         scratch+=Bytes{15,0};
         scratch+=Bytes{M0NativeResidualFixedScratchBytesV1(channels,M0OutputChannelTiledConvV1()),0};
       }
+      if(node.op_type()=="DurationExtentV4")scratch+=Bytes{512*2*sizeof(uint32_t)+15,0};
+      if(node.op_type()=="LSTM"&&M0LstmInputProjectionV1()&&node.output_size()>0&&!node.output(0).empty()){
+        // Four gate projections per ordinary hidden output, including alignment.
+        // Full projection plus one bounded output block and gathered X block.
+        // The full-X/full-projection bounds cover every legal tile size.
+        for(uint32_t gate=0;gate<8;++gate)scratch+=values_.at(node.output(0));
+        if(node.input_size()>0&&!node.input(0).empty())scratch+=values_.at(node.input(0));
+      }
       if(node.op_type()=="RecurrenceExtentV2"&&M0LstmInputProjectionV1()){
         // Four input gates for both directions, retained until recurrence completes.
         // Budget this even when a device binding limit selects the legacy path.
@@ -182,6 +191,24 @@ class M0NativeMemoryPlanV1 final {
         // Two exact transpositions retained with all recurrence outputs/projection.
         scratch+=Bytes{uint64_t(2048)*(640+256)*sizeof(float)+2*15,0};
       }
+      if(node.op_type()=="GeneratorResidualExtentV1"||node.op_type()=="NoiseResidualAfter1600ExtentV1"){
+        const auto branch=Attribute(node,"branch");
+        const uint32_t channels=node.op_type()=="GeneratorResidualExtentV1"?(branch<3?256u:128u):(branch==0?256u:128u);
+        // A command binds two carriers (norm, convolution or in-place mix),
+        // while the operator working set retains four. Its graph input/output
+        // bound covers those two carriers; fixed workspaces cover packing.
+        const auto& input_carrier=values_.at(node.input(0));
+        const auto& output_carrier=values_.at(node.output(0));
+        const Bytes largest_carrier{std::max(input_carrier.fixed,output_carrier.fixed),
+            std::max(input_carrier.per_duration,output_carrier.per_duration)};
+        references.Subtract(input_carrier);references.Subtract(output_carrier);
+        references+=largest_carrier;references+=largest_carrier;
+        references+=Bytes{M0NativeResidualFixedScratchBytesV1(channels,M0OutputChannelTiledConvV1()),0};
+      }else{
+        // Include internal temporary allocations conservatively for other ops.
+        references+=scratch;
+      }
+      command_references_.push_back(references);
       steps_.emplace_back(live, scratch);
       for (const auto& name : releases[pc]) live.Subtract(values_.at(name));
     }
@@ -196,6 +223,16 @@ class M0NativeMemoryPlanV1 final {
       ORT_ENFORCE(live<=std::numeric_limits<uint64_t>::max()-uniforms&&
           scratch<=std::numeric_limits<uint64_t>::max()-live-uniforms,"RW07_NATIVE_MEMORY_PLAN_OVERFLOW");
       peak=std::max(peak,live+scratch+uniforms);
+    }
+    return peak;
+  }
+  uint64_t PeakReferenceBytes(uint32_t duration) const {
+    const uint64_t uniforms=M0NativePendingUniformBytesV1()+(M0GpuNumericTraceV1()?64ull*1024:0);
+    uint64_t peak=uniforms;
+    for(const auto& references:command_references_){
+      const uint64_t bytes=references.At(duration);
+      ORT_ENFORCE(bytes<=std::numeric_limits<uint64_t>::max()-uniforms,"RW07_NATIVE_MEMORY_PLAN_REFERENCE_OVERFLOW");
+      peak=std::max(peak,bytes+uniforms);
     }
     return peak;
   }
@@ -271,6 +308,7 @@ class M0NativeMemoryPlanV1 final {
 
   std::map<std::string, Bytes> values_;
   std::vector<std::pair<Bytes, Bytes>> steps_;
+  std::vector<Bytes> command_references_;
   std::vector<std::string> order_;
   uint64_t initializer_bytes_ = 0;
 };

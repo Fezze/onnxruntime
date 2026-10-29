@@ -3,6 +3,8 @@
 #pragma once
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <limits>
 #include <chrono>
 #include "core/common/m0_observation_options_v1.h"
 #include <cstdint>
@@ -16,12 +18,15 @@
 // Both original generator and noise residual paths use the same scalar stage
 // ordering. Roles, extents, parameters and capacities remain caller supplied.
 namespace onnxruntime::webgpu::m0_residual_stages {
-inline Status RunHeavyProgram(ComputeContextBase& context,const ProgramBase& program){
+// Normalization division/affine product; Snake adds angle, square and scale.
+inline constexpr uint32_t kNormAffineWorkPerElementV1=2;
+inline constexpr uint32_t kSnakeWorkPerElementV1=m0_trig_detail::kSincosProductsPerElementV1+3;
+inline Status RunHeavyProgram(ComputeContextBase& context,const ProgramBase& program,uint64_t active_elements){
   // The native recording still fences each bounded dispatch/resource window and
   // final publication. Keep the legacy per-program isolation available.
-  // Each heavy path is already bounded per dispatch; charge its conservative
-  // maximum so a larger command count cannot create an unbounded work window.
-  return M0BatchHeavyProgramsV1()?context.RunProgram(program,uint64_t{1}<<25):context.RunProgramWithCheckedCompletion(program);
+  // Pointwise callers charge their actual rounded element range; convolution
+  // callers account for the inner products separately.
+  return M0BatchHeavyProgramsV1()?context.RunProgram(program,active_elements):context.RunProgramWithCheckedCompletion(program,active_elements);
 }
 
 // One immutable sidecar predicate per shader. Insert before any lane-specific
@@ -109,38 +114,24 @@ inline Status StorageBudget(ComputeContext& c, std::initializer_list<const Tenso
 // Larger windows remove repeated input-channel passes while each convolution
 // dispatch still obeys its independent product and aggregate submission bounds.
 inline uint32_t ResidualTileChannelCountV1(const wgpu::Limits& limits,uint32_t input_capacity,
-    uint32_t output_capacity,uint32_t channels,bool batched,uint64_t queue_budget=0,uint64_t fixed_references=0){
+    uint32_t output_capacity,uint32_t channels,bool batched){
   const uint64_t alignment=limits.minStorageBufferOffsetAlignment;
   const uint64_t capacity=std::max(input_capacity,output_capacity);
   if(!alignment||alignment%sizeof(float)||!capacity||!channels||capacity*channels>UINT32_MAX)return 0;
   const uint64_t row_bytes=capacity*sizeof(float),prefix=alignment-sizeof(float);
   const uint64_t physical=std::min(limits.maxStorageBufferBindingSize,limits.maxBufferSize);
   if(row_bytes>physical||prefix>physical-row_bytes)return 0;
-  uint64_t preferred=(batched?32ull:8ull)*1024*1024;
-  if(batched&&queue_budget){
-    // Do not enlarge an activation until every command exceeds the queue byte
-    // budget. Leave a quarter of remaining references for adjacent preparation.
-    const uint64_t remaining=queue_budget>fixed_references?queue_budget-fixed_references:0;
-    preferred=std::min(preferred,remaining/4*3);
-  }
-  const uint64_t target=std::min(physical,std::max(preferred,row_bytes+prefix));
+  // The admitted working-set plan already reserves a full activation carrier.
+  // A queue allowance bounds retained preceding commands, not this allocation:
+  // an oversized single command drains and completes immediately. Subtracting
+  // its fixed references here collapsed valid full-width tiles to one channel.
   return static_cast<uint32_t>(std::min({uint64_t(channels),uint64_t(batched?256u:32u),
-    uint64_t(limits.maxComputeWorkgroupsPerDimension),(target-prefix)/row_bytes}));
-}
-inline uint64_t ResidualFixedReferencesV1(uint32_t input_capacity,uint32_t output_capacity,uint32_t channels,
-    uint64_t weight_bytes,uint64_t bias_bytes){
-  // Unique backing bytes, not just the bound window. Covers norm/conv commands,
-  // the maximum packed scratch, coefficients, extent, uniforms and alignment.
-  const uint64_t carrier=uint64_t(std::max(input_capacity,output_capacity))*channels*sizeof(float);
-  return carrier+weight_bytes+bias_bytes+uint64_t(channels)*6*sizeof(float)+128+
-    kM0ResidualPackedScratchBytesV1+kM0ResidualRegisterWeightScratchBytesV1+
-    kM0ResidualPackedFlagWordsV1*sizeof(uint32_t)+kM0UniformArenaBytesV1+9*15;
+    uint64_t(limits.maxComputeWorkgroupsPerDimension),(physical-prefix)/row_bytes}));
 }
 inline Status ResidualTileChannels(ComputeContext& c,uint32_t input_capacity,uint32_t output_capacity,
-    uint32_t channels,uint32_t& tile_channels,bool wide_residual=false,uint64_t fixed_references=0){
+    uint32_t channels,uint32_t& tile_channels,bool wide_residual=false){
   const auto count=ResidualTileChannelCountV1(c.DeviceLimits(),input_capacity,output_capacity,channels,
-    wide_residual&&M0BatchHeavyProgramsV1()&&M0OutputChannelTiledConvV1(),
-    wide_residual?c.M0SubmissionBudgetBytesV1():0,fixed_references);
+    wide_residual&&M0BatchHeavyProgramsV1()&&M0OutputChannelTiledConvV1());
   ORT_RETURN_IF_NOT(count>0,"RW07 residual channel window descriptor/device/index limit");
   tile_channels=count;
   return Status::OK();
@@ -343,10 +334,11 @@ fn residual_accumulate(state:vec2<f32>,value:f32)->vec2<f32> {
  private:
   const bool parallel_;
 };
-// Each invocation evaluates at most one sample; cap the number per dispatch.
-inline constexpr uint32_t kResidualSnakeElementsPerDispatchV1 = 16384;
+// Each invocation evaluates one sample. Derive chunk size from its worst
+// fused norm/Snake product cost within the existing dispatch envelope.
 inline uint32_t ResidualSnakeElementsPerDispatchV1(bool batched=M0BatchHeavyProgramsV1()) {
-  return batched ? 131072u : kResidualSnakeElementsPerDispatchV1;
+  constexpr uint32_t lanes=64;
+  return M0HeavyProductsPerDispatchV1(batched)/(kNormAffineWorkPerElementV1+kSnakeWorkPerElementV1)/lanes*lanes;
 }
 class GeneratorNormAffine final : public Program<GeneratorNormAffine> {
  public:
@@ -459,9 +451,9 @@ class GeneratorSnakeInPlace final : public Program<GeneratorSnakeInPlace> {
 };
 // Bound scalar products encoded by one residual convolution dispatch. This
 // is a scheduling upper bound, not measured GPU instructions, FLOPs or time.
-inline constexpr uint32_t kResidualProductsPerDispatchV1 = 1u << 22;
+inline constexpr uint32_t kResidualProductsPerDispatchV1 = kM0HeavyProductsPerDispatchV1;
 inline uint32_t ResidualProductsPerDispatchV1(bool batched=M0BatchHeavyProgramsV1()) {
-  return batched ? 8u*kResidualProductsPerDispatchV1 : kResidualProductsPerDispatchV1;
+  return M0HeavyProductsPerDispatchV1(batched);
 }
 inline uint32_t ResidualConvElementsPerDispatchV1(uint32_t input_channels, uint32_t kernel,
                                                 bool batched=M0BatchHeavyProgramsV1()) {
@@ -479,13 +471,12 @@ inline uint32_t ResidualChannelBlockV1(uint64_t workgroup_bytes) {
   return 0;
 }
 inline uint32_t ResidualBestBlockV1(const std::array<double,7>& scores,uint32_t maximum) {
-  uint32_t chosen=1;
-  double best=scores[0];
-  for(size_t i=1;i<scores.size();++i){
+  uint32_t chosen=0;double best=std::numeric_limits<double>::infinity();
+  for(size_t i=0;i<scores.size();++i){
     const uint32_t block=1u<<i;
-    if(block<=maximum&&scores[i]>0&&scores[i]<best*0.95){chosen=block;best=scores[i];}
+    if(block<=maximum&&scores[i]>0&&(!chosen||scores[i]<best*0.95)){chosen=block;best=scores[i];}
   }
-  return chosen;
+  return chosen?chosen:1;
 }
 // Only an initial input-channel pass overwrites its output. Trials must never
 // repeat a pass that reads a preceding partial sum from that output.
@@ -498,20 +489,27 @@ inline Status ResidualAutotunedBlockV1(ComputeContextBase& context,const std::st
   if(chosen)return Status::OK();
   chosen=1;
   if(!overwrite_pass||maximum==1)return Status::OK();
-  // Compile/warm all candidates outside the measured intervals. Reverse the
-  // second round so one candidate does not always receive the warmest device.
-  for(uint32_t block=1;block<=maximum;block*=2)ORT_RETURN_IF_ERROR(run(block));
-  std::array<double,7> scores{};
-  for(uint32_t round=0;round<2;++round){
-    for(uint32_t i=0;i<7;++i){
-      const uint32_t index=round?6u-i:i,block=1u<<index;
-      if(block>maximum)continue;
-      const auto start=std::chrono::steady_clock::now();
-      ORT_RETURN_IF_ERROR(run(block));
+  // First compare execution families. Refine channel-block variants only if
+  // that family wins the coarse comparison. This is a measured search
+  // heuristic, not a proof that the omitted variants could never be faster.
+  const uint32_t legacy=std::min(maximum,std::max(1u,ResidualChannelBlockV1(context.DeviceLimits().maxComputeWorkgroupStorageSize)));
+  std::array<double,7> scores{};std::array<bool,7> candidates{};
+  candidates[std::bit_width(legacy)-1]=true;
+  for(uint32_t block=16;block<=maximum;block*=2)candidates[std::bit_width(block)-1]=true;
+  const auto measure=[&](const std::array<bool,7>& selected)->Status{
+    for(size_t i=0;i<selected.size();++i)if(selected[i]){scores[i]=0;ORT_RETURN_IF_ERROR(run(1u<<i));}
+    for(uint32_t round=0;round<2;++round)for(uint32_t i=0;i<7;++i){
+      const uint32_t index=round?6u-i:i;if(!selected[index])continue;
+      const auto start=std::chrono::steady_clock::now();ORT_RETURN_IF_ERROR(run(1u<<index));
       scores[index]+=std::chrono::duration<double,std::nano>(std::chrono::steady_clock::now()-start).count();
     }
+    return Status::OK();
+  };
+  ORT_RETURN_IF_ERROR(measure(candidates));chosen=ResidualBestBlockV1(scores,maximum);
+  if(chosen<=legacy&&legacy>1){
+    candidates.fill(false);for(uint32_t block=1;block<=legacy;block*=2)candidates[std::bit_width(block)-1]=true;
+    ORT_RETURN_IF_ERROR(measure(candidates));chosen=ResidualBestBlockV1(scores,maximum);
   }
-  chosen=ResidualBestBlockV1(scores,maximum);
   context.M0RememberResidualBlockV1(key,chosen);
   LOGS(context.Logger(),INFO)<<"M0_RW07_RESIDUAL_BLOCK_TUNING key="<<key<<" selected="<<chosen
     <<" max_supported="<<maximum<<" samples_ns="<<scores[0]<<","<<scores[1]<<","<<scores[2]<<","<<scores[3]<<","<<scores[4]<<","<<scores[5]<<","<<scores[6];
@@ -653,7 +651,7 @@ class ResidualPackedWeightFlagsV1 final : public Program<ResidualPackedWeightFla
 };
 class ResidualPackColumnsV1 final : public Program<ResidualPackColumnsV1> {
  public:
-  explicit ResidualPackColumnsV1(bool skip_inactive=false):Program{skip_inactive?"RW07ResidualPackActiveColumnsV6":"RW07ResidualPackColumnsV6"},skip_inactive_(skip_inactive){}
+  explicit ResidualPackColumnsV1(bool skip_inactive=false):Program{skip_inactive?"RW07ResidualPackActiveColumnsGridV7":"RW07ResidualPackColumnsGridV7"},skip_inactive_(skip_inactive){}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(M0_RESIDUAL_TILE_UNIFORMS_V1,
     {"row_begin",ProgramUniformVariableDataType::Uint32},{"row_count",ProgramUniformVariableDataType::Uint32},
     {"weight_flag_offset",ProgramUniformVariableDataType::Uint32});
@@ -668,17 +666,18 @@ class ResidualPackColumnsV1 final : public Program<ResidualPackColumnsV1> {
     f<<"if(uniforms.time_count<32u||uniforms.time_count>2048u||uniforms.time_count%32u!=0u||"
       <<"uniforms.channel_count==0u||uniforms.channel_count>256u||uniforms.kernel==0u||uniforms.kernel>11u){return;}"
       <<"let inner_count=uniforms.channel_count*uniforms.kernel;let time_tiles=uniforms.time_count/32u;"
-      <<"let group_count=((inner_count+7u)/8u)*time_tiles;"
-      <<"if(workgroup_idx>=group_count){return;}";
+      <<"let group_count=((inner_count+7u)/8u)*time_tiles;let physical_group="
+      <<(IndirectDispatchTensor()?"workgroup_id.y*time_tiles+workgroup_id.x":"workgroup_idx")<<";"
+      <<"if(physical_group>=group_count){return;}";
     if(skip_inactive_){
       f<<"if(local_idx==0u){skip_tail=select(0u,1u,valid_output()&&uniforms.time_begin+"
-        <<"(workgroup_idx%time_tiles)*32u>="<<e.GetByOffset("6u")<<");}"
+        <<"(physical_group%time_tiles)*32u>="<<e.GetByOffset("6u")<<");}"
         <<"let inactive=workgroupUniformLoad(&skip_tail);if(inactive!=0u){if(local_idx==0u){"
-        <<flag.SetByOffset("workgroup_idx","0u")<<"}return;}";
+        <<flag.SetByOffset("physical_group","0u")<<"}return;}";
     }
     f<<"var value=vec4<f32>(0.0);"
-      <<"let row=(workgroup_idx/time_tiles)*8u+local_idx/8u;"
-      <<"let local_t=(workgroup_idx%time_tiles)*32u+(local_idx%8u)*4u;"
+      <<"let row=(physical_group/time_tiles)*8u+local_idx/8u;"
+      <<"let local_t=(physical_group%time_tiles)*32u+(local_idx%8u)*4u;"
       <<"let valid=valid_output()&&uniforms.dilation>=1u&&uniforms.dilation<=5u;"
       <<"if(row<(inner_count+3u)/4u*4u){if(row<inner_count&&valid){let ic=row/uniforms.kernel;let k=row%uniforms.kernel;"
       <<"let n="<<e.GetByOffset("6u")<<";let pad=i32((uniforms.kernel-1u)*uniforms.dilation/2u);"
@@ -688,7 +687,7 @@ class ResidualPackColumnsV1 final : public Program<ResidualPackColumnsV1> {
       <<col.SetByOffset("((row/4u)*time_tiles+local_t/32u)*32u+(row%4u)*8u+(local_t%32u)/4u","value")<<"}"
       <<"pack_flags[local_idx]=select(0u,1u,any((bitcast<vec4<u32>>(value)&vec4u(0x7fffffffu))>vec4u(0x58800000u)));"
       <<"workgroupBarrier();if(local_idx==0u){var bad=0u;for(var i=0u;i<64u;i++){bad|=pack_flags[i];}"
-      <<flag.SetByOffset("workgroup_idx","bad")<<"}";
+      <<flag.SetByOffset("physical_group","bad")<<"}";
     return Status::OK();
   }
  private:
@@ -697,7 +696,7 @@ class ResidualPackColumnsV1 final : public Program<ResidualPackColumnsV1> {
 class ResidualPackedMatrixV1 final : public Program<ResidualPackedMatrixV1> {
  public:
   explicit ResidualPackedMatrixV1(bool cached_weights=false,uint32_t register_rows=0)
-      :Program{register_rows==8?"RW07ResidualRegister8MatrixV6":register_rows==4?"RW07ResidualRegister4MatrixV6":cached_weights?"RW07ResidualPackedMatrixWeightsV3":"RW07ResidualPackedMatrixV2"},
+      :Program{register_rows==8?"RW07ResidualRegister8ParallelFmaV7":register_rows==4?"RW07ResidualRegister4ParallelFmaV7":cached_weights?"RW07ResidualPackedMatrixWeightsV3":"RW07ResidualPackedMatrixV2"},
        cached_weights_(cached_weights),register_rows_(register_rows){}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(M0_RESIDUAL_TILE_UNIFORMS_V1,
     {"row_begin",ProgramUniformVariableDataType::Uint32},{"row_count",ProgramUniformVariableDataType::Uint32},
@@ -757,7 +756,8 @@ class ResidualPackedMatrixV1 final : public Program<ResidualPackedMatrixV1> {
       <<b.GetByOffset("uniforms.output_channel_offset+r")<<");}}"<<y.SetByOffset("r*uniforms.output_capacity+t","result")<<"}}}";
     auto& f=s.MainFunctionBody();
     f<<"let tile_columns=uniforms.time_count/32u;if(tile_columns==0u||workgroup_idx>=tile_columns*((uniforms.row_count+"<<tile_rows-1<<"u)/"<<tile_rows<<"u)){return;}"
-      <<"let tile_t=uniforms.time_begin+(workgroup_idx%tile_columns)*32u;let tile_row=uniforms.row_begin+(workgroup_idx/tile_columns)*"<<tile_rows<<"u;"
+      <<"let tile_t=uniforms.time_begin+"<<(IndirectDispatchTensor()?"workgroup_id.x":"(workgroup_idx%tile_columns)")
+      <<"*32u;let tile_row=uniforms.row_begin+"<<(IndirectDispatchTensor()?"workgroup_id.y":"(workgroup_idx/tile_columns)")<<"*"<<tile_rows<<"u;"
       <<"if(local_idx==0u){matrix_enabled=0u;let n="<<e.GetByOffset("6u")<<";"
       <<"if(valid_output()&&n<=uniforms.input_capacity&&uniforms.time_count<=2048u&&uniforms.time_count%32u==0u&&"
       <<"uniforms.row_begin<uniforms.output_channel_count&&uniforms.row_count>0u&&uniforms.row_count<=uniforms.output_channel_count-uniforms.row_begin&&"
@@ -795,7 +795,7 @@ class ResidualPackedMatrixV1 final : public Program<ResidualPackedMatrixV1> {
         <<"let column=(tile_t-uniforms.time_begin)/4u+local_idx%8u;"
         <<"let first_t=uniforms.time_begin+column*4u;";
       for(uint32_t row=0;row<register_rows_;++row){
-        f<<"var acc"<<row<<"=vec4<f32>(0.0);if(uniforms.channel_offset!=0u&&first_row+"<<row<<"u<uniforms.row_count){"
+        f<<"var partial"<<row<<"=vec4<f32>(0.0);var acc"<<row<<"=vec4<f32>(0.0);if(uniforms.channel_offset!=0u&&first_row+"<<row<<"u<uniforms.row_count){"
           <<"for(var lane=0u;lane<4u;lane++){if(first_t+lane<n){acc"<<row<<"[lane]="
           <<y.GetByOffset("(uniforms.row_begin+first_row+"+std::to_string(row)+"u)*uniforms.output_capacity+first_t+lane")<<";}}}";
       }
@@ -805,21 +805,22 @@ class ResidualPackedMatrixV1 final : public Program<ResidualPackedMatrixV1> {
         <<"let v1=mm_readB(0,i32(k*4u+1u),i32(column));"
         <<"let v2=mm_readB(0,i32(k*4u+2u),i32(column));"
         <<"let v3=mm_readB(0,i32(k*4u+3u),i32(column));";
-      // Interleave two independent rows, keeping each accumulator's exact K
-      // order. Only two weight vectors are live at once; no reassociation/FMA.
+      // Interleave two independent rows, using two independent reduction chains. Exceptional
+      // tiles still use serial_sample; finite tiles use native FP32 FMA.
       for(uint32_t row=0;row<register_rows_;row+=2){
         f<<"{let weights0=mm_readA(0,i32(first_row+"<<row<<"u),i32(k));"
           <<"let weights1=mm_readA(0,i32(first_row+"<<row+1<<"u),i32(k));";
         for(uint32_t k=0;k<4;++k){
           const char component="xyzw"[k];
-          f<<"acc"<<row<<"=acc"<<row<<"+v"<<k<<"*vec4<f32>(weights0."<<component<<");"
-           <<"acc"<<row+1<<"=acc"<<row+1<<"+v"<<k<<"*vec4<f32>(weights1."<<component<<");";
+          const char* target=k%2?"partial":"acc";
+          f<<target<<row<<"=fma(v"<<k<<",vec4<f32>(weights0."<<component<<"),"<<target<<row<<");"
+           <<target<<row+1<<"=fma(v"<<k<<",vec4<f32>(weights1."<<component<<"),"<<target<<row+1<<");";
         }
         f<<"}";
       }
       f<<"}";
       for(uint32_t row=0;row<register_rows_;++row)
-        f<<"mm_write(0,i32(first_row+"<<row<<"u),i32(column),acc"<<row<<");";
+        f<<"mm_write(0,i32(first_row+"<<row<<"u),i32(column),acc"<<row<<"+partial"<<row<<");";
       return Status::OK();
     }
     std::string prelude=std::move(f).str();f=OStringStream(kStringInitialSizeShaderSourceCodeMain);
@@ -833,7 +834,7 @@ class ResidualPackedMatrixV1 final : public Program<ResidualPackedMatrixV1> {
       <<y.GetByOffset("row*uniforms.output_capacity+t")<<";}}}}";body.insert(at+decl.size(),std::move(seed).str());
     const std::string needle="uniforms.dim_inner",replace="(uniforms.channel_count*uniforms.kernel)";
     for(size_t i=0;(i=body.find(needle,i))!=std::string::npos;i+=replace.size())body.replace(i,needle.size(),replace);
-    f<<prelude<<"let logical_workgroup_id=vec3u(workgroup_idx%tile_columns,workgroup_idx/tile_columns,0u);"
+    f<<prelude<<"let logical_workgroup_id="<<(IndirectDispatchTensor()?"workgroup_id":"vec3u(workgroup_idx%tile_columns,workgroup_idx/tile_columns,0u)")<<";"
       <<"let logical_global_id=logical_workgroup_id*vec3u(8u,8u,1u)+local_id;"<<body;
     return Status::OK();
   }
@@ -1206,10 +1207,42 @@ inline Status PrepareResidualRegisterWeightsV1(ComputeContextBase& c,const Tenso
   ORT_RETURN_IF_ERROR(c.RunProgram(program,elements));++dispatches;
   return Status::OK();
 }
+class ResidualActiveGridV1 final : public Program<ResidualActiveGridV1> {
+ public:
+  ResidualActiveGridV1():Program{"RW07ResidualActiveGridV2"}{}
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(M0_RESIDUAL_TILE_UNIFORMS_V1,
+    {"row_begin",ProgramUniformVariableDataType::Uint32},{"row_count",ProgramUniformVariableDataType::Uint32},
+    {"weight_flag_offset",ProgramUniformVariableDataType::Uint32},{"grid_rows",ProgramUniformVariableDataType::Uint32});
+  Status GenerateShaderCode(ShaderHelper& shader)const override{
+    const auto& extent=shader.AddInput("extent",ShaderUsage::UseValueTypeAlias);
+    const auto& args=shader.AddOutput("args",ShaderUsage::UseValueTypeAlias);
+    ValidOutput(shader,extent);
+    shader.MainFunctionBody()<<args.SetByOffset("0u","0u")<<args.SetByOffset("1u","uniforms.grid_rows")
+      <<args.SetByOffset("2u","1u")
+      <<"if(valid_output()){let n="<<extent.GetByOffset("6u")<<";if(n>uniforms.time_begin){"
+      <<"let active_count=min(uniforms.time_count,n-uniforms.time_begin);"
+      <<args.SetByOffset("0u","(active_count+31u)/32u")<<"}}";
+    return Status::OK();
+  }
+};
+inline Status ResidualSetActiveGridV1(ComputeContextBase& context,ProgramBase& program,const Tensor* extent,
+    Tensor* args,const ResidualConvSpecV1& spec,uint32_t begin,uint32_t times,uint32_t row,uint32_t count,
+    uint32_t rows,uint64_t& dispatches){
+  ORT_RETURN_IF_NOT(args&&args->IsDataType<uint32_t>()&&args->Shape()==TensorShape{3}&&
+      args->Location().device.Type()==OrtDevice::GPU&&rows&&rows<=context.DeviceLimits().maxComputeWorkgroupsPerDimension&&
+      times/32<=context.DeviceLimits().maxComputeWorkgroupsPerDimension,"RW07 active residual indirect bounds");
+  ResidualActiveGridV1 grid;
+  grid.AddInput({extent,ProgramTensorMetadataDependency::None}).AddOutput({args,ProgramTensorMetadataDependency::None})
+    .SetWorkgroupSize(1).SetDispatchGroupSize(1);
+  spec.ApplyPacked(grid,begin,times,row,count);grid.AddUniformVariables({rows});
+  ORT_RETURN_IF_ERROR(context.RunProgram(grid));++dispatches;
+  program.SetIndirectDispatchTensor(args);
+  return Status::OK();
+}
 inline Status RunResidualPackedTileV1(ComputeContextBase& c,const ProgramInput& input,const ProgramOutput& output,
     const Tensor* extent,const Tensor* weight,const Tensor* bias,Tensor* columns,Tensor* flags,
     const ResidualConvSpecV1& spec,uint32_t time_begin,uint32_t time_count,bool checked,uint64_t& dispatches,
-    bool weights_ready=false,uint32_t register_rows=0,Tensor* register_weights=nullptr) {
+    bool weights_ready=false,uint32_t register_rows=0,Tensor* register_weights=nullptr,Tensor* indirect=nullptr) {
   ORT_RETURN_IF_NOT((register_rows==0||register_rows==4||register_rows==8)&&(!register_rows||M0BatchHeavyProgramsV1()),"RW07 register matrix requires bounded batching");
   ORT_RETURN_IF_NOT(ResidualPackedSupportedV1(c.DeviceLimits()),"RW07 packed matrix device requirements");
   ORT_RETURN_IF_NOT(columns&&flags&&columns->IsDataType<float>()&&flags->IsDataType<uint32_t>()&&
@@ -1244,8 +1277,12 @@ inline Status RunResidualPackedTileV1(ComputeContextBase& c,const ProgramInput& 
     .AddOutput({columns,ProgramTensorMetadataDependency::None,ProgramOutput::Flatten,4})
     .AddOutput({flags,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64);
   const auto limit=c.DeviceLimits().maxComputeWorkgroupsPerDimension;
-  const auto dx=std::min(groups,limit);ORT_RETURN_IF_NOT(dx>0,"RW07 pack workgroup limit");
-  pack.SetDispatchGroupSize(dx,(groups+dx-1)/dx);spec.ApplyPacked(pack,time_begin,time_count,0,spec.output_channel_count,flag_base);
+  ORT_RETURN_IF_NOT(groups&&time_count/32<=limit&&(spec.channel_count*spec.kernel+7)/8<=limit,"RW07 pack workgroup limit");
+  spec.ApplyPacked(pack,time_begin,time_count,0,spec.output_channel_count,flag_base);
+  if(indirect){
+    ORT_RETURN_IF_ERROR(ResidualSetActiveGridV1(c,pack,extent,indirect,spec,time_begin,time_count,0,spec.output_channel_count,
+        (spec.channel_count*spec.kernel+7)/8,dispatches));
+  }else {const uint32_t dx=std::min(groups,limit);pack.SetDispatchGroupSize(dx,(groups+dx-1)/dx);}
   ORT_RETURN_IF_ERROR(c.RunProgram(pack));++dispatches;
   const uint64_t rounded=(uint64_t(spec.channel_count)*spec.kernel+31)/32*32;
   const uint32_t tile_rows=register_rows?8u*register_rows:32u;
@@ -1259,11 +1296,15 @@ inline Status RunResidualPackedTileV1(ComputeContextBase& c,const ProgramInput& 
       .AddInput({bias,ProgramTensorMetadataDependency::None})
       .AddInput({columns,ProgramTensorMetadataDependency::None,ProgramInput::Flatten,4})
       .AddInput({flags,ProgramTensorMetadataDependency::None}).AddOutput(ProgramOutput(output))
-      .SetWorkgroupSize(8,8).SetDispatchGroupSize(time_count/32,(count+tile_rows-1)/tile_rows);
+      .SetWorkgroupSize(8,8);
     spec.ApplyPacked(matrix,time_begin,time_count,row,count,flag_base);
+    if(indirect){ORT_RETURN_IF_ERROR(ResidualSetActiveGridV1(c,matrix,extent,indirect,spec,time_begin,time_count,row,count,
+        (count+tile_rows-1)/tile_rows,dispatches));}
+    else matrix.SetDispatchGroupSize(time_count/32,(count+tile_rows-1)/tile_rows);
     const uint64_t work=uint64_t((count+tile_rows-1)/tile_rows*tile_rows)*time_count*rounded;
     ORT_RETURN_IF_NOT(work<=ResidualPackedProductsPerDispatchV1(),"RW07 packed matrix scheduled work");
-    if(!M0BatchHeavyProgramsV1()||(checked&&row+count==spec.output_channel_count))ORT_RETURN_IF_ERROR(c.RunProgramWithCheckedCompletion(matrix));
+    if(!M0BatchHeavyProgramsV1())ORT_RETURN_IF_ERROR(c.RunProgramWithCheckedCompletion(matrix,work));
+    else if(checked&&row+count==spec.output_channel_count)ORT_RETURN_IF_ERROR(c.RunProgramWithQueuedCompletion(matrix,work));
     else ORT_RETURN_IF_ERROR(c.RunProgram(matrix,work));
     ++dispatches;
   }
@@ -1271,13 +1312,20 @@ inline Status RunResidualPackedTileV1(ComputeContextBase& c,const ProgramInput& 
 }
 inline Status RunResidualConvolutionV1(ComputeContextBase& c,const ProgramInput& input,const ProgramOutput& output,
     const Tensor* extent,const Tensor* weight,const Tensor* bias,Tensor* columns,Tensor* flags,
-    const ResidualConvSpecV1& spec,uint64_t& dispatches,bool checked=false,uint32_t forced=0,Tensor* register_weights=nullptr) {
+    const ResidualConvSpecV1& spec,uint64_t& dispatches,bool checked=false,uint32_t forced=0,Tensor* register_weights=nullptr,Tensor* indirect=nullptr) {
   const bool tiled=M0OutputChannelTiledConvV1();
   const bool packed=tiled&&columns&&flags&&ResidualPackedSupportedV1(c.DeviceLimits());
   const bool registers=packed&&M0BatchHeavyProgramsV1()&&register_weights&&
     ResidualRegisterWeightElementsV1(spec.output_channel_count,spec.channel_count,spec.kernel)>0;
   const uint32_t maximum=packed?(registers?64u:16u):std::max(1u,ResidualChannelBlockV1(c.DeviceLimits().maxComputeWorkgroupStorageSize));
-  const uint32_t sample_time=ResidualPackedTimeV1(spec.channel_count,spec.kernel);
+  const uint32_t packed_time=ResidualPackedTimeV1(spec.channel_count,spec.kernel);
+  ORT_RETURN_IF_NOT(packed_time&&spec.output_channel_count>0,"RW07 residual trial descriptor/work bounds");
+  // Time AND every output row belong to each tuning trial. The old32-row
+  // denominator let full-width trials grow by the input-channel tile factor.
+  const uint64_t trial_rows=(uint64_t(spec.output_channel_count)+63)/64*64;
+  const uint64_t trial_inner=(uint64_t(spec.channel_count)*spec.kernel+31)/32*32;
+  const uint64_t trial_times=M0HeavyProductsPerDispatchV1()/(trial_rows*trial_inner)/32*32;
+  const uint32_t sample_time=uint32_t(std::min<uint64_t>(packed_time,std::max<uint64_t>(32,trial_times)));
   ORT_RETURN_IF_NOT(sample_time>0,"RW07 residual sample work bound");
   const auto original=[&](uint32_t block,uint32_t begin,uint32_t count,bool finish)->Status {
     const GeneratorResidualConv scheduling(M0VectorizedConvV1(),M0TiledConvV1(),tiled,block);
@@ -1293,7 +1341,7 @@ inline Status RunResidualConvolutionV1(ComputeContextBase& c,const ProgramInput&
       const auto groups=(n+64*program.ValuesPerInvocation()-1)/(64*program.ValuesPerInvocation());
       const auto dx=std::min(groups,c.DeviceLimits().maxComputeWorkgroupsPerDimension);
       program.SetWorkgroupSize(64).SetDispatchGroupSize(dx,(groups+dx-1)/dx);
-      if(!M0BatchHeavyProgramsV1()||(finish&&first+n==elements))ORT_RETURN_IF_ERROR(c.RunProgramWithCheckedCompletion(program));
+      if(!M0BatchHeavyProgramsV1()||(finish&&first+n==elements))ORT_RETURN_IF_ERROR(c.RunProgramWithCheckedCompletion(program,uint64_t(n)*spec.channel_count*spec.kernel));
       else ORT_RETURN_IF_ERROR(c.RunProgram(program,uint64_t(n)*spec.channel_count*spec.kernel));
       ++dispatches;first+=n;
     }
@@ -1314,10 +1362,10 @@ inline Status RunResidualConvolutionV1(ComputeContextBase& c,const ProgramInput&
     }
     return Status::OK();
   };
-  uint32_t chosen=forced?forced:1;
+  uint32_t chosen=forced?forced:((tiled&&trial_times<32)?maximum:1);
   if(forced){ORT_RETURN_IF_NOT(forced==1||forced==2||forced==4||forced==8||((forced==16||forced==32||forced==64)&&packed&&forced<=maximum),"RW07 forced convolution variant");}
-  else if(tiled){
-    const std::string key="packed-register-block64-time32-v6:"+std::to_string(maximum)+":"+std::to_string(spec.output_capacity)+":"+std::to_string(spec.channels)+":"+
+  else if(tiled&&trial_times>=32){
+    const std::string key="packed-register-active-fma-bounded-trial-v8:"+std::to_string(maximum)+":"+std::to_string(spec.channels)+":"+
       std::to_string(spec.channel_count)+":"+std::to_string(spec.output_channel_count)+":"+
       std::to_string(spec.kernel)+":"+std::to_string(spec.dilation);
     ORT_RETURN_IF_ERROR(ResidualAutotunedBlockV1(c,key,maximum,spec.channel_offset==0,
@@ -1333,9 +1381,9 @@ inline Status RunResidualConvolutionV1(ComputeContextBase& c,const ProgramInput&
   if(chosen!=16&&chosen!=32&&chosen!=64)return original(chosen,0,0,checked);
   if(chosen==16)ORT_RETURN_IF_ERROR(prepare_weights());
   else ORT_RETURN_IF_ERROR(prepare_registers());
-  for(uint32_t t=0;t<spec.output_capacity;t+=sample_time){
-    ORT_RETURN_IF_ERROR(RunResidualPackedTileV1(c,input,output,extent,weight,bias,columns,flags,spec,t,sample_time,
-      checked&&spec.output_capacity-t<=sample_time,dispatches,weights_ready,chosen==32?4u:chosen==64?8u:0u,register_weights));
+  for(uint32_t t=0;t<spec.output_capacity;t+=packed_time){
+    ORT_RETURN_IF_ERROR(RunResidualPackedTileV1(c,input,output,extent,weight,bias,columns,flags,spec,t,packed_time,
+      checked&&spec.output_capacity-t<=packed_time,dispatches,weights_ready,chosen==32?4u:chosen==64?8u:0u,register_weights,indirect));
   }
   return Status::OK();
 }

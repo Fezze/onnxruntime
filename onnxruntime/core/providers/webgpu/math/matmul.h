@@ -44,7 +44,7 @@ class MatMulOptImplCache {
 
 Status ComputeMatMul(ComputeContext* context, const Activation& activation, std::vector<const Tensor*>& inputs, Tensor* output,
                      bool is_channels_last, MatMulOptImplCache& cache,
-                     bool b_is_constant = false);
+                     bool b_is_constant = false, bool bounded_work = false);
 
 MatMulFillBiasOrZeroBeforeSplitKProgram CreateMatMulFillBiasOrZeroBeforeSplitKProgram(
     const Tensor* bias,

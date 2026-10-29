@@ -278,7 +278,7 @@ class GeneratorEdge : public WebGpuKernel {
                   .AddOutput(output_window(&*scratch,0u,co)).SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(cx),uint32_t(cy))
                   .AddUniformVariables({capacities[0],uint32_t(capacity_),channels,minimum,maximum,modulus,remainder,
                       uint32_t(stage_),tap,i,ic,o,co,uint32_t(first),size,identity});
-              ORT_RETURN_IF_ERROR(m0_residual_stages::RunHeavyProgram(c,column));
+              ORT_RETURN_IF_ERROR(m0_residual_stages::RunHeavyProgram(c,column,cg*64*ic));
               ++upsample_dispatches;
             }
           }
@@ -369,7 +369,7 @@ class GeneratorEdge : public WebGpuKernel {
       data.AddOutput({y,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(gx),uint32_t(gy))
           .AddUniformVariables({capspan,uint32_t(capacity_),channels,minimum,maximum,modulus,remainder,uint32_t(stage_),channels,0u,
                                 uint32_t(first),size,identity});
-      ORT_RETURN_IF_ERROR(m0_residual_stages::RunHeavyProgram(c,data));
+      ORT_RETURN_IF_ERROR(m0_residual_stages::RunHeavyProgram(c,data,cg*64*source_channels*2));
       ++upsample_dispatches;
     }
     LOGS(c.Logger(),INFO)<<"M0_RW07_GENERATOR_EDGE_V1 mode="<<mode_<<" stage="<<stage_<<" role="<<role

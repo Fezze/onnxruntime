@@ -90,12 +90,13 @@ class Prefix final : public Program<Prefix> {
 class Signal final : public Program<Signal> {
  public:
   explicit Signal(bool reuse_coefficients=M0BatchHeavyProgramsV1())
-      : Program{reuse_coefficients?"RW07SignalOriginal1528Through1571CoefficientsV2":"RW07SignalOriginal1528Through1571V1"},
+      : Program{reuse_coefficients?"RW07SignalOriginalCoefficientsWindowsV3":"RW07SignalOriginalWindowsV3"},
         reuse_coefficients_(reuse_coefficients) {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"input_capacity", ProgramUniformVariableDataType::Uint32},
       {"output_capacity", ProgramUniformVariableDataType::Uint32},
-      {"identity", ProgramUniformVariableDataType::Uint32});
+      {"identity", ProgramUniformVariableDataType::Uint32},
+      {"element_begin",ProgramUniformVariableDataType::Uint32},{"element_count",ProgramUniformVariableDataType::Uint32});
   Status GenerateShaderCode(ShaderHelper& s) const override {
     const auto& x = s.AddInput("f0", ShaderUsage::UseValueTypeAlias);
     const auto& phase = s.AddInput("phase", ShaderUsage::UseValueTypeAlias);
@@ -107,11 +108,12 @@ class Signal final : public Program<Signal> {
     s.AdditionalImplementation() << m0_trig_detail::Trig;
     ValidOutput(s, e);
     auto& f = s.MainFunctionBody();
-    f << "if(global_idx>=uniforms.output_capacity){return;}" << out.SetByOffset("global_idx", "0.0")
-      << "if(!valid_output()||global_idx>=" << e.GetByOffset("4u") << "){return;}"
+    f << "if(global_idx>=uniforms.element_count){return;}let sample_idx=uniforms.element_begin+global_idx;"
+      << "if(sample_idx>=uniforms.output_capacity){return;}" << out.SetByOffset("sample_idx", "0.0")
+      << "if(!valid_output()||sample_idx>=" << e.GetByOffset("4u") << "){return;}"
       << "let len=(" << e.GetByOffset("4u") << "-20u)/300u;let expanded=300u*len;"
-      << "var sample=0u;if(global_idx<10u){sample=10u-global_idx;}"
-      << "else{sample=global_idx-10u;if(sample>=expanded){sample=2u*expanded-2u-sample;}}"
+      << "var sample=0u;if(sample_idx<10u){sample=10u-sample_idx;}"
+      << "else{sample=sample_idx-10u;if(sample>=expanded){sample=2u*expanded-2u-sample;}}"
       << "let coord=rw07_add(rw07_div(rw07_add(f32(sample),0.5),300.0),-0.5);"
       << "let pos=max(0.0,min(coord,f32(len-1u)));let lo=min(u32(pos),len-1u);let hi=min(lo+1u,len-1u);"
       << "var dx1=abs(pos-f32(lo));var dx2=abs(pos-f32(hi));if(lo==hi){dx1=0.5;dx2=0.5;}"
@@ -159,11 +161,51 @@ class Signal final : public Program<Signal> {
       << "let amplitude:f32=rw07_sin(value)*bitcast<f32>(0x3dcccccdu);let voiced:f32=amplitude*uv;"
       << "let product:f32=voiced*" << w.GetByOffset("h") << ";sum=sum+product;}"
       << "let shifted:f32=" << bias.GetByOffset("0u") << "+sum;"
-      << out.SetByOffset("global_idx", "tanh(shifted)");
+      << out.SetByOffset("sample_idx", "tanh(shifted)");
     return Status::OK();
   }
  private:
   const bool reuse_coefficients_;
 };
+
+
+// Nine harmonics: four interpolation corners, three software multiplies per
+// corner (four integer limb products each), sine reduction/polynomial products,
+// and amplitude/voicing/weight products. The non-reuse path bounds both variants.
+inline constexpr uint64_t kSignalProductsPerSampleV3=
+    9u*(4u*3u*4u+m0_trig_detail::kSincosProductsPerElementV1+3u)+2u;
+inline Status RunSignalWindowsV3(ComputeContextBase& context,const Tensor* x,const Tensor* phase,
+    const Tensor* extent,const Tensor* weights,const Tensor* bias,Tensor* signal,uint32_t input_capacity,
+    uint32_t output_capacity,gsl::span<const uint32_t> identity,bool reuse_coefficients=M0BatchHeavyProgramsV1(),
+    uint64_t* dispatches=nullptr){
+  ORT_RETURN_IF_NOT(x&&phase&&extent&&weights&&bias&&signal&&input_capacity&&output_capacity&&identity.size()==10&&
+      x->IsDataType<float>()&&phase->IsDataType<float>()&&extent->IsDataType<uint32_t>()&&
+      weights->IsDataType<float>()&&bias->IsDataType<float>()&&signal->IsDataType<float>()&&
+      x->Shape().Size()==input_capacity&&phase->Shape().Size()==9ll*input_capacity&&extent->Shape()==TensorShape{32}&&
+      weights->Shape().Size()==9&&bias->Shape().Size()==1&&signal->Shape().Size()==output_capacity,
+      "RW07 signal windows descriptors");
+  const auto& limits=context.DeviceLimits();constexpr uint32_t lanes=64;
+  ORT_RETURN_IF_NOT(limits.maxComputeWorkgroupSizeX>=lanes&&limits.maxComputeInvocationsPerWorkgroup>=lanes&&
+      limits.maxComputeWorkgroupsPerDimension>0,"RW07 signal windows device limits");
+  const uint64_t group_limit=limits.maxComputeWorkgroupsPerDimension;
+  const uint64_t work_elements=M0HeavyProductsPerDispatchV1()/kSignalProductsPerSampleV3/lanes*lanes;
+  const uint64_t groups_per_side=std::min(group_limit,work_elements/lanes);
+  const uint32_t chunk=uint32_t(std::min<uint64_t>(work_elements,groups_per_side*groups_per_side*lanes));
+  ORT_RETURN_IF_NOT(chunk>0,"RW07 signal windows positive work budget");
+  if(dispatches)*dispatches=0;
+  for(uint32_t first=0;first<output_capacity;){
+    const uint32_t count=std::min(chunk,output_capacity-first),groups=(count+lanes-1)/lanes;
+    const uint32_t dx=std::min<uint32_t>(groups,uint32_t(group_limit)),dy=(groups+dx-1)/dx;
+    Signal program(reuse_coefficients);
+    program.AddInputs({{x,ProgramTensorMetadataDependency::None},{phase,ProgramTensorMetadataDependency::None},
+        {extent,ProgramTensorMetadataDependency::None},{weights,ProgramTensorMetadataDependency::None},{bias,ProgramTensorMetadataDependency::None}})
+      .AddOutput({signal,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(lanes).SetDispatchGroupSize(dx,dy)
+      .AddUniformVariables({input_capacity,output_capacity,identity,first,count});
+    ORT_RETURN_IF_ERROR(context.RunProgram(program,uint64_t(groups)*lanes*kSignalProductsPerSampleV3));
+    if(dispatches)++*dispatches;
+    first+=count;
+  }
+  return Status::OK();
+}
 
 }  // namespace onnxruntime::webgpu::m0_signal_detail

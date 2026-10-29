@@ -30,13 +30,19 @@ inline bool M0BatchHeavyProgramsV1() {
 inline uint32_t M0NativeDispatchWindowV1(bool batched = M0BatchHeavyProgramsV1()) {
   return batched ? 128u : 16u;
 }
+// Retain the existing qualified heavy-dispatch product envelope. Actual
+// algorithm work determines element counts; the aggregate queue limit is separate.
+inline constexpr uint32_t kM0HeavyProductsPerDispatchV1=1u<<22;
+inline uint32_t M0HeavyProductsPerDispatchV1(bool batched=M0BatchHeavyProgramsV1()){
+  return batched?8u*kM0HeavyProductsPerDispatchV1:kM0HeavyProductsPerDispatchV1;
+}
 inline constexpr uint64_t kM0ResidualPackedScratchBytesV1=4ull*1024*1024;
 inline constexpr uint32_t kM0ResidualPackedWeightFlagWordsV1=16;
 inline constexpr uint64_t kM0ResidualRegisterWeightScratchBytesV1=4ull*1024*1024;
 inline constexpr uint64_t kM0ResidualPackedFlagWordsV1=(kM0ResidualPackedScratchBytesV1/4+255)/256+64+kM0ResidualPackedWeightFlagWordsV1;
 inline constexpr uint64_t M0NativeResidualFixedScratchBytesV1(uint32_t channels,bool packed){
   return uint64_t(channels)*6*sizeof(float)+15+
-    (packed?kM0ResidualPackedScratchBytesV1+kM0ResidualRegisterWeightScratchBytesV1+kM0ResidualPackedFlagWordsV1*sizeof(uint32_t)+3*15:0);
+    (packed?kM0ResidualPackedScratchBytesV1+kM0ResidualRegisterWeightScratchBytesV1+kM0ResidualPackedFlagWordsV1*sizeof(uint32_t)+3*15+3*sizeof(uint32_t)+15:0);
 }
 inline constexpr uint64_t kM0NativeUniformBytesV1=512;
 inline constexpr uint64_t kM0UniformArenaBytesV1=64*1024;

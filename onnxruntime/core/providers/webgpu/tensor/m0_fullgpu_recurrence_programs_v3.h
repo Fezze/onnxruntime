@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 #pragma once
 #include <algorithm>
+#include <bit>
 #include <string>
 #include "core/providers/webgpu/webgpu_kernel.h"
 #include "core/providers/webgpu/shader_helper.h"
@@ -130,6 +131,94 @@ inline Status RunInputProjectionV1(ComputeContextBase& context,const Tensor* x,c
         .SetWorkgroupSize(64).SetDispatchGroupSize(gx,gy)
         .AddUniformVariables({input_capacity,output_capacity,identity,uint32_t(first),count});
     ORT_RETURN_IF_ERROR(context.RunProgram(program,ProjectionScheduledProductsV1(count)));
+  }
+  return Status::OK();
+}
+// Matrix geometry follows the device subgroup/lane/storage envelope. The four
+// gates and640 input features are original-model constants, not tuning knobs.
+class TiledRecurrenceProjectionV1 final : public Program<TiledRecurrenceProjectionV1> {
+ public:
+  TiledRecurrenceProjectionV1(bool coalesced,uint32_t lanes,uint32_t units,uint32_t inner)
+    :Program{"RW07TiledRecurrenceProjectionV6"},coalesced_(coalesced),lanes_(lanes),units_(units),inner_(inner){
+    CacheHint(std::to_string(coalesced),std::to_string(lanes),std::to_string(units),std::to_string(inner));}
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"input_capacity",ProgramUniformVariableDataType::Uint32},
+    {"output_capacity",ProgramUniformVariableDataType::Uint32},{"identity",ProgramUniformVariableDataType::Uint32},
+    {"first_time",ProgramUniformVariableDataType::Uint32});
+  Status GenerateShaderCode(ShaderHelper& shader)const override{
+    const auto& x=shader.AddInput("x",ShaderUsage::UseValueTypeAlias);
+    const auto& w=shader.AddInput("w",ShaderUsage::UseValueTypeAlias);
+    const auto& extent=shader.AddInput("extent",ShaderUsage::UseValueTypeAlias);
+    const auto& out=shader.AddOutput("projection",ShaderUsage::UseValueTypeAlias);
+    AddValidExtent(shader,extent);
+    const uint32_t times=lanes_/units_;
+    shader.AdditionalImplementation()<<"const tile_units="<<units_<<"u;const tile_times="<<times
+      <<"u;const tile_k="<<inner_<<"u;const tile_lanes="<<lanes_<<"u;"
+      <<"var<workgroup> matrix_x:array<f32,"<<times*inner_<<">;var<workgroup> matrix_w:array<f32,"<<4*units_*inner_
+      <<">;var<workgroup> live_count:u32;";
+    auto& body=shader.MainFunctionBody();
+    body<<"let dir=workgroup_id.y/(256u/tile_units);let first_unit=(workgroup_id.y%(256u/tile_units))*tile_units;"
+      <<"let first_time=uniforms.first_time+workgroup_id.x*tile_times;"
+      <<"if(local_idx==0u){live_count=0u;if(valid_extent()){live_count="<<extent.GetByOffset("6u")<<";}}workgroupBarrier();"
+      <<"let len=workgroupUniformLoad(&live_count);if(first_time>=len){return;}"
+      <<"let unit=first_unit+local_idx%tile_units;let time=first_time+local_idx/tile_units;let wb=dir*1024u*640u;"
+      <<"var gi=0.0;var go=0.0;var gf=0.0;var gc=0.0;"
+      <<"for(var block=0u;block<640u;block+=tile_k){"
+      <<"for(var i=local_idx;i<tile_k*tile_times;i+=tile_lanes){let t=first_time+i%tile_times;var v=0.0;if(t<len){v="
+      <<x.GetByOffset("(block+i/tile_times)*uniforms.input_capacity+t")<<";}matrix_x[i]=v;}"
+      <<"for(var i=local_idx;i<4u*tile_k*tile_units;i+=tile_lanes){let k=block+(i/tile_units)%tile_k;let gate=i/(tile_k*tile_units);"
+      <<"let row=gate*256u+first_unit+i%tile_units;matrix_w[i]="
+      <<w.GetByOffset(WeightOffset("wb","row","640u",coalesced_))<<";}workgroupBarrier();"
+      <<"for(var k=0u;k<tile_k;k++){let value=matrix_x[k*tile_times+local_idx/tile_units];let wi=k*tile_units+local_idx%tile_units;"
+      <<"gi=gi+value*matrix_w[wi];go=go+value*matrix_w[tile_k*tile_units+wi];"
+      <<"gf=gf+value*matrix_w[2u*tile_k*tile_units+wi];gc=gc+value*matrix_w[3u*tile_k*tile_units+wi];}workgroupBarrier();}"
+      <<"if(time<len){let base=(time*2u+dir)*1024u+unit;"
+      <<out.SetByOffset("base","gi")<<out.SetByOffset("base+256u","go")
+      <<out.SetByOffset("base+512u","gf")<<out.SetByOffset("base+768u","gc")<<"}";
+    return Status::OK();
+  }
+ private:bool coalesced_;uint32_t lanes_,units_,inner_;
+};
+inline Status RunTiledInputProjectionV1(ComputeContextBase& context,const Tensor* x,const Tensor* weights,
+    const Tensor* extent,Tensor* projection,uint32_t input_capacity,uint32_t output_capacity,
+    gsl::span<const uint32_t> identity,bool coalesced,bool* used_tiled=nullptr){
+  if(used_tiled)*used_tiled=false;
+  ORT_RETURN_IF_NOT(input_capacity&&input_capacity<=102400&&output_capacity&&output_capacity<=102400&&identity.size()==10&&
+      x&&weights&&extent&&projection&&x->IsDataType<float>()&&weights->IsDataType<float>()&&
+      extent->IsDataType<uint32_t>()&&projection->IsDataType<float>()&&
+      x->Shape()==TensorShape({1,640,input_capacity})&&extent->Shape()==TensorShape{32}&&
+      weights->Shape()==(coalesced?TensorShape({2,640,1024}):TensorShape({2,1024,640}))&&
+      projection->Shape()==TensorShape({output_capacity,2,1024}),"RW07 tiled projection descriptor bounds");
+  const auto& limits=context.DeviceLimits();
+  constexpr uint32_t gates=4,features=640,hidden=256,directions=2,scalar_bytes=sizeof(float),shared_alignment=16;
+  // No subgroup operations are used. If the optional subgroup limits are
+  // unavailable, derive a cooperative group from one hidden unit per gate
+  // instead of silently reducing the group to a single lane.
+  const uint32_t preferred_lanes=context.AdapterInfo().subgroupMaxSize?
+      context.AdapterInfo().subgroupMaxSize:hidden/gates;
+  const uint32_t lanes=std::bit_floor(std::min({limits.maxComputeWorkgroupSizeX,limits.maxComputeInvocationsPerWorkgroup,
+      preferred_lanes,hidden}));
+  const auto legacy=[&](){return RunInputProjectionV1(context,x,weights,extent,projection,input_capacity,output_capacity,identity,coalesced);};
+  if(lanes<gates||limits.maxComputeWorkgroupStorageSize<=shared_alignment)return legacy();
+  const uint32_t units=1u<<((std::bit_width(lanes)-1)/2),times=lanes/units;
+  // Square output tile from the lane count; at most one K coefficient per
+  // lane per gate keeps cooperative loading bounded. Clamp to actual shared RAM.
+  const uint32_t inner=std::bit_floor(std::min({features,lanes/gates,
+      (limits.maxComputeWorkgroupStorageSize-shared_alignment)/scalar_bytes/(times+gates*units)}));
+  const uint32_t unit_groups=directions*(hidden/units);
+  if(!inner||features%inner||limits.maxComputeWorkgroupsPerDimension<unit_groups)return legacy();
+  const uint64_t products_per_group=uint64_t(lanes)*gates*features;
+  const uint32_t blocks=uint32_t(std::min<uint64_t>(limits.maxComputeWorkgroupsPerDimension,
+      kM0ScheduledProductsPerWindowV1/(products_per_group*unit_groups)));
+  ORT_RETURN_IF_NOT(blocks>0,"RW07 tiled input projection work budget");
+  if(used_tiled)*used_tiled=true;
+  for(uint32_t first=0;first<output_capacity;){
+    const uint32_t groups=std::min(blocks,(output_capacity-first+times-1)/times);
+    TiledRecurrenceProjectionV1 program(coalesced,lanes,units,inner);
+    program.AddInputs({{x,ProgramTensorMetadataDependency::None},{weights,ProgramTensorMetadataDependency::None},
+        {extent,ProgramTensorMetadataDependency::None}}).AddOutput({projection,ProgramTensorMetadataDependency::None})
+      .SetWorkgroupSize(lanes).SetDispatchGroupSize(groups,unit_groups)
+      .AddUniformVariables({input_capacity,output_capacity,identity,first});
+    ORT_RETURN_IF_ERROR(context.RunProgram(program,uint64_t(groups)*unit_groups*products_per_group));first+=groups*times;
   }
   return Status::OK();
 }

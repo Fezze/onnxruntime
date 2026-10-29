@@ -12,7 +12,6 @@ namespace {
 bool Gpu(const Tensor* t) { return t && t->Location().device.Type() == OrtDevice::GPU; }
 
 using m0_signal_detail::Prefix;
-using m0_signal_detail::Signal;
 
 class Guard final : public Program<Guard> {
  public:
@@ -127,15 +126,11 @@ class SignalExtent final : public WebGpuKernel {
         .AddOutput({&phase, ProgramTensorMetadataDependency::None}).SetWorkgroupSize(1).SetDispatchGroupSize(9)
         .AddUniformVariables({pc, oc, identity});
     ORT_RETURN_IF_ERROR(c.RunProgram(prefix));
-    const uint64_t dx = std::min(groups, limit), dy = (groups + dx - 1) / dx;
-    Signal signal;
-    signal.AddInputs({{x, ProgramTensorMetadataDependency::None}, {&phase, ProgramTensorMetadataDependency::None},
-                      {out, ProgramTensorMetadataDependency::None}, {w, ProgramTensorMetadataDependency::None}, {bias, ProgramTensorMetadataDependency::None}})
-        .AddOutput({y, ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64)
-        .SetDispatchGroupSize(uint32_t(dx), uint32_t(dy)).AddUniformVariables({pc, oc, identity});
-    ORT_RETURN_IF_ERROR(c.RunProgram(signal));
+    uint64_t signal_dispatches=0;
+    ORT_RETURN_IF_ERROR(m0_signal_detail::RunSignalWindowsV3(c,x,&phase,out,w,bias,y,pc,oc,identity,
+        M0BatchHeavyProgramsV1(),&signal_dispatches));
     LOGS(c.Logger(), INFO) << "M0_RW07_SIGNAL_AFTER1487_V1 session=" << session << " run=" << run
-                          << " source_pair_valid=" << paired << " role=13 instance=1014 GPU_dispatches=3 host_payload_reads=0";
+                          << " source_pair_valid=" << paired << " role=13 instance=1014 GPU_dispatches="<<2+signal_dispatches<<" host_payload_reads=0";
     return Status::OK();
   }
  private:

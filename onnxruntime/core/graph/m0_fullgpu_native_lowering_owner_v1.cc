@@ -133,17 +133,20 @@ uint32_t M0FullGpuNativeLoweringOwnerV1::SelectPhysicalCapacity(M0NativeGpuModul
  const uint64_t minimum_peak=memory.PeakBytes(1);
  const auto memory_budget=M0BoundedMemoryPlanningBudgetV1(
   available_bytes,future_weights,minimum_peak,limits.max_buffer_bytes);
- const uint64_t planning_budget=memory_budget.working_set_bytes;
- queued_reference_limit_bytes=memory_budget.queued_reference_limit_bytes;
- const uint64_t reserve_headroom=available_bytes>=kM0MemoryReserveBytesV1&&
-  future_weights<=available_bytes-kM0MemoryReserveBytesV1?available_bytes-kM0MemoryReserveBytesV1-future_weights:0;
- const uint64_t queued_warning_envelope=queued_reference_limit_bytes?queued_reference_limit_bytes:planning_budget;
- if(!reading.IsOK()||planning_budget>reserve_headroom||queued_warning_envelope>reserve_headroom-planning_budget) {
-  LOGS_DEFAULT(WARNING)<<"M0_RW07_MEMORY_WARNING phase=capacity policy=monitor available_bytes="<<available_bytes
-   <<" future_weight_bytes="<<future_weights<<" minimum_peak_bytes="<<minimum_peak
-   <<" planning_budget_bytes="<<planning_budget;
- }
- const auto memory_fits=[&](uint32_t d){return memory.PeakBytes(d)<=planning_budget;};
+ ORT_ENFORCE(memory_budget.queued_reference_limit_bytes<=std::numeric_limits<uint64_t>::max()-memory_budget.working_set_bytes,
+  "RW07_NATIVE_MEMORY_PLAN_COMBINED_OVERFLOW");
+ const uint64_t combined_budget=memory_budget.working_set_bytes+memory_budget.queued_reference_limit_bytes;
+ const uint64_t minimum_queue=std::max(memory_budget.queued_reference_limit_bytes,memory.PeakReferenceBytes(1));
+ const bool batchable_floor=memory_budget.queued_reference_limit_bytes&&minimum_queue<=limits.max_buffer_bytes&&
+  minimum_peak<=combined_budget&&minimum_queue<=combined_budget-minimum_peak;
+ // If even the minimum batchable node cannot fit, retain the existing bounded
+ // serial fallback rather than denying an otherwise supported small utterance.
+ const auto queue_for=[&](uint32_t d){return batchable_floor?
+  std::max(memory_budget.queued_reference_limit_bytes,memory.PeakReferenceBytes(d)):memory_budget.queued_reference_limit_bytes;};
+ const auto memory_fits=[&](uint32_t d){
+  const uint64_t peak=memory.PeakBytes(d),queue=queue_for(d);
+  return queue<=limits.max_buffer_bytes&&peak<=combined_budget&&queue<=combined_budget-peak;
+ };
  const auto fits=[&](uint32_t d){
   const auto sized=module.DeviceLimits(CarrierBytes(d),initializer_bytes,kUniformBytes);
   const auto single=module.DeviceLimits(SingleBindingBytes(d));
@@ -155,6 +158,14 @@ uint32_t M0FullGpuNativeLoweringOwnerV1::SelectPhysicalCapacity(M0NativeGpuModul
  ORT_ENFORCE(low>0,"RW07_NATIVE_CAPACITY_DEVICE_OR_MEMORY_UNSUPPORTED available_bytes=",available_bytes,
   " reserve_bytes=",kM0MemoryReserveBytesV1," future_weight_bytes=",future_weights,
   " minimum_peak_bytes=",memory.PeakBytes(1));
+ queued_reference_limit_bytes=queue_for(low);
+ const uint64_t planning_budget=combined_budget-queued_reference_limit_bytes;
+ const uint64_t reserve_headroom=available_bytes>=kM0MemoryReserveBytesV1&&
+  future_weights<=available_bytes-kM0MemoryReserveBytesV1?available_bytes-kM0MemoryReserveBytesV1-future_weights:0;
+ if(!reading.IsOK()||combined_budget>reserve_headroom){
+  LOGS_DEFAULT(WARNING)<<"M0_RW07_MEMORY_WARNING phase=capacity policy=monitor available_bytes="<<available_bytes
+   <<" future_weight_bytes="<<future_weights<<" minimum_peak_bytes="<<minimum_peak<<" planning_budget_bytes="<<planning_budget;
+ }
  memory_order=memory.Order();peak_bytes=memory.PeakBytes(low);
  const uint64_t remaining=available_bytes>=future_weights?available_bytes-future_weights:0;
  const uint64_t queued_slack=queued_reference_limit_bytes?queued_reference_limit_bytes:
@@ -163,7 +174,7 @@ uint32_t M0FullGpuNativeLoweringOwnerV1::SelectPhysicalCapacity(M0NativeGpuModul
   <<" requested_ceiling="<<requested_ceiling<<" reserve_bytes="<<kM0MemoryReserveBytesV1<<" future_weight_bytes="<<future_weights
   <<" estimated_live_and_scratch_bytes="<<peak_bytes<<" queued_slack_bytes="<<queued_slack
   <<" planned_queued_reference_limit_bytes="<<queued_reference_limit_bytes
-  <<" planning_budget_bytes="<<planning_budget<<" memory_policy="<<(kM0EnforceMemoryReserveV1?"enforce":"monitor")<<" mono_us="<<M0MonotonicMicrosecondsV1();
+  <<" planning_budget_bytes="<<planning_budget<<" queue_command_floor_available="<<batchable_floor<<" memory_policy="<<(kM0EnforceMemoryReserveV1?"enforce":"monitor")<<" mono_us="<<M0MonotonicMicrosecondsV1();
  return low;
 }
 void M0FullGpuNativeLoweringOwnerV1::ValidatePhysicalCapacity(M0NativeGpuModuleV2& module)const{

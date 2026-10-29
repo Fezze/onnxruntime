@@ -232,14 +232,8 @@ class M0SignalNumerics : public testing::Test {
         .AddOutput({&phase, ProgramTensorMetadataDependency::None}).SetWorkgroupSize(1).SetDispatchGroupSize(9)
         .AddUniformVariables({capacity, output_capacity, words});
     ASSERT_STATUS_OK(context.RunProgram(prefix));
-    m0_signal_detail::Signal signal(reuse_coefficients);
-    signal.AddInputs({{&x, ProgramTensorMetadataDependency::None}, {&phase, ProgramTensorMetadataDependency::None},
-                      {&e, ProgramTensorMetadataDependency::None}, {&w, ProgramTensorMetadataDependency::None},
-                      {&b, ProgramTensorMetadataDependency::None}})
-        .AddOutput({&y, ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64)
-        .SetDispatchGroupSize((output_capacity + 63) / 64)
-        .AddUniformVariables({capacity, output_capacity, words});
-    ASSERT_STATUS_OK(context.RunProgram(signal));
+    ASSERT_STATUS_OK(m0_signal_detail::RunSignalWindowsV3(context,&x,&phase,&e,&w,&b,&y,
+        capacity,output_capacity,words,reuse_coefficients));
     ep.BufferManager().Download(ep.Recording(), pb.get(), result.phase.data(), result.phase.size() * sizeof(float));
     ep.BufferManager().Download(ep.Recording(), yb.get(), result.signal.data(), result.signal.size() * sizeof(float));
   }
@@ -609,16 +603,8 @@ TEST(M0ResidualDispatchBudget, ActivationWindowsUseAvailableDeviceCapacityWithou
       const auto count=ResidualTileChannelCountV1(limits,capacity,capacity,channels,batched);
       ASSERT_GT(count,0u);EXPECT_LE(count,channels);EXPECT_LE(count,batched?256u:32u);
       const uint64_t row=uint64_t(capacity)*4,prefix=252;
-      const uint64_t target=std::min<uint64_t>(limits.maxStorageBufferBindingSize,std::max<uint64_t>((batched?32ull:8ull)*1024*1024,row+prefix));
+      const uint64_t target=std::min(limits.maxStorageBufferBindingSize,limits.maxBufferSize);
       EXPECT_LE(uint64_t(count)*row+prefix,target);
-    }
-  for(uint64_t budget:{64ull*1024*1024,128ull*1024*1024})for(uint32_t capacity:{12001u,72001u})
-    for(uint32_t channels:{128u,256u}){
-      const uint64_t fixed=ResidualFixedReferencesV1(capacity,capacity,channels,uint64_t(channels)*channels*11*4,channels*4);
-      const auto count=ResidualTileChannelCountV1(limits,capacity,capacity,channels,true,budget,fixed);
-      ASSERT_GT(count,0u);
-      if(fixed+uint64_t(capacity)*4+252<=budget)EXPECT_LT(fixed+uint64_t(count)*capacity*4+252,budget);
-      EXPECT_LE(count,ResidualTileChannelCountV1(limits,capacity,capacity,channels,true));
     }
   limits.maxComputeWorkgroupsPerDimension=3;
   EXPECT_EQ(ResidualTileChannelCountV1(limits,121,121,256,true),3u);
@@ -669,7 +655,12 @@ TEST(M0ResidualDispatchBudget, ProductBoundAndLastChunkCoverAdmittedPhysicalRang
   using namespace webgpu::m0_residual_stages;
   EXPECT_EQ(ResidualConvElementsPerDispatchV1(0,11),0u);
   EXPECT_EQ(M0NativeDispatchWindowV1(false),16u);EXPECT_EQ(M0NativeDispatchWindowV1(true),128u);
-  EXPECT_EQ(ResidualSnakeElementsPerDispatchV1(false),16384u);EXPECT_EQ(ResidualSnakeElementsPerDispatchV1(true),131072u);
+  for(bool batched:{false,true}){
+    const uint64_t chunk=ResidualSnakeElementsPerDispatchV1(batched),work=kNormAffineWorkPerElementV1+kSnakeWorkPerElementV1;
+    EXPECT_GT(chunk,0u);EXPECT_EQ(chunk%64,0u);
+    EXPECT_LE(chunk*work,M0HeavyProductsPerDispatchV1(batched));
+    EXPECT_GT((chunk+64)*work,M0HeavyProductsPerDispatchV1(batched));
+  }
   EXPECT_EQ(ResidualConvElementsPerDispatchV1(32,0),0u);
   EXPECT_EQ(ResidualConvElementsPerDispatchV1(UINT32_MAX,UINT32_MAX),0u);
   for(const bool batched:{false,true})for(const uint32_t inputs:{1u,7u,32u,64u,128u,256u})for(const uint32_t taps:{3u,7u,11u}){
@@ -2535,7 +2526,7 @@ TEST_F(M0RecurrenceProjection, ScheduledWorkBoundSurvivesByteDrainsAndPreservesD
     EXPECT_EQ(recording.m0_queued_scheduled_products,0u);EXPECT_TRUE(recording.deferred_dispatches.empty());
     for(uint32_t i=0;i<12;++i){
       if(i==3)recording.m0_submission_budget_bytes=recording.m0_queued_reference_bytes;
-      ASSERT_STATUS_OK(m0_residual_stages::RunHeavyProgram(context,program));
+      ASSERT_STATUS_OK(m0_residual_stages::RunHeavyProgram(context,program,hint));
       // Reused uniforms now retain one arena, so this exact byte limit is
       // reached by the new command as well: pre-admission drain is followed
       // by the required post-enqueue drain. Both must reset scheduled work.

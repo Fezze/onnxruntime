@@ -13,6 +13,8 @@ namespace onnxruntime {
 namespace webgpu {
 class MatMulProgram final : public Program<MatMulProgram> {
  public:
+  // K coefficients loaded by each generic shared-memory tile.
+  static constexpr uint32_t kInnerTileSamplesV1=32;
   MatMulProgram(const Activation& activation, bool bias, bool is_vec4,
                 const gsl::span<int64_t>& elements_per_thread, bool is_channels_last = false,
                 uint32_t split_dim_inner = 1, bool use_f32_accumulation = false)

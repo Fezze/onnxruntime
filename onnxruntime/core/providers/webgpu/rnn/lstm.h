@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "core/providers/webgpu/program.h"
+#include "core/providers/webgpu/math/matmul.h"
 #include "core/providers/webgpu/webgpu_kernel.h"
 
 namespace onnxruntime {
@@ -42,8 +43,8 @@ class LstmCellProgram final : public Program<LstmCellProgram> {
                   bool input_forget, bool has_clip, int layout,
                   const std::string& f_activation_fn,
                   const std::string& g_activation_fn,
-                  const std::string& h_activation_fn, bool coalesced_weights = false)
-      : Program{coalesced_weights ? "LstmCellCoalescedWeights" : "LstmCell"},
+                  const std::string& h_activation_fn, bool coalesced_weights = false, bool input_projected = false)
+      : Program{input_projected ? "LstmCellPreprojectedV2" : coalesced_weights ? "LstmCellCoalescedWeights" : "LstmCell"},
         has_bias_(has_bias),
         has_peephole_(has_peephole),
         has_Y_(has_Y),
@@ -54,7 +55,7 @@ class LstmCellProgram final : public Program<LstmCellProgram> {
         f_activation_fn_(f_activation_fn),
         g_activation_fn_(g_activation_fn),
         h_activation_fn_(h_activation_fn),
-        coalesced_weights_(coalesced_weights) {}
+        coalesced_weights_(coalesced_weights), input_projected_(input_projected) {}
 
   Status GenerateShaderCode(ShaderHelper& shader) const override;
 
@@ -80,6 +81,7 @@ class LstmCellProgram final : public Program<LstmCellProgram> {
   std::string g_activation_fn_;
   std::string h_activation_fn_;
   bool coalesced_weights_;
+  bool input_projected_;
 };
 
 // Writes h_new values to the Y output tensor with optional seq_lens masking.
@@ -108,6 +110,7 @@ class Lstm final : public WebGpuKernel {
   Status ComputeInternal(ComputeContext& context) const override;
 
  private:
+  mutable MatMulOptImplCache projection_cache_;
   std::string direction_;
   int64_t hidden_size_;
   float clip_;

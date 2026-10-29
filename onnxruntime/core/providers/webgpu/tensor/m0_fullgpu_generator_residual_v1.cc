@@ -108,9 +108,7 @@ class GeneratorResidualExtent final : public WebGpuKernel {
     for(const auto* t:params){ORT_RETURN_IF_ERROR(binding(t));}
     const uint32_t pc=uint32_t(x->Shape()[2]),oc=uint32_t(capacity_);
     uint32_t tile_channels=0;
-    const uint64_t fixed_references=m0_residual_stages::ResidualFixedReferencesV1(pc,oc,channels,
-        std::max(params[4]->SizeInBytes(),params[10]->SizeInBytes()),std::max(params[5]->SizeInBytes(),params[11]->SizeInBytes()));
-    ORT_RETURN_IF_ERROR(m0_residual_stages::ResidualTileChannels(c,pc,oc,channels,tile_channels,true,fixed_references));
+    ORT_RETURN_IF_ERROR(m0_residual_stages::ResidualTileChannels(c,pc,oc,channels,tile_channels,true));
     // The tile planner validated both complete rows and the worst alignment prefix.
     const uint64_t prefix=limits.minStorageBufferOffsetAlignment-sizeof(float);
     const uint64_t row_bytes=uint64_t(std::max(pc,oc))*sizeof(float);
@@ -133,10 +131,12 @@ class GeneratorResidualExtent final : public WebGpuKernel {
     auto activated=c.CreateGPUTensor(x->DataType(),TensorShape{1,tile_channels,capacity_});
     auto conv=c.CreateGPUTensor(x->DataType(),TensorShape{1,channels,capacity_});
     auto coefficients=c.CreateGPUTensor(x->DataType(),TensorShape{channels,6});
-    std::optional<Tensor> packed_columns,packed_flags,register_weights;
+    std::optional<Tensor> packed_columns,packed_flags,register_weights,active_grid;
     const uint64_t packed_elements=m0_residual_stages::ResidualPackedElementsV1(tile_channels,kernel);
     if(M0OutputChannelTiledConvV1()&&m0_residual_stages::ResidualPackedSupportedV1(limits)&&
         packed_elements*4<=limits.maxStorageBufferBindingSize&&packed_elements*4<=limits.maxBufferSize){
+      active_grid.emplace(c.CreateGPUTensor(DataTypeImpl::GetType<uint32_t>(),TensorShape{3}));
+      ORT_RETURN_IF_ERROR(binding(&*active_grid));
       packed_columns.emplace(c.CreateGPUTensor(x->DataType(),TensorShape{int64_t(packed_elements)}));
       packed_flags.emplace(c.CreateGPUTensor(DataTypeImpl::GetType<uint32_t>(),TensorShape{int64_t(m0_residual_stages::ResidualPackedFlagCapacityV1(packed_elements))}));
       ORT_RETURN_IF_ERROR(binding(&*packed_columns));ORT_RETURN_IF_ERROR(binding(&*packed_flags));
@@ -252,7 +252,7 @@ class GeneratorResidualExtent final : public WebGpuKernel {
           const uint64_t norm_groups=(uint64_t(size)+63)/64;
           const uint64_t nx=std::min(norm_groups,limit),ny=(norm_groups+nx-1)/nx;
           norm.SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(nx),uint32_t(ny));
-          ORT_RETURN_IF_ERROR(m0_residual_stages::RunHeavyProgram(c,norm));
+          ORT_RETURN_IF_ERROR(m0_residual_stages::RunHeavyProgram(c,norm,norm_groups*64*(m0_residual_stages::kNormAffineWorkPerElementV1+(norm.FusedSnake()?m0_residual_stages::kSnakeWorkPerElementV1:0))));
           ++dispatches;
           if(!norm.FusedSnake()){
             GeneratorSnakeInPlace snake;
@@ -261,7 +261,7 @@ class GeneratorResidualExtent final : public WebGpuKernel {
                 .SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(nx),uint32_t(ny))
                 .AddUniformVariables({inputcap,oc,channels,minimum,maximum,modulus,remainder,kernel,dilation,pc,
                                       offset,count,tile_channels,uint32_t(first),size,identity});
-            ORT_RETURN_IF_ERROR(m0_residual_stages::RunHeavyProgram(c,snake));
+            ORT_RETURN_IF_ERROR(m0_residual_stages::RunHeavyProgram(c,snake,norm_groups*64*m0_residual_stages::kSnakeWorkPerElementV1));
             ++dispatches;
           }
         }
@@ -271,7 +271,7 @@ class GeneratorResidualExtent final : public WebGpuKernel {
             offset,count,output_offset,output_count,identity};
           ORT_RETURN_IF_ERROR(m0_residual_stages::RunResidualConvolutionV1(c,
             ProgramInput{normout,ProgramTensorMetadataDependency::None},output_window(convout,output_offset,output_count),
-            out,params[6*h+4],params[6*h+5],packed_columns?&*packed_columns:nullptr,packed_flags?&*packed_flags:nullptr,spec,dispatches,false,0,register_weights?&*register_weights:nullptr));
+            out,params[6*h+4],params[6*h+5],packed_columns?&*packed_columns:nullptr,packed_flags?&*packed_flags:nullptr,spec,dispatches,false,0,register_weights?&*register_weights:nullptr,active_grid?&*active_grid:nullptr));
         }
       }
     }

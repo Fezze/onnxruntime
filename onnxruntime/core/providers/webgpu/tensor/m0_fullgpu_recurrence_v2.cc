@@ -163,7 +163,8 @@ Status ComputeOwnedRecurrence(ComputeContext& c, const Tensor* x, const Tensor* 
   if(preproject){
     projection=std::make_unique<Tensor>(c.CreateGPUTensor(x->DataType(),TensorShape{output_capacity,2,1024}));
     ORT_RETURN_IF_ERROR(binding(projection.get()));
-    ORT_RETURN_IF_ERROR(m0_recurrence_programs::RunInputProjectionV1(c,x,active_w,out,projection.get(),
+    c.FillZero(*projection);
+    ORT_RETURN_IF_ERROR(m0_recurrence_programs::RunTiledInputProjectionV1(c,x,active_w,out,projection.get(),
         input_capacity,output_capacity,opaque,coalesced));
     recurrence_input=projection.get();
   }

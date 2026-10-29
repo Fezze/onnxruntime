@@ -344,17 +344,9 @@ class WebGpuContext final {
   static constexpr uint64_t kWebGpuGuaranteedMaxStorageBufferBindingSize =
       128ULL * 1024 * 1024;
 
-  uint32_t M0ResidualBlockChoiceV1(const std::string& key) const {
-    std::lock_guard<std::mutex> lock(m0_residual_block_mutex_);
-    const auto found=m0_residual_blocks_.find(key);
-    return found==m0_residual_blocks_.end()?0u:found->second;
-  }
-  void M0RememberResidualBlockV1(const std::string& key,uint32_t block) {
-    ORT_ENFORCE(block==1||block==2||block==4||block==8||block==16||block==32||block==64,"RW07 residual tuning block");
-    std::lock_guard<std::mutex> lock(m0_residual_block_mutex_);
-    if(m0_residual_blocks_.size()>=128)m0_residual_blocks_.clear();
-    m0_residual_blocks_[key]=block;
-  }
+  uint32_t M0ResidualBlockChoiceV1(const std::string& key) const;
+  void M0RememberResidualBlockV1(const std::string& key,uint32_t block);
+
 
   ~WebGpuContext();
 
@@ -506,6 +498,7 @@ class WebGpuContext final {
 
   Status Run(ComputeContextBase& context, const ProgramBase& program, uint64_t scheduled_products=0);
   Status RunWithCheckedCompletion(ComputeContextBase& context, const ProgramBase& program, uint64_t scheduled_products = 0);
+  Status RunWithQueuedCompletion(ComputeContextBase& context,const ProgramBase& program,uint64_t scheduled_products=0);
 
 #if defined(ENABLE_PIX_FOR_WEBGPU_EP)
   std::unique_ptr<WebGpuPIXFrameGenerator> CreatePIXFrameGenerator() {
@@ -515,8 +508,12 @@ class WebGpuContext final {
 #endif  // ENABLE_PIX_FOR_WEBGPU_EP
 
  private:
+  std::string M0ResidualPersistentKeyV1(const std::string& key)const;
+  bool M0CheckedQueueCurrentV1(const CommandRecordingState& recording)const;
+  mutable std::mutex m0_queue_epoch_mutex_;
+  uint64_t m0_queue_epoch_=0,m0_checked_queue_epoch_=0;
   mutable std::mutex m0_residual_block_mutex_;
-  InlinedHashMap<std::string,uint32_t> m0_residual_blocks_;
+  mutable InlinedHashMap<std::string,uint32_t> m0_residual_blocks_;
   enum class TimestampQueryType {
     None = 0,
     InsidePasses,

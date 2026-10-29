@@ -7,6 +7,9 @@
 #include "core/common/m0_capacity_ceiling_v1.h"
 #include "core/providers/webgpu/webgpu_kernel.h"
 #include "core/providers/webgpu/tensor/m0_fullgpu_signal_programs_v1.h"
+#include "core/providers/webgpu/tensor/m0_fullgpu_residual_stages_v1.h"
+#include "core/providers/webgpu/tensor/m0_fullgpu_recurrence_programs_v3.h"
+#include "core/providers/webgpu/tensor/m0_fullgpu_duration_programs_v5.h"
 #include "core/providers/webgpu/tensor/m0_fullgpu_polar_after1573_v1_programs.h"
 #include "core/providers/webgpu/tensor/m0_fullgpu_stft1573_extent_v1_programs.h"
 
@@ -64,6 +67,25 @@ class ProbeStftInputs final : public Program<ProbeStftInputs> {
   }
 };
 
+// Decode the public integer producer outputs only inside an isolated test.
+class ProbeDurationSummaryV1 final : public Program<ProbeDurationSummaryV1> {
+ public:
+  ProbeDurationSummaryV1():Program{"M0QualificationDurationSummaryV1"}{}
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"tokens",ProgramUniformVariableDataType::Uint32});
+  Status GenerateShaderCode(ShaderHelper& s)const override{
+    const auto& duration=s.AddInput("duration",ShaderUsage::UseValueTypeAlias);
+    const auto& prefix=s.AddInput("prefix",ShaderUsage::UseValueTypeAlias);
+    const auto& total=s.AddInput("total",ShaderUsage::UseValueTypeAlias);
+    const auto& extent=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
+    const auto& output=s.AddOutput("summary",ShaderUsage::UseValueTypeAlias);
+    s.MainFunctionBody()<<"for(var t=0u;t<uniforms.tokens;t++){"
+      <<output.SetByOffset("t","f32("+duration.GetByOffset("2u*t")+")")
+      <<output.SetByOffset("uniforms.tokens+t","f32("+prefix.GetByOffset("2u*t")+")")<<"}"
+      <<output.SetByOffset("2u*uniforms.tokens","f32("+total.GetByOffset("0u")+")")
+      <<output.SetByOffset("2u*uniforms.tokens+1u","f32("+extent.GetByOffset("20u")+")");
+    return Status::OK();
+  }
+};
 class SignalProgramProbe final : public WebGpuKernel {
  public:
   explicit SignalProgramProbe(const OpKernelInfo& info)
@@ -76,7 +98,7 @@ class SignalProgramProbe final : public WebGpuKernel {
     ORT_RETURN_IF_NOT(c.KernelContext().M0FullGpuExtentOwnerEpochV1()!=0&&
                           c.KernelContext().M0FullGpuExtentRunIdV2()==0,
                       "M0_PROGRAM_PROBE_REQUIRES_ISOLATED_SESSION");
-    ORT_RETURN_IF_NOT((stage_==1||stage_==2||stage_==3||stage_==5)&&(reuse_==0||reuse_==1),"M0_PROGRAM_PROBE_STAGE");
+    ORT_RETURN_IF_NOT((stage_==1||stage_==2||stage_==3||stage_==5||stage_==6||stage_==7||stage_==8)&&(reuse_==0||reuse_==1),"M0_PROGRAM_PROBE_STAGE");
     const auto* x=c.Input<Tensor>(0);const auto* e=c.Input<Tensor>(1);
     const auto& limits=c.DeviceLimits();
     const auto storage=[&](const Tensor* tensor){
@@ -111,6 +133,73 @@ class SignalProgramProbe final : public WebGpuKernel {
     };
     constexpr std::array<uint32_t,10> identity{1,2,3,4,5,6,7,8,9,10};
     const auto words=gsl::span<const uint32_t>{identity.data(),identity.size()};
+    if(stage_==8){
+      const auto* weight=c.Input<Tensor>(2);
+      ORT_RETURN_IF_NOT(x->Shape().NumDimensions()==3&&x->Shape()[0]==1&&x->Shape()[1]==640&&
+          x->Shape()[2]>0&&x->Shape()[2]<=102400&&storage(weight)&&weight->Shape()==TensorShape({2,1024,640}),
+          "M0_PROJECTION_PROBE_INPUT");
+      const uint32_t capacity=uint32_t(x->Shape()[2]);
+      auto* output=c.Output(0,TensorShape{capacity,2,1024});c.FillZero(*output);
+      Tensor transposed;const Tensor* selected=weight;
+      if(reuse_){transposed=c.CreateGPUTensor(weight->DataType(),TensorShape{2,640,1024});
+        ORT_RETURN_IF_ERROR(m0_recurrence_programs::RunWeightTranspose(c,weight,&transposed,640));selected=&transposed;}
+      bool used_tiled=false;
+      ORT_RETURN_IF_ERROR(m0_recurrence_programs::RunTiledInputProjectionV1(c,x,selected,e,output,capacity,capacity,words,reuse_!=0,&used_tiled));
+      ORT_RETURN_IF_NOT(used_tiled,"M0_PROJECTION_PROBE_REQUIRES_TILED_PATH");
+      return Status::OK();
+    }
+    if(stage_==6){
+      const auto* weight=c.Input<Tensor>(2);const auto* bias=c.Input<Tensor>(3);
+      ORT_RETURN_IF_NOT(x->Shape().NumDimensions()==3&&x->Shape()[0]==1&&x->Shape()[1]>0&&x->Shape()[1]<=256&&
+          x->Shape()[2]>0&&x->Shape()[2]<=UINT32_MAX&&storage(weight)&&storage(bias)&&
+          weight->Shape().NumDimensions()==3,"M0_RESIDUAL_PROBE_INPUT");
+      const uint32_t channels=uint32_t(x->Shape()[1]),capacity=uint32_t(x->Shape()[2]),kernel=uint32_t(weight->Shape()[2]);
+      auto* output=c.Output(0,x->Shape());c.FillZero(*output);
+      uint32_t planned_channels=0;
+      ORT_RETURN_IF_ERROR(m0_residual_stages::ResidualTileChannels(c,capacity,capacity,channels,planned_channels,true));
+      ORT_RETURN_IF_NOT(planned_channels==channels,"M0_RESIDUAL_PROBE_FULL_ADMITTED_ACTIVATION_TILE");
+      const uint64_t elements=m0_residual_stages::ResidualPackedElementsV1(planned_channels,kernel);
+      auto columns=c.CreateGPUTensor(x->DataType(),TensorShape{int64_t(elements)});
+      auto flags=c.CreateGPUTensor(DataTypeImpl::GetType<uint32_t>(),TensorShape{int64_t(m0_residual_stages::ResidualPackedFlagCapacityV1(elements))});
+      auto weights=c.CreateGPUTensor(x->DataType(),TensorShape{int64_t(m0_residual_stages::ResidualRegisterWeightElementsV1(channels,channels,kernel))});
+      auto args=c.CreateGPUTensor(DataTypeImpl::GetType<uint32_t>(),TensorShape{3});
+      const m0_residual_stages::ResidualConvSpecV1 spec{capacity,capacity,channels,1u,capacity,1u,0u,kernel,1u,capacity,
+          0u,channels,0u,channels,words};
+      uint64_t dispatches=0;
+      return m0_residual_stages::RunResidualConvolutionV1(c,{x,ProgramTensorMetadataDependency::None},
+          {output,ProgramTensorMetadataDependency::None},e,weight,bias,&columns,&flags,spec,dispatches,true,reuse_?64u:32u,&weights,&args);
+    }
+    if(stage_==7){
+      const auto* speed=c.Input<Tensor>(2);
+      ORT_RETURN_IF_NOT(x->Shape().NumDimensions()==3&&x->Shape()[0]==1&&x->Shape()[1]>0&&x->Shape()[1]<=512&&
+          x->Shape()[2]==50&&storage(speed)&&speed->Shape().Size()==1,"M0_DURATION_PROBE_INPUT");
+      const uint32_t tokens=uint32_t(x->Shape()[1]),capacity=reuse_?tokens*12-1:tokens*50;
+      auto values=c.CreateGPUTensor(DataTypeImpl::GetType<uint32_t>(),TensorShape{tokens,2});
+      auto durations=c.CreateGPUTensor(DataTypeImpl::GetType<int64_t>(),TensorShape{tokens});
+      auto prefixes=c.CreateGPUTensor(DataTypeImpl::GetType<int64_t>(),TensorShape{tokens});
+      auto total=c.CreateGPUTensor(DataTypeImpl::GetType<int64_t>(),TensorShape{});
+      auto extent=c.CreateGPUTensor(DataTypeImpl::GetType<uint32_t>(),TensorShape{32});
+      m0_duration_detail::DurationRowsProgram rows;
+      rows.AddInputs({{x,ProgramTensorMetadataDependency::None},{speed,ProgramTensorMetadataDependency::None}})
+        .AddOutput({&values,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(kProductionWorkgroupLanes)
+        .SetDispatchGroupSize((tokens+kProductionWorkgroupLanes-1)/kProductionWorkgroupLanes).AddUniformVariables({tokens});
+      ORT_RETURN_IF_ERROR(c.RunProgram(rows));
+      const auto in_words=[](const Tensor* tensor){ProgramInput input(tensor,ProgramTensorMetadataDependency::None,
+          TensorShape{int64_t(tensor->SizeInBytes()/sizeof(uint32_t))},1);input.var_type=ProgramVariableDataType::Uint32;return input;};
+      const auto out_words=[](Tensor* tensor){ProgramOutput output(tensor,ProgramTensorMetadataDependency::None,
+          TensorShape{int64_t(tensor->SizeInBytes()/sizeof(uint32_t))},1);output.var_type=ProgramVariableDataType::Uint32;return output;};
+      m0_duration_detail::DurationProgram publish;
+      publish.AddInput({&values,ProgramTensorMetadataDependency::None})
+        .AddOutputs({out_words(&durations),out_words(&prefixes),out_words(&total),out_words(&extent)})
+        .SetWorkgroupSize(1).SetDispatchGroupSize(1)
+        .AddUniformVariables({tokens,capacity,1u,0u,1u,0u,1u,0u,1u,0u});
+      ORT_RETURN_IF_ERROR(c.RunProgram(publish));
+      auto* output=c.Output(0,TensorShape{1,2*tokens+2});
+      ProbeDurationSummaryV1 summary;
+      summary.AddInputs({in_words(&durations),in_words(&prefixes),in_words(&total),in_words(&extent)})
+        .AddOutput({output,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(1).SetDispatchGroupSize(1).AddUniformVariables({tokens});
+      return c.RunProgram(summary);
+    }
     if(stage_==1){
       const auto* weight=c.Input<Tensor>(2);const auto* bias=c.Input<Tensor>(3);
       ORT_RETURN_IF_NOT(x->Shape().NumDimensions()==3&&x->Shape()[0]==1&&x->Shape()[1]==1&&
@@ -141,12 +230,7 @@ class SignalProgramProbe final : public WebGpuKernel {
           .AddOutput({phase,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(1).SetDispatchGroupSize(kHarmonicRows)
           .AddUniformVariables({capacity,output_capacity,words});
       ORT_RETURN_IF_ERROR(c.RunProgram(prefix));
-      m0_signal_detail::Signal signal_program(reuse_!=0);
-      signal_program.AddInputs({{x,ProgramTensorMetadataDependency::None},{phase,ProgramTensorMetadataDependency::None},
-          {e,ProgramTensorMetadataDependency::None},{weight,ProgramTensorMetadataDependency::None},{bias,ProgramTensorMetadataDependency::None}})
-          .AddOutput({signal,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(kProductionWorkgroupLanes)
-          .SetDispatchGroupSize(dispatch[0],dispatch[1]).AddUniformVariables({capacity,output_capacity,words});
-      return c.RunProgram(signal_program);
+      return m0_signal_detail::RunSignalWindowsV3(c,x,phase,e,weight,bias,signal,capacity,output_capacity,words,reuse_!=0);
     }
     if(stage_==3||stage_==5){
       const auto* window=c.Input<Tensor>(2);

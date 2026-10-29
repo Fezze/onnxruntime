@@ -15,17 +15,41 @@ namespace onnxruntime::webgpu::m0_stft_detail {
 inline constexpr uint32_t kOriginalBluesteinFftSamplesV1=64;
 inline constexpr uint32_t kStftFrameSamplesV1=20;
 inline constexpr uint32_t kStftPositiveFrequencyBinsV1=kStftFrameSamplesV1/2+1;
+// A power-of-two lane partition for the11 bins within the retained64-lane
+// qualified dispatch envelope; each independent frame owns one partition.
+inline constexpr uint32_t kDftLanesPerFrameV1=std::bit_ceil(kStftPositiveFrequencyBinsV1);
+inline constexpr uint32_t kDftFramesPerWorkgroupV1=kOriginalBluesteinFftSamplesV1/kDftLanesPerFrameV1;
 inline constexpr uint32_t kBluesteinTransformCountV1=2;
 inline constexpr uint32_t kBluesteinStagesV1=std::bit_width(kOriginalBluesteinFftSamplesV1)-1;
 inline constexpr uint32_t kComplexRealProductsV1=4;
-// Conservative real multiplications per active frame: window/chirp, initial
-// rotation, both radix2 FFTs, convolution/reversal and final retained bins.
-inline constexpr uint64_t kStftRealProductsPerFrameV1=
+// Each retained bin independently computes the window product and its real
+// and imaginary products. Windowing is repeated per bin in this shader.
+inline constexpr uint64_t kDftRealProductsPerFrameV1=
+    kStftFrameSamplesV1*kStftPositiveFrequencyBinsV1*3;
+// Forward error of the window product, rounded root coefficient, complex
+// component product and accumulation. gamma(n)=n*u/(1-n*u), u=epsilon/2.
+// Divide by the lower bound for the independently accumulated absolute sum.
+inline constexpr float kDftUnitRoundoffV1=std::numeric_limits<float>::epsilon()/2;
+inline constexpr float DftGammaV1(uint32_t operations){
+  return operations*kDftUnitRoundoffV1/(1-operations*kDftUnitRoundoffV1);
+}
+inline constexpr float kDftPhaseRoundoffBoundV1=
+    DftGammaV1(4*kStftFrameSamplesV1)/(1-DftGammaV1(2*kStftFrameSamplesV1));
+inline constexpr uint64_t kDftPhaseCheckProductsPerFrameV1=kStftFrameSamplesV1+1;
+// Preserve the original native Bluestein arithmetic for exact complex zeros
+// and the negative-real phase cut within the derived DFT rounding bound.
+// The exported downstream graph
+// evaluates atan(im/re), including 0/0, rather than atan2: removing the FFT's
+// roundoff can otherwise introduce NaNs into previously finite original audio.
+// Both dispatches are admitted at their full worst-case arithmetic cost.
+inline constexpr uint64_t kBluesteinRealProductsPerFrameV1=
     kStftFrameSamplesV1*(1+kComplexRealProductsV1)+
     kOriginalBluesteinFftSamplesV1*kComplexRealProductsV1+
     kBluesteinTransformCountV1*kBluesteinStagesV1*kOriginalBluesteinFftSamplesV1*kComplexRealProductsV1+
     kOriginalBluesteinFftSamplesV1*2*kComplexRealProductsV1+
-    kStftPositiveFrequencyBinsV1*kComplexRealProductsV1;
+    kStftPositiveFrequencyBinsV1*kComplexRealProductsV1+kDftPhaseCheckProductsPerFrameV1;
+inline constexpr uint64_t kStftRealProductsPerFrameV1=
+    kDftRealProductsPerFrameV1+kBluesteinRealProductsPerFrameV1;
 // Tint's SPIR-V writer rounds each workgroup global to16bytes (std430
 // upper-bound accounting, spirv/writer/printer/printer.cc EmitVar).
 inline constexpr uint32_t kStftWorkgroupVariableAlignmentBytesV1=16;
@@ -119,7 +143,45 @@ inline void ValidSpectrum(ShaderHelper& s, const ShaderVariableHelper& e) {
 }
 class OwnedStftData final : public Program<OwnedStftData> {
  public:
-  OwnedStftData() : Program{"RW07STFT1573NativeFp32BluesteinWindowDataV4"} {}
+  OwnedStftData() : Program{"RW07STFT1573RealDft20FourFramesV5"} {}
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+      {"signal_capacity", ProgramUniformVariableDataType::Uint32},
+      {"frame_capacity", ProgramUniformVariableDataType::Uint32},
+      {"first_frame", ProgramUniformVariableDataType::Uint32},
+      {"frame_count", ProgramUniformVariableDataType::Uint32},
+      {"signal_begin", ProgramUniformVariableDataType::Uint32},
+      {"identity", ProgramUniformVariableDataType::Uint32});
+  Status GenerateShaderCode(ShaderHelper& s) const override {
+    const auto& x = s.AddInput("signal", ShaderUsage::UseValueTypeAlias);
+    const auto& window = s.AddInput("window", ShaderUsage::UseValueTypeAlias);
+    const auto& e = s.AddInput("extent", ShaderUsage::UseValueTypeAlias);
+    const auto& y = s.AddOutput("spectrum", ShaderUsage::UseValueTypeAlias);
+    Roots(s);
+    ValidSpectrum(s,e);
+    auto& f=s.MainFunctionBody();
+    // Four independent real DFT20 frames per64-lane group. Sixteen lanes per
+    // frame cover the11 retained bins; no shared storage or FFT barriers.
+    f<<"let relative=workgroup_idx*"<<kDftFramesPerWorkgroupV1<<"u+local_idx/"<<kDftLanesPerFrameV1<<"u;let bin=local_idx%"<<kDftLanesPerFrameV1<<"u;"
+     <<"if(relative>=uniforms.frame_count||bin>=11u){return;}let frame=uniforms.first_frame+relative;"
+     <<y.SetByOffset("22u*relative+2u*bin","0.0")
+     <<y.SetByOffset("22u*relative+2u*bin+1u","0.0")
+     <<"if(!valid_spectrum()||frame>="<<e.GetByOffset("4u")
+     <<"||5u*frame+19u>=uniforms.signal_capacity){return;}"
+     <<"var re=0.0;var im=0.0;for(var n=0u;n<20u;n++){"
+     <<"let value="<<x.GetByOffset("5u*frame+n-uniforms.signal_begin")<<"*"<<window.GetByOffset("n")<<";"
+     <<"let root=(bin*n)%20u;re=re+value*cosine[root];im=im-value*sine[root];}"
+     <<y.SetByOffset("22u*relative+2u*bin","re")
+     <<y.SetByOffset("22u*relative+2u*bin+1u","im");
+    return Status::OK();
+  }
+};
+
+// Workgroup storage is a per-workgroup limit. Native FP32 windows are bounded
+// by actual binding/alignment/grid limits and the existing scheduled-product
+// envelope, rather than summing unrelated groups' shared memory into one limit.
+class OwnedStftZeroFallbackData final : public Program<OwnedStftZeroFallbackData> {
+ public:
+  OwnedStftZeroFallbackData() : Program{"RW07STFT1573PhaseBoundaryNativeBluesteinFallbackV7"} {}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"signal_capacity", ProgramUniformVariableDataType::Uint32},
       {"frame_capacity", ProgramUniformVariableDataType::Uint32},
@@ -150,11 +212,14 @@ fn stft_sum(a:vec2<f32>,b:vec2<f32>)->vec2<f32>{return vec2<f32>(stft_add(a.x,b.
     // One complete64-point transform per workgroup, one complex lane per
     // invocation. Arithmetic uses the GPU's native FP32 operations.
     f<<"if(workgroup_idx>=uniforms.frame_count){return;}let frame=uniforms.first_frame+workgroup_idx;"
-     <<"if(local_idx<11u){"<<y.SetByOffset("22u*workgroup_idx+2u*local_idx","0.0")
-     <<y.SetByOffset("22u*workgroup_idx+2u*local_idx+1u","0.0")<<"}"
-     <<"if(local_idx==0u){stft_active=select(0u,1u,valid_spectrum()&&frame<"<<e.GetByOffset("4u")
-     <<"&&5u*frame+19u<uniforms.signal_capacity);}workgroupBarrier();"
-     // The broadcast establishes uniform control flow before FFT barriers.
+     <<"if(local_idx==0u){stft_active=0u;if(valid_spectrum()&&frame<"<<e.GetByOffset("4u")
+     <<"&&5u*frame+19u<uniforms.signal_capacity){var amplitude=0.0;for(var j=0u;j<20u;j++){amplitude+=abs("
+     <<x.GetByOffset("5u*frame+j-uniforms.signal_begin")<<"*"<<window.GetByOffset("j")<<");}"
+     <<"let phase_error=amplitude*bitcast<f32>("<<std::bit_cast<uint32_t>(kDftPhaseRoundoffBoundV1)<<"u);"
+     <<"for(var bin=0u;bin<11u;bin++){let re="
+     <<y.GetByOffset("22u*workgroup_idx+2u*bin")<<";let im="<<y.GetByOffset("22u*workgroup_idx+2u*bin+1u")
+     <<";if(((bitcast<u32>(re)&0x7fffffffu)==0u&&(bitcast<u32>(im)&0x7fffffffu)==0u)||"
+     <<"(re<0.0&&abs(im)<=phase_error)){stft_active=1u;}}}}workgroupBarrier();"
      <<"let frame_enabled=workgroupUniformLoad(&stft_active);if(frame_enabled==0u){return;}"
      <<"let n=reverseBits(local_idx)>>26u;var value=vec2<f32>(0.0);"
      <<"if(n<20u){let windowed=stft_mul("<<x.GetByOffset("5u*frame+n-uniforms.signal_begin")<<","<<window.GetByOffset("n")<<");"
@@ -181,9 +246,6 @@ fn stft_sum(a:vec2<f32>,b:vec2<f32>)->vec2<f32>{return vec2<f32>(stft_add(a.x,b.
   }
 };
 
-// Workgroup storage is a per-workgroup limit. Native FP32 windows are bounded
-// by actual binding/alignment/grid limits and the existing scheduled-product
-// envelope, rather than summing unrelated groups' shared memory into one limit.
 inline uint32_t StftFramesPerWindowV1(const wgpu::Limits& limits,uint32_t capacity,
                                     uint32_t requested=std::numeric_limits<uint32_t>::max()) {
   constexpr uint64_t float_bytes=sizeof(float),window_samples=20,hop_samples=5,complex_bins=22;
@@ -227,16 +289,22 @@ inline Status RunOwnedStftWindowsV1(ComputeContextBase& context,const Tensor& si
     const uint32_t count=std::min(frames,frame_capacity-first);
     const uint32_t begin=uint32_t(std::min<uint64_t>(5ull*first,uint64_t(signal_capacity)-1));
     const uint32_t samples=uint32_t(std::min<uint64_t>(5ull*(count-1)+20,uint64_t(signal_capacity)-begin));
-    const uint32_t dx=std::min(count,limits.maxComputeWorkgroupsPerDimension),dy=(count+dx-1)/dx;
+    const auto configure=[&](auto& program,uint32_t groups){
+      const uint32_t dx=std::min(groups,limits.maxComputeWorkgroupsPerDimension),dy=(groups+dx-1)/dx;
+      program.AddInput(ProgramInput::FloatBufferWindow(&signal,ProgramTensorMetadataDependency::None,TensorShape{samples},begin,alignment))
+          .AddInputs({{&window,ProgramTensorMetadataDependency::None},{&extent,ProgramTensorMetadataDependency::None}})
+          .AddOutput(ProgramOutput::FloatBufferWindow(&spectrum,ProgramTensorMetadataDependency::None,TensorShape{count,11,2},22u*first,alignment))
+          .SetWorkgroupSize(kOriginalBluesteinFftSamplesV1).SetDispatchGroupSize(dx,dy)
+          .AddUniformVariables({signal_capacity,frame_capacity,first,count,begin,identity});
+    };
     OwnedStftData program;
-    program.AddInput(ProgramInput::FloatBufferWindow(&signal,ProgramTensorMetadataDependency::None,TensorShape{samples},begin,alignment))
-        .AddInputs({{&window,ProgramTensorMetadataDependency::None},{&extent,ProgramTensorMetadataDependency::None}})
-        .AddOutput(ProgramOutput::FloatBufferWindow(&spectrum,ProgramTensorMetadataDependency::None,TensorShape{count,11,2},22u*first,alignment))
-        .SetWorkgroupSize(kOriginalBluesteinFftSamplesV1).SetDispatchGroupSize(dx,dy)
-        .AddUniformVariables({signal_capacity,frame_capacity,first,count,begin,identity});
-    // Completion fences prevent independent cohorts accumulating into the
-    // same oversized device submission. This downloads no tensor payload.
-    ORT_RETURN_IF_ERROR(context.RunProgramWithCheckedCompletion(program,uint64_t(count)*kStftRealProductsPerFrameV1));
+    configure(program,(count+kDftFramesPerWorkgroupV1-1)/kDftFramesPerWorkgroupV1);
+    ORT_RETURN_IF_ERROR(context.RunProgramWithCheckedCompletion(program,uint64_t(count)*kDftRealProductsPerFrameV1));
+    OwnedStftZeroFallbackData fallback;
+    configure(fallback,count);
+    // The GPU alone decides which frames require the original FFT arithmetic.
+    // Completed direct output remains untouched for all other frames.
+    ORT_RETURN_IF_ERROR(context.RunProgramWithCheckedCompletion(fallback,uint64_t(count)*kBluesteinRealProductsPerFrameV1));
     first+=count;
   }
   return Status::OK();

@@ -135,7 +135,7 @@ void RunProgramProbe(int64_t stage,int64_t reuse,const std::vector<ProgramOracle
   }
   // Match the reference calling-thread policy. Every qualification node has
   // only a WebGPU kernel, with CPU fallback explicitly prohibited.
-  SessionOptions options;options.execution_mode=ExecutionMode::ORT_SEQUENTIAL;
+  SessionOptions options;options.session_log_severity_level=0;options.execution_mode=ExecutionMode::ORT_SEQUENTIAL;
   options.intra_op_param.thread_pool_size=options.inter_op_param.thread_pool_size=1;
   ASSERT_STATUS_OK(options.config_options.AddConfigEntry("session.disable_cpu_ep_fallback","1"));
   auto provider=DefaultWebGpuExecutionProvider(false);ASSERT_NE(provider,nullptr);
@@ -145,7 +145,7 @@ void RunProgramProbe(int64_t stage,int64_t reuse,const std::vector<ProgramOracle
   ASSERT_STATUS_OK(session.Initialize());std::vector<OrtValue> fetched;
   ASSERT_STATUS_OK(session.Run(RunOptions{},names,feeds,outputs,&fetched));ASSERT_EQ(fetched.size(),expected.size());
   // Exactly the existing original-operator absolute tolerance; no relaxation.
-  constexpr double original_absolute_tolerance=1e-4;
+  const double original_absolute_tolerance=stage==6?1e-5:1e-4;
   for(size_t output=0;output<fetched.size();++output){
     const auto& tensor=fetched[output].Get<Tensor>();ASSERT_EQ(tensor.Shape(),TensorShape(expected[output].shape));
     ASSERT_EQ(tensor.Location().device.Type(),OrtDevice::CPU);ASSERT_TRUE(tensor.IsDataType<float>());
@@ -277,6 +277,137 @@ TEST(M0IsolatedPrograms, OriginalSpeechPolarMatchesCpuAndClearsPhysicalPadding){
     ASSERT_NO_FATAL_FAILURE(RunProgramProbe(2,1,{padded},extent,{expected}));
   }
   RecordProperty("qualification_scope","isolated original Programs; independent CPU-oracle inputs; no actual-model intermediate readback");
+}
+TEST(M0IsolatedPrograms, ParallelDurationRowsPreserveRoundingPrefixAndCapacityFailure){
+  for(const uint32_t tokens:{1u,17u,65u,512u})for(const float speed:{0.5f,1.0f,2.0f})for(const int64_t limited:{0,1}){
+    SCOPED_TRACE(tokens);
+    SCOPED_TRACE(speed);
+    SCOPED_TRACE(limited);
+    ProgramOracle logits{{1,tokens,50},std::vector<float>(tokens*50,0.0f)};
+    ProgramOracle scale{{1},{speed}},unused{{1},{0.0f}};
+    ProgramOracle expected{{1,2*tokens+2},std::vector<float>(2*tokens+2,0.0f)};
+    const uint32_t duration=speed==0.5f?50:speed==1.0f?25:12;
+    const uint32_t capacity=limited?tokens*12-1:tokens*50;uint32_t prefix=0,status=0;
+    for(uint32_t t=0;t<tokens;t++){
+      if(duration>capacity-prefix){status=102;break;}prefix+=duration;
+      expected.values[t]=float(duration);expected.values[tokens+t]=float(prefix);
+    }
+    expected.values[2*tokens]=status?0.0f:float(prefix);expected.values[2*tokens+1]=float(status);
+    auto extent=ProbeExtent(3,121);
+    ASSERT_NO_FATAL_FAILURE(RunProgramProbe(7,limited,{logits,scale,unused},extent,{expected}));
+  }
+  {
+    constexpr uint32_t tokens=65,first_bad=17;
+    ProgramOracle logits{{1,tokens,50},std::vector<float>(tokens*50,0.0f)};
+    logits.values[first_bad*50]=std::numeric_limits<float>::quiet_NaN();
+    ProgramOracle scale{{1},{1.0f}},unused{{1},{0.0f}};
+    ProgramOracle expected{{1,2*tokens+2},std::vector<float>(2*tokens+2,0.0f)};
+    for(uint32_t t=0;t<first_bad;t++){expected.values[t]=25.0f;expected.values[tokens+t]=float(25*(t+1));}
+    expected.values[2*tokens+1]=100.0f;
+    ASSERT_NO_FATAL_FAILURE(RunProgramProbe(7,0,{logits,scale,unused},ProbeExtent(3,121),{expected}));
+  }
+  RecordProperty("qualification_scope","production token-parallel exact rows/integer publication on Android; original ties-to-even and no-output capacity failure");
+}
+TEST(M0IsolatedPrograms, ParallelResidualIndirectGridMatchesCpuAcrossActiveAndPaddedWindows){
+  for(const uint32_t channels:{8u,128u,256u})for(const uint32_t active:{1u,17u,65u})for(const uint32_t capacity:{96u,2080u})
+  for(const int64_t variant:{0,1}){
+    SCOPED_TRACE(channels);
+    SCOPED_TRACE(active);
+    SCOPED_TRACE(capacity);
+    SCOPED_TRACE(variant);
+    constexpr uint32_t kernel=3;
+    ProgramOracle input{{1,channels,capacity},std::vector<float>(channels*capacity,12345.0f)};
+    ProgramOracle weight{{channels,channels,kernel},std::vector<float>(channels*channels*kernel)};
+    ProgramOracle bias{{channels},std::vector<float>(channels)};
+    for(uint32_t c=0;c<channels;c++)for(uint32_t t=0;t<active;t++)input.values[c*capacity+t]=float(int((c*13+t*7)%29)-14)*0.01f;
+    for(size_t i=0;i<weight.values.size();i++)weight.values[i]=float(int(i%19)-9)*0.01f;
+    for(uint32_t c=0;c<channels;c++)bias.values[c]=float(c)*0.001f;
+    ProgramOracle expected{{1,channels,capacity},std::vector<float>(channels*capacity,0.0f)};
+    for(uint32_t oc=0;oc<channels;oc++)for(uint32_t t=0;t<active;t++){
+      float sum=0;
+      for(uint32_t ic=0;ic<channels;ic++)for(uint32_t k=0;k<kernel;k++){
+        const int64_t at=int64_t(t)+k-1;
+        if(at>=0&&at<active)sum+=input.values[ic*capacity+size_t(at)]*weight.values[(oc*channels+ic)*kernel+k];
+      }
+      expected.values[oc*capacity+t]=sum+bias.values[oc];
+    }
+    auto extent=ProbeExtent(3,active);extent[4]=channels;extent[18]=channels*active;
+    ASSERT_NO_FATAL_FAILURE(RunProgramProbe(6,variant,{input,weight,bias},extent,{expected}));
+  }
+  RecordProperty("qualification_scope","actual production packed/register FMA4/8 and GPU indirect argument reuse; independent serial CPU conv; poisoned inactive input and zero output padding across physical windows");
+}
+TEST(M0IsolatedPrograms, TiledRecurrenceProjectionMatchesCpuWithInactiveFramesAndBothWeightLayouts){
+  for(const uint32_t capacity:{9u,25u})for(const int64_t coalesced:{0,1}){
+    constexpr uint32_t active=7,input_size=640,rows=1024,directions=2;
+    ProgramOracle input{{1,input_size,capacity},std::vector<float>(input_size*capacity,12345.0f)};
+    ProgramOracle weights{{directions,rows,input_size},std::vector<float>(directions*rows*input_size)};
+    ProgramOracle unused{{1},{0.0f}};
+    for(uint32_t k=0;k<input_size;k++)for(uint32_t t=0;t<active;t++)input.values[k*capacity+t]=float(int((k+t*3)%17)-8)*0.01f;
+    for(size_t i=0;i<weights.values.size();i++)weights.values[i]=float(int(i%13)-6)*0.01f;
+    ProgramOracle expected{{capacity,directions,rows},std::vector<float>(capacity*directions*rows,0.0f)};
+    for(uint32_t t=0;t<active;t++)for(uint32_t d=0;d<directions;d++)for(uint32_t row=0;row<rows;row++){
+      float sum=0;for(uint32_t k=0;k<input_size;k++)sum+=input.values[k*capacity+t]*weights.values[(d*rows+row)*input_size+k];
+      expected.values[(t*directions+d)*rows+row]=sum;
+    }
+    auto extent=ProbeExtent(3,active);extent[4]=512;extent[18]=512*active;
+    ASSERT_NO_FATAL_FAILURE(RunProgramProbe(8,coalesced,{input,weights,unused},extent,{expected}));
+  }
+  RecordProperty("qualification_scope","production tiled XW and GPU weight transpose vs independent serial CPU; two directions/four gates; partial8-frame tiles and poisoned inactive input");
+}
+TEST(M0IsolatedPrograms, OrdinaryLstmPreprojectionMatchesAndroidCpuForBothLayouts){
+  //431steps match the whole sentence that exposed unbounded projection work;
+  //9steps retain the small and partial-row cases, in both physical layouts.
+  for(const int64_t hidden:{8,256})for(const int64_t layout:{0,1})for(const int64_t time:{9,431}){
+    SCOPED_TRACE(time);
+    SCOPED_TRACE(hidden);
+    SCOPED_TRACE(layout);
+    constexpr int64_t batch=1,directions=2;const int64_t features=hidden==8?5:640;
+    ONNX_NAMESPACE::ModelProto model;model.set_ir_version(ONNX_NAMESPACE::Version::IR_VERSION);
+    auto* opset=model.add_opset_import();opset->set_domain("");opset->set_version(14);
+    auto* graph=model.mutable_graph();graph->set_name("ordinary_lstm_projection_android_oracle");
+    auto* node=graph->add_node();node->set_name("actual_ordinary_lstm");node->set_op_type("LSTM");
+    for(const char* name:{"x","W","R","B"})node->add_input(name);node->add_output("Y");
+    auto* h=node->add_attribute();h->set_name("hidden_size");h->set_type(ONNX_NAMESPACE::AttributeProto::INT);h->set_i(hidden);
+    auto* direction=node->add_attribute();direction->set_name("direction");direction->set_type(ONNX_NAMESPACE::AttributeProto::STRING);direction->set_s("bidirectional");
+    const auto port=[](ONNX_NAMESPACE::ValueInfoProto* p,const char* name,std::initializer_list<int64_t> dims){
+      p->set_name(name);auto* tensor=p->mutable_type()->mutable_tensor_type();tensor->set_elem_type(ONNX_NAMESPACE::TensorProto::FLOAT);
+      for(const auto dim:dims)tensor->mutable_shape()->add_dim()->set_dim_value(dim);
+    };
+    port(graph->add_input(),"x",{time,batch,features});port(graph->add_output(),"Y",{time,directions,batch,hidden});
+    const auto parameter=[&](const char* name,std::initializer_list<int64_t> dims){
+      auto* tensor=graph->add_initializer();tensor->set_name(name);tensor->set_data_type(ONNX_NAMESPACE::TensorProto::FLOAT);
+      size_t count=1;for(const auto dim:dims){tensor->add_dims(dim);count*=size_t(dim);}
+      for(size_t i=0;i<count;i++)tensor->add_float_data(float(int(i%17)-8)*0.01f);
+    };
+    parameter("W",{directions,4*hidden,features});parameter("R",{directions,4*hidden,hidden});parameter("B",{directions,8*hidden});
+    std::vector<float> values(size_t(time*batch*features));for(size_t i=0;i<values.size();i++)values[i]=float(int(i%19)-9)*0.01f;
+    SessionOptions options;options.graph_optimization_level=TransformerLevel::Default;
+    options.intra_op_param.thread_pool_size=options.inter_op_param.thread_pool_size=1;
+    const auto run=[&](const ONNX_NAMESPACE::ModelProto& proto,bool gpu,std::vector<OrtValue>& fetched)->Status{
+      SessionOptions selected=options;if(gpu)ORT_RETURN_IF_ERROR(selected.config_options.AddConfigEntry("session.disable_cpu_ep_fallback","1"));
+      InferenceSession session(selected,GetEnvironment());
+      ORT_RETURN_IF_ERROR(session.RegisterExecutionProvider(gpu?DefaultWebGpuExecutionProvider(false):DefaultCpuExecutionProvider()));
+      const auto wire=proto.SerializeAsString();ORT_RETURN_IF_ERROR(session.Load(wire.data(),int(wire.size())));ORT_RETURN_IF_ERROR(session.Initialize());
+      OrtValue value;const TensorShape shape=layout&&gpu?TensorShape{batch,time,features}:TensorShape{time,batch,features};
+      Tensor::InitOrtValue(DataTypeImpl::GetType<float>(),shape,values.data(),OrtMemoryInfo{},value);
+      const std::vector<std::string> names{"x"},outputs{"Y"};
+      const std::vector<OrtValue> inputs{value};
+      return session.Run(RunOptions{},names,inputs,outputs,&fetched);
+    };
+    std::vector<OrtValue> cpu,gpu;ASSERT_STATUS_OK(run(model,false,cpu));
+    if(layout){
+      auto* attribute=node->add_attribute();attribute->set_name("layout");attribute->set_type(ONNX_NAMESPACE::AttributeProto::INT);attribute->set_i(layout);
+      auto* input=graph->mutable_input(0)->mutable_type()->mutable_tensor_type()->mutable_shape();input->mutable_dim(0)->set_dim_value(batch);input->mutable_dim(1)->set_dim_value(time);
+      auto* output=graph->mutable_output(0)->mutable_type()->mutable_tensor_type()->mutable_shape();
+      output->mutable_dim(0)->set_dim_value(batch);output->mutable_dim(1)->set_dim_value(time);output->mutable_dim(2)->set_dim_value(directions);
+    }
+    ASSERT_STATUS_OK(run(model,true,gpu));ASSERT_EQ(cpu.size(),1u);ASSERT_EQ(gpu.size(),1u);
+    const auto& expected=cpu[0].Get<Tensor>();const auto& actual=gpu[0].Get<Tensor>();ASSERT_EQ(actual.Shape().Size(),expected.Shape().Size());
+    // Batch1 preserves the linear sequence/direction/state order in both layouts.
+    for(int64_t i=0;i<actual.Shape().Size();i++){ASSERT_TRUE(std::isfinite(actual.Data<float>()[i]));
+      ASSERT_NEAR(actual.Data<float>()[i],expected.Data<float>()[i],1e-4)<<"hidden="<<hidden<<" layout="<<layout<<" index="<<i;}
+  }
+  RecordProperty("qualification_scope","ordinary production LSTM with batched XW preprojection vs original CPU LSTM on Android; both layouts; odd input width and actual640x256 geometry");
 }
 }  // namespace
 }  // namespace onnxruntime::test

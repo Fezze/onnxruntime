@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <vector>
 #include "core/common/common.h"
+#include "core/common/logging/logging.h"
 #include "core/graph/model.h"
 #include "core/graph/m0_fullgpu_native_lowering_owner_v1.h"
 #include "core/session/inference_session.h"
@@ -204,6 +205,8 @@ M0NativeDescriptorReceiptV1 M0NativeLoweringQualificationV1::Descriptors(
 }
 #if defined(__ANDROID__) && defined(USE_WEBGPU) && !defined(ORT_PLUGIN_EP_STATICALLY_LINKED)
 M0NativeRunReceiptV1 M0NativeLoweringQualificationV1::RunSequence(InferenceSession& session) {
+  const auto checkpoint=[](const char* phase){LOGS_DEFAULT(WARNING)<<"M0_NATIVE_SEQUENCE_CHECKPOINT "<<phase;};
+  checkpoint("prepare");
   // Exercise the app's device-selected physical capacity. Explicit1024/2048
   // descriptor and initialization cases remain separate qualification coverage;
   // forcing1024 here can exceed the production device admission's work/memory.
@@ -240,6 +243,7 @@ M0NativeRunReceiptV1 M0NativeLoweringQualificationV1::RunSequence(InferenceSessi
         holder->state.get() == state && holder->plan == plan && state->GetExecutionPlan() == plan;
   };
   const auto valid_run = [&](bool short_input, bool pointer_api = false) {
+    checkpoint(short_input?"short_begin":"long_begin");
     const auto feeds = inputs(short_input, false);
     std::vector<OrtValue> result;
     if (pointer_api) {
@@ -264,6 +268,7 @@ M0NativeRunReceiptV1 M0NativeLoweringQualificationV1::RunSequence(InferenceSessi
                     uint64_t(tensor.Shape()[0]) <= uint64_t(native.capacity_) * 600 && tensor.Shape()[0] % 600 == 0,
                 "RW07_NATIVE_RUN_QUALIFICATION_LOGICAL_PCM");
     idle();
+    checkpoint(short_input?"short_complete":"long_complete");
     return result[0];
   };
   const OrtValue first = valid_run(false);
@@ -278,6 +283,7 @@ M0NativeRunReceiptV1 M0NativeLoweringQualificationV1::RunSequence(InferenceSessi
   refused[0].GetMutable<Tensor>()->MutableData<float>()[0] = 777.0f;
   const auto* sentinel = refused[0].Get<Tensor>().DataRaw();
   const auto failure = session.Run(options, names, invalid, outputs, &refused);
+  checkpoint("invalid_complete");
   receipt.canonical_token_failure = !failure.IsOK() && failure.ErrorMessage() == "RW07_NATIVE_GPU_STATUS_103";
   receipt.failed_output_unchanged = refused.size() == 1 && refused[0].IsTensor() &&
       refused[0].Get<Tensor>().DataRaw() == sentinel && refused[0].Get<Tensor>().Shape() == TensorShape{1} &&
@@ -368,6 +374,7 @@ M0NativeRunReceiptV1 M0NativeLoweringQualificationV1::RunSequence(InferenceSessi
   const std::array<const OrtValue*, 3> pointer_invalid{&invalid[0], &invalid[1], &invalid[2]};
   std::array<OrtValue*, 1> refused_pointer{nullptr};
   const auto pointer_failure = session.Run(options, pointer_names, pointer_invalid, pointer_outputs, refused_pointer);
+  checkpoint("pointer_invalid_complete");
   // Even unexpected publication is owned and released by this qualification
   // caller; failed Run must leave the caller's null output pointer unchanged.
   std::unique_ptr<OrtValue> unexpected_output(refused_pointer[0]);
@@ -381,6 +388,7 @@ M0NativeRunReceiptV1 M0NativeLoweringQualificationV1::RunSequence(InferenceSessi
   const std::array<const OrtValue*, 3> pointer_valid{&valid_inputs[0], &valid_inputs[1], &valid_inputs[2]};
   std::array<OrtValue*, 1> pointer_preallocated{&preallocated};
   ORT_THROW_IF_ERROR(session.Run(options, pointer_names, pointer_valid, pointer_outputs, pointer_preallocated));
+  checkpoint("preallocated_complete");
   receipt.pointer_preallocated_retained = pointer_preallocated[0] == &preallocated &&
       preallocated.Get<Tensor>().DataRaw() == pcm_storage.data() + 1;
   receipt.pointer_preallocated_pcm_equal = preallocated.Get<Tensor>().SizeInBytes() == second.Get<Tensor>().SizeInBytes() &&
@@ -392,6 +400,7 @@ M0NativeRunReceiptV1 M0NativeLoweringQualificationV1::RunSequence(InferenceSessi
   OrtValue empty_wrapper;
   std::array<OrtValue*, 1> pointer_empty{&empty_wrapper};
   ORT_THROW_IF_ERROR(session.Run(options, pointer_names, pointer_valid, pointer_outputs, pointer_empty));
+  checkpoint("empty_wrapper_complete");
   receipt.pointer_empty_wrapper_retained = pointer_empty[0] == &empty_wrapper && empty_wrapper.IsTensor();
   receipt.pointer_empty_wrapper_pcm_equal = empty_wrapper.IsTensor() &&
       empty_wrapper.Get<Tensor>().Shape() == second.Get<Tensor>().Shape() &&

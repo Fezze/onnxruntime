@@ -7,10 +7,12 @@
 #include <array>
 #include <cctype>
 #include <limits>
+#include "core/common/safeint.h"
 #include <string>
 #include <vector>
 
 #include "core/providers/webgpu/shader_helper.h"
+#include "core/providers/webgpu/math/matmul_packed.h"
 #include "core/providers/webgpu/tensor/transpose.h"
 #include "core/common/m0_observation_options_v1.h"
 #include "core/providers/webgpu/webgpu_supported_types.h"
@@ -21,6 +23,30 @@
 
 namespace onnxruntime {
 namespace webgpu {
+namespace {
+class LstmProjectionRowsProgramV3 final:public Program<LstmProjectionRowsProgramV3>{
+ public:
+  explicit LstmProjectionRowsProgramV3(bool publish):Program{publish?"LstmProjectionPublishRowsV3":"LstmProjectionGatherRowsV3"},publish_(publish){}
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"row_begin",ProgramUniformVariableDataType::Uint32},
+      {"rows",ProgramUniformVariableDataType::Uint32},{"full_rows",ProgramUniformVariableDataType::Uint32},
+      {"columns",ProgramUniformVariableDataType::Uint32},{"directions",ProgramUniformVariableDataType::Uint32});
+  Status GenerateShaderCode(ShaderHelper& shader)const override{
+    const auto& x=shader.AddInput("source",ShaderUsage::UseValueTypeAlias);
+    const auto& y=shader.AddOutput("destination",ShaderUsage::UseValueTypeAlias);
+    auto& body=shader.MainFunctionBody();
+    body<<"let count=uniforms.rows*uniforms.columns*uniforms.directions;if(global_idx>=count){return;}";
+    if(publish_){
+      body<<"let direction=global_idx/(uniforms.rows*uniforms.columns);let within=global_idx%(uniforms.rows*uniforms.columns);"
+        <<y.SetByOffset("(direction*uniforms.full_rows+uniforms.row_begin)*uniforms.columns+within",x.GetByOffset("global_idx"));
+    }else{
+      body<<y.SetByOffset("global_idx",x.GetByOffset("uniforms.row_begin*uniforms.columns+global_idx"));
+    }
+    return Status::OK();
+  }
+ private:bool publish_;
+};
+} // namespace
+
 
 namespace {
 
@@ -191,6 +217,13 @@ Status LstmCellProgram::GenerateShaderCode(ShaderHelper& shader) const {
        << "  var gate_f: f32 = 0.0;\n"
        << "  var gate_c: f32 = 0.0;\n\n";
 
+  if(input_projected_){
+    body << "  let projected_row = dir * uniforms.seq_length * B + "
+         << (layout_==0 ? "uniforms.timestep * B + batch_idx" : "batch_idx * uniforms.seq_length + uniforms.timestep")
+         << ";let projected_base=projected_row*4u*H+j;\n"
+         << "  gate_i=f32(x[projected_base]);gate_o=f32(x[projected_base+H]);"
+         << "gate_f=f32(x[projected_base+2u*H]);gate_c=f32(x[projected_base+3u*H]);\n";
+  }else{
   // X * W^T
   body << "  let w_base = dir * 4u * H * I;\n";
   if (layout_ == 0) {
@@ -209,6 +242,8 @@ Status LstmCellProgram::GenerateShaderCode(ShaderHelper& shader) const {
        << "    gate_c += xv * f32(w["
        << (coalesced_weights_ ? "w_base + k * 4u * H + (3u * H + j)" : "w_base + (3u * H + j) * I + k") << "]);\n"
        << "  }\n\n";
+
+  }
 
   // H_prev * R^T  (h_prev always [batch, H] - flat indexing)
   body << "  let r_base = dir * 4u * H * H;\n"
@@ -475,7 +510,24 @@ Status Lstm::ComputeInternal(ComputeContext& context) const {
   // gate rows stride I/H between lanes at every dot-product iteration. Transpose
   // only the immutable GPU weight views; arithmetic and timestep order are unchanged.
   Tensor coalesced_w, coalesced_r;
-  const bool coalesced_weights=M0CoalescedRecurrenceWeightsV1()&&X->IsDataType<float>()&&seq_length>1;
+  const uint64_t projection_bytes=SafeInt<uint64_t>(num_directions)*seq_length*batch_size*4*H*sizeof(float);
+  const uint64_t total_rows=SafeInt<uint64_t>(seq_length)*batch_size;
+  const uint64_t gate_columns=4*uint64_t(H),tile_k=MatMulProgram::kInnerTileSamplesV1;
+  const uint64_t padded_k=(uint64_t(input_size)+tile_k-1)/tile_k*tile_k;
+  const uint64_t tile_n=MatMul::MATMUL_PACKED_WORKGROUP_SIZE_X*4;
+  const uint64_t padded_n=(gate_columns+tile_n-1)/tile_n*tile_n;
+  const uint64_t products_per_row=SafeInt<uint64_t>(num_directions)*padded_k*padded_n;
+  const uint64_t binding=std::min(context.DeviceLimits().maxBufferSize,context.DeviceLimits().maxStorageBufferBindingSize);
+  uint64_t projection_rows=products_per_row?M0HeavyProductsPerDispatchV1()/products_per_row:0;
+  if(input_size>0&&gate_columns)projection_rows=std::min({projection_rows,total_rows,
+      binding/(uint64_t(input_size)*sizeof(float)),binding/(num_directions*gate_columns*sizeof(float))});
+  const uint64_t small_m=MatMul::MATMUL_PACKED_WORKGROUP_SIZE_Y,large_m=small_m*4;
+  if(projection_rows>=large_m)projection_rows=projection_rows/large_m*large_m;
+  else if(projection_rows>=small_m)projection_rows=std::min(projection_rows,small_m);
+  else if(total_rows>projection_rows||products_per_row>M0HeavyProductsPerDispatchV1()/small_m)projection_rows=0;
+  const bool preproject=M0LstmInputProjectionV1()&&X->IsDataType<float>()&&seq_length>1&&projection_rows&&
+      projection_bytes<=binding&&projection_bytes/sizeof(float)<=UINT32_MAX&&total_rows<=UINT32_MAX;
+  const bool coalesced_weights=(preproject||M0CoalescedRecurrenceWeightsV1())&&X->IsDataType<float>()&&seq_length>1;
   const Tensor* cell_w=W;const Tensor* cell_r=R;
   if(coalesced_weights){
     coalesced_w=context.CreateGPUTensor(W->DataType(),TensorShape{num_directions,input_size,4*hidden_size_});
@@ -484,6 +536,32 @@ Status Lstm::ComputeInternal(ComputeContext& context) const {
     ORT_RETURN_IF_ERROR(Transpose::DoTranspose(context,permutation,*W,coalesced_w));
     ORT_RETURN_IF_ERROR(Transpose::DoTranspose(context,permutation,*R,coalesced_r));
     cell_w=&coalesced_w;cell_r=&coalesced_r;
+  }
+  Tensor projected;
+  const Tensor* cell_x=X;
+  if(preproject){
+    projected=context.CreateGPUTensor(X->DataType(),TensorShape{num_directions,int64_t(total_rows),4*hidden_size_});
+    const auto copy_rows=[&](const Tensor* source,Tensor* destination,uint32_t first,uint32_t rows,uint32_t columns,uint32_t directions,bool publish)->Status{
+      const uint64_t elements=uint64_t(rows)*columns*directions,groups=(elements+wg_size-1)/wg_size;
+      const uint64_t limit=context.DeviceLimits().maxComputeWorkgroupsPerDimension,dx=std::min(groups,limit),dy=(groups+dx-1)/dx;
+      ORT_RETURN_IF_NOT(dy<=limit,"LSTM projection copy grid bound");
+      LstmProjectionRowsProgramV3 program(publish);
+      program.AddInput({source,ProgramTensorMetadataDependency::None}).AddOutput({destination,ProgramTensorMetadataDependency::None})
+        .SetWorkgroupSize(wg_size).SetDispatchGroupSize(uint32_t(dx),uint32_t(dy))
+        .AddUniformVariables({first,rows,uint32_t(total_rows),columns,directions});
+      return context.RunProgram(program,groups*wg_size);
+    };
+    for(uint32_t first=0;first<total_rows;){
+      const uint32_t rows=uint32_t(std::min<uint64_t>(projection_rows,total_rows-first));
+      auto matrix_x=context.CreateGPUTensor(X->DataType(),TensorShape{1,rows,input_size});
+      auto matrix_y=context.CreateGPUTensor(X->DataType(),TensorShape{num_directions,rows,4*hidden_size_});
+      ORT_RETURN_IF_ERROR(copy_rows(X,&matrix_x,first,rows,uint32_t(input_size),1,false));
+      std::vector<const Tensor*> matrices{&matrix_x,cell_w};
+      ORT_RETURN_IF_ERROR(ComputeMatMul(&context,Activation(),matrices,&matrix_y,false,projection_cache_,false,true));
+      ORT_RETURN_IF_ERROR(copy_rows(&matrix_y,&projected,first,rows,uint32_t(gate_columns),uint32_t(num_directions),true));
+      first+=rows;
+    }
+    cell_x=&projected;
   }
   for (int dir = 0; dir < num_directions; dir++) {
     std::string fa = ActivationToWgslFn(activations_[dir * 3 + 0]);
@@ -533,16 +611,16 @@ Status Lstm::ComputeInternal(ComputeContext& context) const {
 
       LstmCellProgram program{B != nullptr, P != nullptr, cell_has_Y, has_seq_lens,
                               input_forget_ != 0, clip_ > 0.0f,
-                              static_cast<int>(layout_), fa, ga, ha, coalesced_weights};
+                              static_cast<int>(layout_), fa, ga, ha, coalesced_weights,preproject};
 
       program.CacheHint(std::to_string(B != nullptr), std::to_string(P != nullptr),
                         std::to_string(cell_has_Y), std::to_string(has_seq_lens),
                         std::to_string(input_forget_ != 0), std::to_string(clip_ > 0.0f),
-                        std::to_string(layout_), fa, ga, ha, std::to_string(coalesced_weights));
+                        std::to_string(layout_), fa, ga, ha, std::to_string(coalesced_weights),std::to_string(preproject));
 
       program.SetWorkgroupSize(wg_size).SetDispatchGroupSize(num_groups);
 
-      program.AddInputs({{X, ProgramTensorMetadataDependency::Type}})
+      program.AddInputs({{cell_x, ProgramTensorMetadataDependency::Type}})
           .AddInputs({{cell_w, ProgramTensorMetadataDependency::Type}})
           .AddInputs({{cell_r, ProgramTensorMetadataDependency::Type}})
           .AddInputs({{h_read, ProgramTensorMetadataDependency::Type}})

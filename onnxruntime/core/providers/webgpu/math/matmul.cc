@@ -4,6 +4,7 @@
 #include "core/providers/webgpu/math/matmul.h"
 
 #include <limits>
+#include "core/common/safeint.h"
 
 #include "core/common/inlined_containers.h"
 #include "core/providers/cpu/tensor/utils.h"
@@ -188,7 +189,7 @@ Status MatMul::ComputeInternal(ComputeContext& context) const {
 Status ComputeMatMul(ComputeContext* context,
                      const Activation& activation, std::vector<const Tensor*>& inputs, Tensor* output_tensor, bool is_channels_last,
                      MatMulOptImplCache& cache,
-                     bool b_is_constant) {
+                     bool b_is_constant, bool bounded_work) {
   const auto* a = inputs[0];
   const auto* b = inputs[1];
   bool has_bias = inputs.size() > 2;
@@ -199,9 +200,12 @@ Status ComputeMatMul(ComputeContext* context,
 
   MatMulComputeHelper helper;
   ORT_THROW_IF_ERROR(helper.Compute(logical_a_shape, logical_b_shape));
+  const bool charge_work=bounded_work||context->M0SubmissionBudgetBytesV1()!=0;
 
   const bool requires_fp32_accumulation = context->EnableMatmulFp32Accumulation() && a->IsDataType<MLFloat16>();
-  MatMulOptImpl* subgroup_impl = requires_fp32_accumulation ? nullptr : cache.GetOrCreate(*context);
+  // Bounded projections use the generic tile below, whose padded arithmetic
+  // is charged exactly. Other callers retain all optimized backend choices.
+  MatMulOptImpl* subgroup_impl = (requires_fp32_accumulation||bounded_work) ? nullptr : cache.GetOrCreate(*context);
   if (subgroup_impl != nullptr) {
     bool handled = false;
     ORT_RETURN_IF_ERROR(subgroup_impl->Compute(
@@ -246,10 +250,11 @@ Status ComputeMatMul(ComputeContext* context,
         .AddIndices(outer_dims)
         .AddUniformVariables({{output_size}, {m}, {n}, {k}});
     AppendActivationUniformsData(activation, program);
-    return context->RunProgram(program);
+    const uint64_t products=charge_work?uint64_t(SafeInt<uint64_t>(m)*n*k*outer_dims.Size()):0;
+    return context->RunProgram(program,products);
   }
 
-  if (intel::CanApplyMatMulIntel(*context, helper.M(), helper.N(), helper.K())) {
+  if (!bounded_work&&intel::CanApplyMatMulIntel(*context, helper.M(), helper.N(), helper.K())) {
     return intel::ApplyMatMulIntel(*context, activation, inputs, output_tensor, is_channels_last);
   }
 
@@ -335,7 +340,7 @@ Status ComputeMatMul(ComputeContext* context,
   uint32_t splits_per_batch = 1;
 
   // Current Split-K implementation relies on atomic operations, which are not deterministic.
-  if (!context->KernelContext().GetUseDeterministicCompute()) {
+  if (!bounded_work&&!context->KernelContext().GetUseDeterministicCompute()) {
     const SplitKConfig& split_k_config = context->GetSplitKConfig();
     const bool need_split_k = split_k_config.UseSplitK(
         is_vec4, activation.activation_kind_, batch_size, dim_a_outer, dim_b_outer,
@@ -395,7 +400,16 @@ Status ComputeMatMul(ComputeContext* context,
     matmul_program.AddInput({bias, ProgramTensorMetadataDependency::Rank, reduced_bias_shape, bias_components});
   }
 
-  ORT_RETURN_IF_ERROR(context->RunProgram(matmul_program));
+  uint64_t products=0;
+  if(charge_work){
+    const uint64_t tile_n=MatMul::MATMUL_PACKED_WORKGROUP_SIZE_X*elements_per_thread[0];
+    const uint64_t tile_m=MatMul::MATMUL_PACKED_WORKGROUP_SIZE_Y*elements_per_thread[1];
+    const uint64_t tile_k=MatMulProgram::kInnerTileSamplesV1;
+    const uint64_t inner_per_dispatch=split_dim_inner>1?split_dim_inner:dim_inner;
+    const uint64_t padded_k=(inner_per_dispatch+tile_k-1)/tile_k*tile_k;
+    products=SafeInt<uint64_t>(dispatch_x)*tile_n*dispatch_y*tile_m*dispatch_z*padded_k;
+  }
+  ORT_RETURN_IF_ERROR(context->RunProgram(matmul_program,products));
   if (split_dim_inner > 1 && requires_fp32_accumulation) {
     const uint32_t output_size = narrow<uint32_t>(output_tensor->Shape().Size());
     const uint32_t vec_size = output_size / 4;

@@ -156,6 +156,12 @@ class ComputeContextBase {
     return webgpu_context_.Run(*this, program, scheduled_products);
   }
 
+  // Complete a related bounded group (for example pack+matrix) with one fence.
+  inline Status RunProgramWithQueuedCompletion(const ProgramBase& program,uint64_t scheduled_products=0){
+    ORT_RETURN_IF_ERROR(M0CheckCancellationV1());
+    return webgpu_context_.RunWithQueuedCompletion(*this,program,scheduled_products);
+  }
+
   // Isolate a costly dispatch from preceding and subsequent submissions.
   inline Status RunProgramWithCheckedCompletion(const ProgramBase& program, uint64_t scheduled_products = 0) {
     ORT_RETURN_IF_ERROR(M0CheckCancellationV1());
