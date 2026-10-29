@@ -153,6 +153,11 @@ class M0NativeMemoryPlanV1 final {
         scratch += values_.at(name);
       }
       Bytes references=scratch;  // graph inputs/outputs, including immutable bindings
+      // These fused kernels bind their declared inputs/outputs directly and
+      // allocate no GPU temporaries (generator edge modes1/2 and noise conv).
+      // Reserving their IO a second time made merge dictate a false peak.
+      if(node.op_type()=="GeneratorJoinExtentV1"||node.op_type()=="GeneratorMergeExtentV1"||
+          node.op_type()=="NoiseConvAfter1597ExtentV1")scratch=Bytes{};
       // Tail keeps three full 256-channel buffers and two 64-channel tiles.
       if (node.op_type() == "PredictorTailExtentV1") {
         auto tail = CapacityBytes(node, (3 * 256 + 2 * 64) * sizeof(float));
@@ -177,10 +182,8 @@ class M0NativeMemoryPlanV1 final {
       if(node.op_type()=="DurationExtentV4")scratch+=Bytes{512*2*sizeof(uint32_t)+15,0};
       if(node.op_type()=="LSTM"&&M0LstmInputProjectionV1()&&node.output_size()>0&&!node.output(0).empty()){
         // Four gate projections per ordinary hidden output, including alignment.
-        // Full projection plus one bounded output block and gathered X block.
-        // The full-X/full-projection bounds cover every legal tile size.
-        for(uint32_t gate=0;gate<8;++gate)scratch+=values_.at(node.output(0));
-        if(node.input_size()>0&&!node.input(0).empty())scratch+=values_.at(node.input(0));
+        // Four projected gates; bounded dispatches share the full GPU buffers.
+        for(uint32_t gate=0;gate<4;++gate)scratch+=values_.at(node.output(0));
       }
       if(node.op_type()=="RecurrenceExtentV2"&&M0LstmInputProjectionV1()){
         // Four input gates for both directions, retained until recurrence completes.

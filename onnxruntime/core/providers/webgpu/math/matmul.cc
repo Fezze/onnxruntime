@@ -381,35 +381,43 @@ Status ComputeMatMul(ComputeContext* context,
     }
   }
 
-  MatMulProgram matmul_program{activation, use_bias_in_matmul, is_vec4, elements_per_thread, is_channels_last, split_dim_inner, requires_fp32_accumulation};
-  matmul_program
-      .CacheHint(activation.CacheKey(), absl::StrJoin(elements_per_thread, "-"), std::to_string(is_vec4), components, is_channels_last, split_dim_inner, requires_fp32_accumulation)
-      .AddInputs({{a, ProgramTensorMetadataDependency::TypeAndRank, a_shape_temp, components},
-                  {b, ProgramTensorMetadataDependency::TypeAndRank, b_shape_temp, components}})
-      .AddUniformVariables({{dim_a_outer}, {dim_b_outer}, {dim_inner}, {dispatch_x}, {dispatch_y}, {dispatch_z}, {splits_per_batch}})
-      .AddIndices(outer_dims)
-      .SetDispatchGroupSize(dispatch_x, dispatch_y, dispatch_z)
-      .SetWorkgroupSize(MatMul::MATMUL_PACKED_WORKGROUP_SIZE_X, MatMul::MATMUL_PACKED_WORKGROUP_SIZE_Y, MatMul::MATMUL_PACKED_WORKGROUP_SIZE_Z)
-      .AddOutput(std::move(output));
-  // Activation uniforms must remain last because definitions and values are matched by index.
-  AppendActivationUniformsData(activation, matmul_program);
-
-  if (use_bias_in_matmul) {
-    auto bias_components = is_channels_last ? components : 1;
-    TensorShape reduced_bias_shape = ReduceShapeByComponents(bias->Shape(), bias_components);
-    matmul_program.AddInput({bias, ProgramTensorMetadataDependency::Rank, reduced_bias_shape, bias_components});
+  const uint64_t tile_n=MatMul::MATMUL_PACKED_WORKGROUP_SIZE_X*elements_per_thread[0];
+  const uint64_t tile_m=MatMul::MATMUL_PACKED_WORKGROUP_SIZE_Y*elements_per_thread[1];
+  const uint64_t tile_k=MatMulProgram::kInnerTileSamplesV1;
+  const uint64_t inner_per_dispatch=split_dim_inner>1?split_dim_inner:dim_inner;
+  const uint64_t padded_k=(inner_per_dispatch+tile_k-1)/tile_k*tile_k;
+  const uint64_t group_products=SafeInt<uint64_t>(tile_n)*tile_m*padded_k;
+  const uint64_t logical_groups=SafeInt<uint64_t>(dispatch_x)*dispatch_y*dispatch_z;
+  ORT_RETURN_IF_NOT(!charge_work||(group_products&&group_products<=kM0ScheduledProductsPerWindowV1&&logical_groups<=UINT32_MAX),
+      "RW07 bounded MatMul group work/index limit");
+  const uint64_t group_window=charge_work?std::min<uint64_t>(context->DeviceLimits().maxComputeWorkgroupsPerDimension,
+      std::max<uint64_t>(1,M0HeavyProductsPerDispatchV1()/group_products)):logical_groups;
+  ORT_RETURN_IF_NOT(group_window>0,"RW07 positive MatMul workgroup window");
+  for(uint64_t first_group=0;first_group<logical_groups;){
+    const uint64_t window_groups=std::min(group_window,logical_groups-first_group);
+    MatMulProgram matmul_program{activation, use_bias_in_matmul, is_vec4, elements_per_thread, is_channels_last, split_dim_inner, requires_fp32_accumulation};
+    matmul_program
+        .CacheHint(activation.CacheKey(), absl::StrJoin(elements_per_thread, "-"), std::to_string(is_vec4), components, is_channels_last, split_dim_inner, requires_fp32_accumulation)
+        .AddInputs({{a, ProgramTensorMetadataDependency::TypeAndRank, a_shape_temp, components},
+                    {b, ProgramTensorMetadataDependency::TypeAndRank, b_shape_temp, components}})
+        .AddUniformVariables({{dim_a_outer}, {dim_b_outer}, {dim_inner}, {dispatch_x}, {dispatch_y}, {dispatch_z}, {splits_per_batch}, {uint32_t(first_group)}})
+        .AddIndices(outer_dims)
+        .SetDispatchGroupSize(charge_work?uint32_t(window_groups):dispatch_x,
+                              charge_work?1u:dispatch_y,charge_work?1u:dispatch_z)
+        .SetWorkgroupSize(MatMul::MATMUL_PACKED_WORKGROUP_SIZE_X, MatMul::MATMUL_PACKED_WORKGROUP_SIZE_Y, MatMul::MATMUL_PACKED_WORKGROUP_SIZE_Z)
+        .AddOutput(std::move(output));
+    // Activation uniforms must remain last because definitions and values are matched by index.
+    AppendActivationUniformsData(activation, matmul_program);
+  
+    if (use_bias_in_matmul) {
+      auto bias_components = is_channels_last ? components : 1;
+      TensorShape reduced_bias_shape = ReduceShapeByComponents(bias->Shape(), bias_components);
+      matmul_program.AddInput({bias, ProgramTensorMetadataDependency::Rank, reduced_bias_shape, bias_components});
+    }
+  
+    ORT_RETURN_IF_ERROR(context->RunProgram(matmul_program,charge_work?window_groups*group_products:0));
+    first_group+=window_groups;
   }
-
-  uint64_t products=0;
-  if(charge_work){
-    const uint64_t tile_n=MatMul::MATMUL_PACKED_WORKGROUP_SIZE_X*elements_per_thread[0];
-    const uint64_t tile_m=MatMul::MATMUL_PACKED_WORKGROUP_SIZE_Y*elements_per_thread[1];
-    const uint64_t tile_k=MatMulProgram::kInnerTileSamplesV1;
-    const uint64_t inner_per_dispatch=split_dim_inner>1?split_dim_inner:dim_inner;
-    const uint64_t padded_k=(inner_per_dispatch+tile_k-1)/tile_k*tile_k;
-    products=SafeInt<uint64_t>(dispatch_x)*tile_n*dispatch_y*tile_m*dispatch_z*padded_k;
-  }
-  ORT_RETURN_IF_ERROR(context->RunProgram(matmul_program,products));
   if (split_dim_inner > 1 && requires_fp32_accumulation) {
     const uint32_t output_size = narrow<uint32_t>(output_tensor->Shape().Size());
     const uint32_t vec_size = output_size / 4;

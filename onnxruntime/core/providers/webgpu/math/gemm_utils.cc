@@ -124,12 +124,12 @@ void EmitMatMulWriteFnFooter(ShaderHelper& shader) {
 
 }  // namespace
 
-void InitializeLogicalWorkgroupIDAndGlobalID(ShaderHelper& shader) {
+void InitializeLogicalWorkgroupIDAndGlobalID(ShaderHelper& shader,const std::string& workgroup_index) {
   // Dispatch normalization can pad the grid. The return must be uniform across
   // each workgroup, including kernels that use barriers or reinterpret z for Split-K.
   shader.MainFunctionBody()
-      << "  let logical_workgroup_id_x = workgroup_idx % uniforms.logical_dispatch_x;\n"
-      << "  let logical_workgroup_id_yz = workgroup_idx / uniforms.logical_dispatch_x;\n"
+      << "  let logical_workgroup_id_x = ("<<workgroup_index<<") % uniforms.logical_dispatch_x;\n"
+      << "  let logical_workgroup_id_yz = ("<<workgroup_index<<") / uniforms.logical_dispatch_x;\n"
       << "  let logical_workgroup_id_y = logical_workgroup_id_yz % uniforms.logical_dispatch_y;\n"
       << "  let logical_workgroup_id_z = logical_workgroup_id_yz / uniforms.logical_dispatch_y;\n"
       << "  if (logical_workgroup_id_z >= uniforms.logical_dispatch_z) { return; }\n"
@@ -231,7 +231,7 @@ Status MakeMatMulPackedVec4Source(ShaderHelper& shader,
                                   uint32_t tile_inner,
                                   bool split_k,
                                   uint32_t split_dim_inner,
-                                  bool use_f32_accumulation) {
+                                  bool use_f32_accumulation,const std::string& workgroup_index) {
   const std::string accumulation_type = use_f32_accumulation ? "f32" : data_type;
   const std::string write_type = split_k ? "output_value_t" : MakeScalarOrVectorType(output_components, data_type);
 
@@ -273,7 +273,7 @@ Status MakeMatMulPackedVec4Source(ShaderHelper& shader,
       << "const innerElementSize = " << inner_elements_size << ";\n"
       << "const tileInner = " << tile_inner << ";\n";
 
-  InitializeLogicalWorkgroupIDAndGlobalID(shader);
+  InitializeLogicalWorkgroupIDAndGlobalID(shader,workgroup_index);
 
   shader.MainFunctionBody()
       << "  let localRow = i32(local_id.y);\n"
@@ -481,7 +481,7 @@ Status MakeMatMulPackedSource(ShaderHelper& shader,
                               uint32_t tile_inner,
                               bool split_k,
                               uint32_t split_dim_inner,
-                              bool use_f32_accumulation) {
+                              bool use_f32_accumulation,const std::string& workgroup_index) {
   ORT_UNUSED_PARAMETER(split_k);
   ORT_UNUSED_PARAMETER(split_dim_inner);
 
@@ -515,7 +515,7 @@ Status MakeMatMulPackedSource(ShaderHelper& shader,
       << "const colPerThread = " << elements_per_thread_x << ";\n"
       << "const tileInner = " << tile_inner << ";\n";
 
-  InitializeLogicalWorkgroupIDAndGlobalID(shader);
+  InitializeLogicalWorkgroupIDAndGlobalID(shader,workgroup_index);
 
   shader.MainFunctionBody() << " let batch = i32(logical_global_id.z);\n"
                             << (nullptr != batch_dims ? "  let batchIndices = " + batch_dims->OffsetToIndices("u32(batch)") + ";\n" : "")

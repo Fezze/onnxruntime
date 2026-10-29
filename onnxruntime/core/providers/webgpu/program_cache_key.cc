@@ -156,6 +156,9 @@ std::string CalculateProgramCacheKey(const ProgramBase& program,
     }
   }
 
+  // Indirect dispatch changes generated coordinate/normalization code. A
+  // tuning trial compiled for direct dispatch must never serve that variant.
+  if(program.IndirectDispatchTensor())ss<<":Indirect";
   return SS_GET(ss);
 }
 
