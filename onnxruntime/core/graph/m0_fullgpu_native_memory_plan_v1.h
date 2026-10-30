@@ -179,6 +179,12 @@ class M0NativeMemoryPlanV1 final {
         scratch+=Bytes{15,0};
         scratch+=Bytes{M0NativeResidualFixedScratchBytesV1(channels,M0OutputChannelTiledConvV1()),0};
       }
+      if(node.op_type()=="GeneratorUpsampleExtentV1"&&M0GpuExecutionRedesignV1()&&M0BatchHeavyProgramsV1()&&M0OutputChannelTiledConvV1()){
+        // Exact GPU weight transpose [Cin,Cout,K] -> [Cout,K,Cin].
+        // Retain the conservative legacy workspace for unsupported devices.
+        scratch+=values_.at(node.input(2));
+        scratch+=Bytes{3*sizeof(uint32_t)+15,0};
+      }
       if(node.op_type()=="DurationExtentV4")scratch+=Bytes{512*2*sizeof(uint32_t)+15,0};
       if(node.op_type()=="LSTM"&&M0LstmInputProjectionV1()&&node.output_size()>0&&!node.output(0).empty()){
         // Four gate projections per ordinary hidden output, including alignment.
@@ -206,6 +212,9 @@ class M0NativeMemoryPlanV1 final {
             std::max(input_carrier.per_duration,output_carrier.per_duration)};
         references.Subtract(input_carrier);references.Subtract(output_carrier);
         references+=largest_carrier;references+=largest_carrier;
+        // Implicit final convolution binds activated input, output and original
+        // skip carrier together. Budget all three without a physical-capacity cap.
+        if(M0GpuExecutionRedesignV1()&&M0BatchHeavyProgramsV1()&&M0OutputChannelTiledConvV1())references+=largest_carrier;
         references+=Bytes{M0NativeResidualFixedScratchBytesV1(channels,M0OutputChannelTiledConvV1()),0};
       }else{
         // Include internal temporary allocations conservatively for other ops.

@@ -621,7 +621,11 @@ WGPUBuffer BufferManager::Create(CommandRecordingState& recording, size_t size, 
   {
     std::lock_guard<std::mutex> lock{mutex_};
     auto& cache = GetCacheManager(usage);
-    buffer_size = cache.CalculateBufferSize(size);
+    // Native planning is expressed in exact aligned tensor bytes. Bucket
+    // padding can otherwise turn three legal carrier views into a per-command
+    // queue-budget overflow. Non-bucket sizes retain the existing release policy.
+    buffer_size = M0GpuExecutionRedesignV1()&&bool(usage&wgpu::BufferUsage::Storage)?
+        NormalizeBufferSize(size):cache.CalculateBufferSize(size);
     buffer = cache.TryAcquireCachedBuffer(buffer_size);
   }
   if (buffer) {
@@ -684,7 +688,7 @@ size_t BufferManager::M0AllocationBackingSizeV1(size_t size, bool uniform) const
   ORT_ENFORCE(size <= std::numeric_limits<size_t>::max() - 15, "RW07_NATIVE_DEVICE_LIMITS_SIZE_OVERFLOW");
   std::lock_guard<std::mutex> lock{mutex_};
   auto& cache = GetCacheManager(uniform ? wgpu::BufferUsage::Uniform : wgpu::BufferUsage::Storage);
-  const size_t backing = cache.CalculateBufferSize(size);
+  const size_t backing = M0GpuExecutionRedesignV1()&&!uniform?NormalizeBufferSize(size):cache.CalculateBufferSize(size);
   ORT_ENFORCE(backing >= size, "RW07_NATIVE_DEVICE_LIMITS_BACKING_OVERFLOW");
   return backing;
 }

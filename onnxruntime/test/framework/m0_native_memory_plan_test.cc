@@ -74,6 +74,12 @@ ResidualPlan PlanResidual(uint32_t channels, uint32_t kernel, bool noise) {
                           channels*frames*sizeof(float)+32*sizeof(uint32_t);
     EXPECT_GE(result.references[i],live+result.initializers+
         M0NativeResidualFixedScratchBytesV1(channels,M0OutputChannelTiledConvV1())+M0NativePendingUniformBytesV1());
+    if(M0GpuExecutionRedesignV1()&&M0BatchHeavyProgramsV1()&&M0OutputChannelTiledConvV1()){
+      const uint64_t three_carriers=3*uint64_t(channels)*frames*sizeof(float);
+      EXPECT_GE(result.references[i],three_carriers+result.initializers+
+          2*32*sizeof(uint32_t)+256*sizeof(float)+
+          M0NativeResidualFixedScratchBytesV1(channels,true)+M0NativePendingUniformBytesV1());
+    }
     for (uint32_t tile_rows = 1; tile_rows <= channels; ++tile_rows) {
       const uint64_t temporaries = (tile_rows+channels)*frames*sizeof(float)+
           M0NativeResidualFixedScratchBytesV1(channels,M0OutputChannelTiledConvV1());

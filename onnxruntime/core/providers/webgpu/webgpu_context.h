@@ -16,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -151,6 +152,8 @@ struct CapturedCommandInfo {
 };
 
 // Conservative scheduling bound, not measured GPU instructions or FLOPs.
+// Maximum arithmetic in one encoded/submitted command buffer. Native CPU-
+// unchecked work also has a dispatch-count and unique-backing-byte bound.
 inline constexpr uint64_t kM0ScheduledProductsPerWindowV1=uint64_t{1}<<28;
 // A command recording timeline has one caller at a time. ORT serializes Run on a Session;
 // plugin streamless operations use independent encoders. BufferManager synchronizes buffer
@@ -169,8 +172,15 @@ struct CommandRecordingState {
   // retained backing buffers. Both bound the recording, not physical residency.
   uint64_t m0_submission_budget_bytes=0;
   uint64_t m0_queued_reference_bytes=0;
+  // Arithmetic is bounded per submitted command buffer. CPU-unchecked work is
+  // separately bounded by dispatch count and unique retained backing bytes.
   uint64_t m0_queued_scheduled_products=0;
+  uint32_t m0_unchecked_dispatches=0;
+  uint64_t m0_ordered_submissions=0;
   webgpu::M0QueuedBufferBudgetV1 m0_unique_queued_buffers;
+  // Keep API identities alive across ordered Submit until checked completion.
+  // GPU queue ownership alone need not retain the public handle wrapper.
+  std::unordered_map<WGPUBuffer,wgpu::Buffer> m0_retained_queue_buffers;
 #if defined(_WIN32) && defined(ENABLE_D3D12_FILE_LOADING)
   std::mutex pending_release_callbacks_mutex;
   std::vector<std::function<void()>> pending_release_callbacks;
@@ -192,7 +202,7 @@ struct CommandRecordingState {
       for(auto& command:deferred_dispatches)command.m0_uniform_upload.reset();
       m0_uniform_batches.clear();
       m0_uniform_retired.reset();
-      if(m0_submission_budget_bytes&&graph_capture_state==GraphCaptureState::Default&&candidate.use_count()==1)
+      if(m0_submission_budget_bytes&&graph_capture_state==GraphCaptureState::Default)
         m0_uniform_retired=std::move(candidate);
     }
     for(auto& command:deferred_dispatches)command.m0_uniform_upload.reset();
@@ -210,6 +220,16 @@ struct CommandRecordingState {
       ++m0_uniform_arena_recycled;
     }
     m0_uniform_retired.reset();
+  }
+  void M0RecycleUniformUploadsAfterOrderedSubmitV2(){
+    if(!m0_uniform_current&&m0_submission_budget_bytes&&graph_capture_state==GraphCaptureState::Default&&
+       m0_uniform_retired&&m0_uniform_retired.use_count()==1&&m0_uniform_retired->packing.Sealed()){
+      m0_uniform_retired->packing.ResetAfterOrderedSubmit();
+      m0_uniform_current=std::move(m0_uniform_retired);
+      ++m0_uniform_arena_recycled;
+    }
+    // A prospective CPU command may still hold this sealed block. Retain it
+    // until a later preparation sees sole ownership, instead of allocating again.
   }
   void M0ReleaseUniformUploadsV1(){
     m0_uniform_current.reset();
@@ -425,6 +445,7 @@ class WebGpuContext final {
                                   const std::vector<webgpu::M0QueuedBufferBudgetV1::Reference>& references);
   Status M0DrainOnMemoryPressureV1(const webgpu::BufferManager& buffer_mgr,
                                   CommandRecordingState& recording, uint64_t allocation_bytes);
+  Status M0SubmitWorkWindowV2(const webgpu::BufferManager& buffer_mgr, CommandRecordingState& recording);
   Status M0FlushIfBudgetReachedV1(const webgpu::BufferManager& buffer_mgr, CommandRecordingState& recording);
 
   // Context-level managers are shared by sessions and synchronize their buffer caches internally.

@@ -8,6 +8,8 @@
 #include "core/providers/webgpu/shader_helper.h"
 #include "core/providers/webgpu/m0_fullgpu_extent_abi2.h"
 #include "core/providers/webgpu/tensor/m0_fullgpu_residual_stages_v1.h"
+#include "core/providers/webgpu/tensor/m0_fullgpu_implicit_gemm_v1.h"
+#include "core/providers/webgpu/tensor/transpose.h"
 #include "core/providers/webgpu/tensor/m0_fullgpu_generator_edges_programs_v1.h"
 namespace onnxruntime::webgpu {
 namespace {
@@ -134,6 +136,14 @@ class GeneratorEdge : public WebGpuKernel {
     const uint64_t bytes=uint64_t(channels)*capacity_*4;
     const bool windowed=mode_==1||mode_==2;
     const bool windowed_upsample=mode_==0&&(x[0]->SizeInBytes()>limits.maxStorageBufferBindingSize||bytes>limits.maxStorageBufferBindingSize);
+    const bool implicit_upsample=mode_==0&&!windowed_upsample&&m0_implicit_gemm::Supported(limits,channels);
+    std::optional<Tensor> implicit_weights,implicit_arguments;
+    if(implicit_upsample){
+      implicit_weights.emplace(c.CreateGPUTensor(w->DataType(),TensorShape{channels,w->Shape()[2],source_channels}));
+      implicit_arguments.emplace(c.CreateGPUTensor(DataTypeImpl::GetType<uint32_t>(),TensorShape{3}));
+      ORT_RETURN_IF_ERROR(binding(&*implicit_weights));ORT_RETURN_IF_ERROR(binding(&*implicit_arguments));
+    }
+
     ORT_RETURN_IF_NOT(limits.maxStorageBuffersPerShaderStage>=5&&limits.maxComputeWorkgroupSizeX>=64&&
         limits.maxComputeInvocationsPerWorkgroup>=64&&limit>0&&(mode_!=0||windowed_upsample||groups<=limit*limit)&&bytes<=limits.maxBufferSize,"RW07 generator edge output resources");
     uint32_t window_channels=channels;
@@ -168,6 +178,14 @@ class GeneratorEdge : public WebGpuKernel {
       ORT_RETURN_IF_NOT(projection_output_channels>0&&window_groups<=limit*limit,"RW07 projection window dispatch limit");
     }
     auto* y=c.Output(0,TensorShape{1,channels,capacity_});auto* out=c.Output(1,TensorShape{32});
+    if(implicit_upsample){
+      ORT_RETURN_IF_NOT(implicit_weights->DataRaw()!=implicit_arguments->DataRaw(),"RW07 implicit upsample scratch alias");
+      for(const Tensor* target:std::array<const Tensor*,2>{&*implicit_weights,&*implicit_arguments})
+        for(const Tensor* source:std::array<const Tensor*,6>{x[0],e[0],w,b,y,out})
+          ORT_RETURN_IF_NOT(target->DataRaw()!=source->DataRaw(),"RW07 implicit upsample source/scratch alias");
+      ORT_RETURN_IF_ERROR(m0_residual_stages::StorageBudget(c,{w,&*implicit_weights}));
+      ORT_RETURN_IF_ERROR(m0_residual_stages::StorageBudget(c,{x[0],out,&*implicit_weights,b,y}));
+    }
     ORT_RETURN_IF_NOT(Gpu(y)&&y->IsDataType<float>()&&Gpu(out)&&out->IsDataType<uint32_t>()&&y->DataRaw()!=out->DataRaw(),
                       "RW07 generator edge distinct output allocations");
     for(const auto* target:{y,out}){
@@ -257,6 +275,21 @@ class GeneratorEdge : public WebGpuKernel {
           gsl::span<const uint32_t>{paired.data(),paired.size()},gsl::span<const uint32_t>{source_words.data(),source_words.size()},
           uint32_t(capacity_),channels,uint32_t(stage_),identity});
     ORT_RETURN_IF_ERROR(c.RunProgram(guard));
+    if(implicit_upsample){
+      c.FillZero(*y);
+      const std::array<size_t,3> permutation{1,2,0};
+      ORT_RETURN_IF_ERROR(Transpose::DoTranspose(c,permutation,*w,*implicit_weights));
+      const uint32_t kernel=stage_==0?20u:12u;
+      const m0_residual_stages::ResidualConvSpecV1 spec{capacities[0],uint32_t(capacity_),channels,
+          minimum,maximum,modulus,remainder,kernel,1u,capacities[0],0u,source_channels,0u,channels,identity};
+      uint64_t dispatches=1;
+      ORT_RETURN_IF_ERROR(m0_implicit_gemm::Run(c,{x[0],ProgramTensorMetadataDependency::None},
+          {y,ProgramTensorMetadataDependency::None},out,&*implicit_weights,b,&*implicit_arguments,spec,
+          dispatches,nullptr,1u,uint32_t(stage_),source_channels));
+      LOGS(c.Logger(),INFO)<<"M0_RW07_GENERATOR_EDGE_IMPLICIT stage="<<stage_<<" GPU_dispatches="<<dispatches
+          <<" tap_column_workspace_bytes=0 host_payload_reads=0";
+      return Status::OK();
+    }
     if(windowed_upsample){
       uint64_t upsample_dispatches=1;
       const uint32_t kernel=stage_==0?20u:12u;

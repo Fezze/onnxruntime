@@ -23,6 +23,10 @@ inline bool M0WorkloadObservationsV1() {
   static const bool enabled = M0ObservationOptionV1("M0_WORKLOAD_OBSERVATIONS");
   return enabled;
 }
+inline bool M0GpuExecutionRedesignV1() {
+  static const bool enabled=[](){const char* value=std::getenv("M0_GPU_EXECUTION_REDESIGN");return value&&std::strcmp(value,"1")==0;}();
+  return enabled;
+}
 inline bool M0BatchHeavyProgramsV1() {
   static const bool enabled = [](){const char* value=std::getenv("M0_BATCH_HEAVY_PROGRAMS");return value&&std::strcmp(value,"1")==0;}();
   return enabled;

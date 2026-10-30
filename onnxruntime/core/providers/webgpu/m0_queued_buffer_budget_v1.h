@@ -104,6 +104,9 @@ class M0UniformPackingV1 {
   void Seal(){sealed_=true;}
   // The caller must hold the sole block reference after checked queue completion.
   // An encoded/submitted command may still refer to every previous offset.
+  // QueueSubmit has consumed all earlier reads before a later QueueWriteBuffer.
+  // Caller must additionally establish sole CPU ownership of this block.
+  void ResetAfterOrderedSubmit(){ResetAfterCheckedCompletion();}
   void ResetAfterCheckedCompletion(){
     if(!sealed_)throw std::logic_error("RW07 unsubmitted uniform block recycle");
     bytes_.clear();

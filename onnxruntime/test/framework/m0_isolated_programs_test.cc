@@ -76,7 +76,7 @@ ProgramOracles LoadProgramOracles(){
 }
 
 void RunProgramProbe(int64_t stage,int64_t reuse,const std::vector<ProgramOracle>& inputs,
-                     const std::array<uint32_t,32>& extent,const std::vector<ProgramOracle>& expected){
+                     const std::array<uint32_t,32>& extent,const std::vector<ProgramOracle>& expected,int64_t dilation=1){
   ONNX_NAMESPACE::ModelProto model;model.set_ir_version(ONNX_NAMESPACE::Version::IR_VERSION);
   auto* standard=model.add_opset_import();standard->set_domain("");standard->set_version(20);
   auto* domain=model.add_opset_import();domain->set_domain("org.localtts.m0.qualification");domain->set_version(1);
@@ -86,7 +86,7 @@ void RunProgramProbe(int64_t stage,int64_t reuse,const std::vector<ProgramOracle
   const auto attribute=[&](const char* name,int64_t value){
     auto* a=node->add_attribute();a->set_name(name);a->set_type(ONNX_NAMESPACE::AttributeProto::INT);a->set_i(value);
   };
-  attribute("stage",stage==4?1:stage);attribute("reuse_coefficients",reuse);
+  attribute("stage",stage==4?1:stage);attribute("reuse_coefficients",reuse);attribute("probe_dilation",dilation);
   const auto port=[](ONNX_NAMESPACE::ValueInfoProto* p,const std::string& name,int type,const std::vector<int64_t>& shape){
     p->set_name(name);auto* t=p->mutable_type()->mutable_tensor_type();t->set_elem_type(type);
     for(const auto dim:shape)t->mutable_shape()->add_dim()->set_dim_value(dim);
@@ -410,6 +410,117 @@ TEST(M0IsolatedPrograms, ResidualAutomaticDirectWarmupThenIndirectMatchesCpu) {
   }
   auto extent=ProbeExtent(3,active);extent[4]=channels;extent[18]=channels*active;
   ASSERT_NO_FATAL_FAILURE(RunProgramProbe(6,3,{input,weight,bias},extent,{expected}));
+}
+TEST(M0IsolatedPrograms, ImplicitResidualSharedGemmAndFusedSkipMatchCpuAcrossWindows) {
+  struct Case {uint32_t channels,active,capacity,kernel,dilation;};
+  for(const auto c:std::array<Case,6>{{{8,1,96,3,1},{8,65,2080,11,5},{128,17,96,7,3},
+                                    {256,65,2080,11,1},{256,65,2080,3,5},{128,65,2080,3,1}}})
+  for(const int64_t variant:{4,5}){
+    SCOPED_TRACE(c.channels);
+    SCOPED_TRACE(c.kernel);
+    SCOPED_TRACE(c.dilation);
+    SCOPED_TRACE(variant);
+    ProgramOracle input{{1,c.channels,c.capacity},std::vector<float>(c.channels*c.capacity,12345.0f)};
+    ProgramOracle weight{{c.channels,c.channels,c.kernel},std::vector<float>(c.channels*c.channels*c.kernel)};
+    ProgramOracle bias{{c.channels},std::vector<float>(c.channels)};
+    for(uint32_t ch=0;ch<c.channels;ch++)for(uint32_t t=0;t<c.active;t++)
+      input.values[ch*c.capacity+t]=float(int((ch*13+t*7)%29)-14)*0.01f;
+    for(size_t i=0;i<weight.values.size();i++)weight.values[i]=float(int(i%19)-9)*0.01f;
+    for(uint32_t ch=0;ch<c.channels;ch++)bias.values[ch]=float(ch)*0.001f;
+    ProgramOracle expected{{1,c.channels,c.capacity},std::vector<float>(c.channels*c.capacity,0)};
+    for(uint32_t oc=0;oc<c.channels;oc++)for(uint32_t t=0;t<c.active;t++){
+      float sum=0;
+      for(uint32_t ic=0;ic<c.channels;ic++)for(uint32_t k=0;k<c.kernel;k++){
+        const int64_t at=int64_t(t)+int64_t(k)*c.dilation-int64_t((c.kernel-1)*c.dilation/2);
+        if(at>=0&&at<c.active)sum+=input.values[ic*c.capacity+size_t(at)]*weight.values[(oc*c.channels+ic)*c.kernel+k];
+      }
+      sum+=bias.values[oc];if(variant==5)sum+=input.values[oc*c.capacity+t];expected.values[oc*c.capacity+t]=sum;
+    }
+    auto extent=ProbeExtent(3,c.active);extent[4]=c.channels;extent[18]=c.channels*c.active;
+    ASSERT_NO_FATAL_FAILURE(RunProgramProbe(6,variant,{input,weight,bias},extent,{expected},c.dilation));
+  }
+  RecordProperty("qualification_scope","actual no-im2col shared FP32 GEMM; GPU active grid; fused skip after last input tile; partial input/output windows and dilation; original CPU tolerance");
+}
+TEST(M0IsolatedPrograms, ImplicitResidualExceptionalTileRetainsOriginalFp32) {
+  constexpr uint32_t channels=8,active=17,capacity=96,kernel=3;
+  for(const int64_t mode:{4,5}){
+    SCOPED_TRACE(mode);
+    ProgramOracle input{{1,channels,capacity},std::vector<float>(channels*capacity,12345.0f)};
+    ProgramOracle weight{{channels,channels,kernel},std::vector<float>(channels*channels*kernel,0)};
+    ProgramOracle bias{{channels},std::vector<float>(channels,0)};
+    for(uint32_t ch=0;ch<channels;ch++)for(uint32_t t=0;t<active;t++)input.values[ch*capacity+t]=float(int((ch+t)%17)-8)/64;
+    weight.values[1]=std::ldexp(1.0f,60);
+    ProgramOracle expected{{1,channels,capacity},std::vector<float>(channels*capacity,0)};
+    for(uint32_t ch=0;ch<channels;ch++)for(uint32_t t=0;t<active;t++){
+      const float sum=ch==0?input.values[t]*weight.values[1]:0;
+      expected.values[ch*capacity+t]=mode==5?sum+input.values[ch*capacity+t]:sum;
+    }
+    auto extent=ProbeExtent(3,active);extent[4]=channels;extent[18]=channels*active;
+    ASSERT_NO_FATAL_FAILURE(RunProgramProbe(6,mode,{input,weight,bias},extent,{expected}));
+  }
+}
+TEST(M0IsolatedPrograms, ActiveNormSnakeFlatteningMatchesCpuAndClearsPadding) {
+  for(const uint32_t channels:{8u,128u})for(const uint32_t capacity:{96u,2080u})for(const uint32_t active:{1u,65u}){
+    SCOPED_TRACE(channels);
+    SCOPED_TRACE(capacity);
+    SCOPED_TRACE(active);
+    ProgramOracle input{{1,channels,capacity},std::vector<float>(channels*capacity,12345.0f)};
+    ProgramOracle coefficients{{channels,6},std::vector<float>(channels*6)};
+    ProgramOracle unused{{1},std::vector<float>{0}};
+    ProgramOracle expected{{1,channels,capacity},std::vector<float>(channels*capacity,0)};
+    for(uint32_t ch=0;ch<channels;ch++){
+      const float gamma=0.3f,beta=0.1f,a=0.7f,reciprocal=1.0f/a,mean=0.05f,denominator=1.25f;
+      const std::array<float,6> row{gamma,beta,a,reciprocal,mean,denominator};
+      std::copy(row.begin(),row.end(),coefficients.values.begin()+ch*6);
+      for(uint32_t t=0;t<active;t++){
+        const float value=float(int((ch+t)%17)-8)*0.03f;input.values[ch*capacity+t]=value;
+        const float normalized=(value-mean)/denominator;const float affine=gamma*normalized+beta;
+        const float sine=std::sin(a*affine);expected.values[ch*capacity+t]=affine+reciprocal*(sine*sine);
+      }
+    }
+    auto extent=ProbeExtent(3,active);extent[4]=channels;extent[18]=channels*active;
+    ASSERT_NO_FATAL_FAILURE(RunProgramProbe(9,1,{input,coefficients,unused},extent,{expected}));
+  }
+}
+TEST(M0IsolatedPrograms, ImplicitPhaseUpsampleMatchesOriginalCpuIncludingReflection) {
+  struct Case{uint32_t stage,inputs,outputs,active,capacity;bool large=false;};
+  for(const auto c:std::array<Case,8>{{{0,8,8,1,32},{0,8,8,17,65},{1,8,8,1,32},
+                                    {1,8,8,20,65},{0,512,256,3,32},{1,256,128,20,32},{0,8,8,3,32,true},{1,8,8,20,32,true}}}){
+    SCOPED_TRACE(c.stage);
+    SCOPED_TRACE(c.inputs);
+    SCOPED_TRACE(c.outputs);
+    const uint32_t stride=c.stage?6:10,kernel=2*stride,active=c.active*stride+c.stage,capacity=c.capacity*stride+c.stage;
+    ProgramOracle input{{1,c.inputs,c.capacity},std::vector<float>(c.inputs*c.capacity,12345.0f)};
+    ProgramOracle weight{{c.inputs,c.outputs,kernel},std::vector<float>(c.inputs*c.outputs*kernel)};
+    ProgramOracle bias{{c.outputs},std::vector<float>(c.outputs)};
+    for(uint32_t ch=0;ch<c.inputs;ch++)for(uint32_t t=0;t<c.active;t++)input.values[ch*c.capacity+t]=float(int((ch+t)%17)-8)*0.01f;
+    for(size_t i=0;i<weight.values.size();i++)weight.values[i]=float(int(i%19)-9)*0.01f;
+    for(uint32_t ch=0;ch<c.outputs;ch++)bias.values[ch]=float(ch)*0.001f;
+    if(c.large){
+      std::fill(weight.values.begin(),weight.values.end(),0);weight.values[0]=std::ldexp(1.0f,60);
+      std::fill(bias.values.begin(),bias.values.end(),0);
+      for(uint32_t ch=0;ch<c.inputs;ch++)for(uint32_t t=0;t<c.active;t++)input.values[ch*c.capacity+t]=float((ch+t)%7)/64;
+    }
+    ProgramOracle expected{{1,c.outputs,capacity},std::vector<float>(c.outputs*capacity,0)};
+    for(uint32_t oc=0;oc<c.outputs;oc++)for(uint32_t t=0;t<active;t++){
+      const uint32_t frame=c.stage?(t==0?1:t-1):t;float total=0;
+      for(uint32_t k=0;k<kernel;k++){
+        const int64_t numerator=int64_t(frame)+stride/2-k;
+        if(numerator<0||uint64_t(numerator)%stride||uint64_t(numerator)/stride>=c.active)continue;
+        float column=0;
+        for(uint32_t ic=0;ic<c.inputs;ic++){
+          const float value=input.values[ic*c.capacity+size_t(numerator)/stride];
+          const float activated=value>=0?value:value*0.1f;
+          column+=activated*weight.values[(ic*c.outputs+oc)*kernel+k];
+        }
+        total+=column;
+      }
+      expected.values[oc*capacity+t]=total+bias.values[oc];
+    }
+    auto extent=ProbeExtent(3,active);extent[4]=c.outputs;extent[18]=c.outputs*active;
+    ASSERT_NO_FATAL_FAILURE(RunProgramProbe(10,c.stage,{input,weight,bias},extent,{expected}));
+  }
+  RecordProperty("qualification_scope","actual GPU weight transpose and implicit phase GEMM, original ascending two-tap/IC CPU reference, boundary reflection and poisoned padding");
 }
 TEST(M0IsolatedPrograms, TiledRecurrenceProjectionMatchesCpuWithInactiveFramesAndBothWeightLayouts){
   for(const uint32_t capacity:{9u,25u})for(const int64_t coalesced:{0,1}){

@@ -666,7 +666,8 @@ inline void RegisterM0FullGpuExtentSchemasV1() {
       .Output(0,"primary","Signal phase or polar output","tensor(float)")
       .Output(1,"signal","Signal waveform for stage1","tensor(float)",OpSchema::Optional)
       .Attr("stage","1:original signal;2:original polar;3:original STFT;5:isolated STFT input/guard summary",AttributeProto::INT)
-      .Attr("reuse_coefficients","Signal interpolation coefficient reuse",AttributeProto::INT,int64_t{1});
+      .Attr("reuse_coefficients","Signal interpolation coefficient reuse",AttributeProto::INT,int64_t{1})
+      .Attr("probe_dilation","Independent convolution oracle dilation",AttributeProto::INT,int64_t{1});
   ONNX_NAMESPACE::RegisterSchema(std::move(probe),0,true,true);
 #endif
 }

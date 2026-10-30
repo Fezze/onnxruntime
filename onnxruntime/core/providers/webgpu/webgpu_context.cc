@@ -1067,10 +1067,11 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
         recording.graph_capture_state==GraphCaptureState::Default && &buffer_mgr==buffer_mgr_.get()&&
         alignment&&alignment%4==0&&uniform_buffer_total_size<=arena_capacity;
     if(use_arena){
+      recording.M0RecycleUniformUploadsAfterOrderedSubmitV2();
       uniform_batch=recording.m0_uniform_current;
       if(!uniform_batch||!uniform_batch->packing.CanAppend(uniform_buffer_total_size,size_t(alignment))){
         if(uniform_batch){
-          ORT_RETURN_IF_ERROR(FlushAndWaitChecked(buffer_mgr,recording));
+          ORT_RETURN_IF_ERROR(M0SubmitWorkWindowV2(buffer_mgr,recording));
           uniform_batch.reset();
         }
         // Allocation may drain an older window. Publish the new block only afterward.
@@ -1157,7 +1158,7 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
     ORT_RETURN_IF_NOT(recording.m0_queued_scheduled_products<=kM0ScheduledProductsPerWindowV1,
                       "RW07 queued scheduled-work state");
     if(scheduled_products>kM0ScheduledProductsPerWindowV1-recording.m0_queued_scheduled_products)
-      ORT_RETURN_IF_ERROR(FlushAndWaitChecked(buffer_mgr,recording));
+      ORT_RETURN_IF_ERROR(M0SubmitWorkWindowV2(buffer_mgr,recording));
     if(M0BatchHeavyProgramsV1()){
       std::vector<webgpu::M0QueuedBufferBudgetV1::Reference> references;
       references.reserve(bind_buffers.size()+1);
@@ -1189,13 +1190,16 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
     recording.m0_uniform_batches.push_back(uniform_batch);
   ORT_RETURN_IF_NOT(recording.m0_uniform_batches.size()<=2,"RW07 uniform recording block bound");
   recording.deferred_dispatches.push_back(std::move(command));
+  if(recording.m0_submission_budget_bytes)++recording.m0_unchecked_dispatches;
 
   // Drain and submit a full window to bound both recorded and encoded dispatch state. Partial
   // windows are encoded and submitted by the caller at its execution boundary.
-  if (static_cast<size_t>(recording.num_pending_dispatches) + recording.deferred_dispatches.size() >=
+  if(recording.m0_submission_budget_bytes&&recording.m0_unchecked_dispatches>=max_num_pending_dispatches_){
+    ORT_RETURN_IF_ERROR(FlushAndWaitChecked(buffer_mgr,recording));
+  }else if (static_cast<size_t>(recording.num_pending_dispatches) + recording.deferred_dispatches.size() >=
       max_num_pending_dispatches_) {
     ORT_RETURN_IF_ERROR(recording.m0_submission_budget_bytes?
-        FlushAndWaitChecked(buffer_mgr,recording):Flush(buffer_mgr,recording));
+        M0SubmitWorkWindowV2(buffer_mgr,recording):Flush(buffer_mgr,recording));
   }else{
     ORT_RETURN_IF_ERROR(M0FlushIfBudgetReachedV1(buffer_mgr,recording));
   }
@@ -1643,6 +1647,14 @@ Status WebGpuContext::M0BeforeEnqueueUniqueV1(const webgpu::BufferManager& buffe
     ORT_RETURN_IF_ERROR(FlushAndWaitChecked(buffer_mgr,recording));
     transfers=0;
   }
+  for(const auto& reference:references){
+    const auto buffer=reinterpret_cast<WGPUBuffer>(reference.first);
+    if(recording.m0_retained_queue_buffers.find(buffer)==recording.m0_retained_queue_buffers.end()){
+      wgpuBufferAddRef(buffer);
+      auto retained_buffer=wgpu::Buffer::Acquire(buffer);
+      recording.m0_retained_queue_buffers.emplace(buffer,std::move(retained_buffer));
+    }
+  }
   retained.Track(references);
   ORT_RETURN_IF_NOT(transfers<=std::numeric_limits<uint64_t>::max()-retained.Bytes(),
                     "RW07 queued transfer accounting overflow");
@@ -1650,12 +1662,34 @@ Status WebGpuContext::M0BeforeEnqueueUniqueV1(const webgpu::BufferManager& buffe
   return Status::OK();
 }
 
+Status WebGpuContext::M0SubmitWorkWindowV2(const webgpu::BufferManager& buffer_mgr,
+                                             CommandRecordingState& recording){
+  if(!recording.m0_submission_budget_bytes||!M0BatchHeavyProgramsV1()||!M0GpuExecutionRedesignV1()||
+     recording.m0_unchecked_dispatches>=max_num_pending_dispatches_)
+    return FlushAndWaitChecked(buffer_mgr,recording);
+  ORT_RETURN_IF_NOT(recording.m0_queued_scheduled_products<=kM0ScheduledProductsPerWindowV1,
+                    "RW07 submitted command-buffer work bound");
+  const auto status=Flush(buffer_mgr,recording);
+  if(!status.IsOK()){M0OwnershipV2().Poison();return status;}
+  // Submitted resources stay in the unique-byte epoch until checked completion.
+  // Later uses/writes use this same ordered queue. No CPU mapped reuse is added.
+  recording.m0_queued_scheduled_products=0;
+  recording.M0RecycleUniformUploadsAfterOrderedSubmitV2();
+  ++recording.m0_ordered_submissions;
+  const auto device_status=CheckDeviceStatus();
+  if(!device_status.IsOK())M0OwnershipV2().Poison();
+  return device_status;
+}
+
 Status WebGpuContext::M0FlushIfBudgetReachedV1(const webgpu::BufferManager& buffer_mgr,
                                              CommandRecordingState& recording){
-  if(recording.m0_submission_budget_bytes&&
-      (recording.m0_queued_reference_bytes>=recording.m0_submission_budget_bytes||
-       recording.m0_queued_scheduled_products>=kM0ScheduledProductsPerWindowV1))
-    return FlushAndWaitChecked(buffer_mgr,recording);
+  if(recording.m0_submission_budget_bytes){
+    if(recording.m0_queued_reference_bytes>=recording.m0_submission_budget_bytes||
+       recording.m0_unchecked_dispatches>=max_num_pending_dispatches_)
+      return FlushAndWaitChecked(buffer_mgr,recording);
+    if(recording.m0_queued_scheduled_products>=kM0ScheduledProductsPerWindowV1)
+      return M0SubmitWorkWindowV2(buffer_mgr,recording);
+  }
   return Status::OK();
 }
 
@@ -1753,7 +1787,9 @@ Status WebGpuContext::FlushAndWaitChecked(const webgpu::BufferManager& buffer_mg
     {std::lock_guard<std::mutex> queue_lock(m0_queue_epoch_mutex_);
      m0_checked_queue_epoch_=std::max(m0_checked_queue_epoch_,observed_queue_epoch);}
     recording.m0_queued_reference_bytes=0;recording.m0_queued_scheduled_products=0;
+    recording.m0_unchecked_dispatches=0;
     recording.m0_unique_queued_buffers.Reset();
+    recording.m0_retained_queue_buffers.clear();
     recording.M0RecycleUniformUploadsAfterCheckedCompletionV1();
   }else{
     recording.M0ReleaseUniformUploadsV1();

@@ -342,8 +342,8 @@ inline uint32_t ResidualSnakeElementsPerDispatchV1(bool batched=M0BatchHeavyProg
 }
 class GeneratorNormAffine final : public Program<GeneratorNormAffine> {
  public:
-  explicit GeneratorNormAffine(bool fused=M0FusedNormSnakeV1())
-    : Program{fused?"RW07ResidualNormAffineSnakeFusedV5":"RW07ResidualNormAffineElementChunksV4"},fused_(fused) {}
+  explicit GeneratorNormAffine(bool fused=M0FusedNormSnakeV1(),bool active=false)
+    : Program{active?"RW07ResidualNormSnakeActiveV6":fused?"RW07ResidualNormAffineSnakeFusedV5":"RW07ResidualNormAffineElementChunksV4"},fused_(fused),active_(active) {}
   bool FusedSnake() const {return fused_;}
   WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
       {"input_capacity", ProgramUniformVariableDataType::Uint32},
@@ -371,10 +371,17 @@ class GeneratorNormAffine final : public Program<GeneratorNormAffine> {
     OriginalArithmetic(s);
     if(fused_)s.AdditionalImplementation()<<m0_trig_detail::Trig;
     auto& f=s.MainFunctionBody();
-    f << "let elements=uniforms.tile_channels*uniforms.output_capacity;"
+    if(active_){
+      f<<"if(!valid_output()){return;}let logical_count="<<e.GetByOffset("6u")<<";"
+        <<"if(logical_count==0u||logical_count>uniforms.input_capacity){return;}"
+        <<"let logical=uniforms.element_begin+global_idx;"
+        <<"if(global_idx>=uniforms.element_count||logical>=uniforms.channel_count*logical_count){return;}"
+        <<"let at=(logical/logical_count)*uniforms.output_capacity+logical%logical_count;";
+    }else f << "let elements=uniforms.tile_channels*uniforms.output_capacity;"
       << "if(uniforms.element_begin>=elements||uniforms.element_count>elements-uniforms.element_begin||"
       << "global_idx>=uniforms.element_count){return;}let at=uniforms.element_begin+global_idx;"
-      << y.SetByOffset("at","0.0") << "if(!valid_output()){return;}"
+      ;
+    f << y.SetByOffset("at","0.0") << "if(!valid_output()){return;}"
       << "let local_channel=at/uniforms.output_capacity;let t=at%uniforms.output_capacity;"
       << "if(local_channel>=uniforms.channel_count||uniforms.channel_offset>=uniforms.channels||"
       << "uniforms.channel_count>uniforms.channels-uniforms.channel_offset){return;}"
@@ -398,7 +405,7 @@ class GeneratorNormAffine final : public Program<GeneratorNormAffine> {
     return Status::OK();
   }
  private:
-  const bool fused_;
+  const bool fused_,active_;
 };
 // Keep only affine/a/reciprocal live around the trig calculation. Each
 // invocation reads and overwrites its own element in the existing tile.
@@ -557,6 +564,20 @@ struct ResidualConvSpecV1 {
   template <typename P> void ApplyPacked(P& p,uint32_t t,uint32_t n,uint32_t row,uint32_t rows,uint32_t flag_offset=0)const {
     p.AddUniformVariables({input_capacity,output_capacity,channels,minimum,maximum,modulus,remainder,kernel,dilation,
       residual_capacity,channel_offset,channel_count,output_channel_offset,output_channel_count,0u,0u,identity,t,n,row,rows,flag_offset});
+  }
+};
+class ResidualPointwiseGridV2 final:public Program<ResidualPointwiseGridV2>{
+ public:
+  ResidualPointwiseGridV2():Program{"RW07ResidualPointwiseActiveGridV2"}{}
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(M0_RESIDUAL_TILE_UNIFORMS_V1);
+  Status GenerateShaderCode(ShaderHelper& s)const override{
+    const auto& e=s.AddInput("extent",ShaderUsage::UseValueTypeAlias);
+    const auto& a=s.AddOutput("arguments",ShaderUsage::UseValueTypeAlias);ValidOutput(s,e);
+    auto& f=s.MainFunctionBody();f<<a.SetByOffset("0u","0u")<<a.SetByOffset("1u","1u")<<a.SetByOffset("2u","1u")
+      <<"if(!valid_output()){return;}let n="<<e.GetByOffset("6u")<<";let elements=uniforms.channel_count*n;"
+      <<"if(uniforms.element_begin<elements){let count=min(uniforms.element_count,elements-uniforms.element_begin);"
+      <<a.SetByOffset("0u","(count+63u)/64u")<<"}";
+    return Status::OK();
   }
 };
 inline constexpr uint32_t kResidualPackedTimeV1=2048;

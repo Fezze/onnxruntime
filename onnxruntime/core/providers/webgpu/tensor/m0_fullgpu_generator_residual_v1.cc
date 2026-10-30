@@ -8,6 +8,7 @@
 #include "core/providers/webgpu/shader_helper.h"
 #include "core/providers/webgpu/m0_fullgpu_extent_abi2.h"
 #include "core/providers/webgpu/tensor/m0_fullgpu_residual_stages_v1.h"
+#include "core/providers/webgpu/tensor/m0_fullgpu_implicit_gemm_v1.h"
 
 namespace onnxruntime::webgpu {
 namespace {
@@ -131,9 +132,15 @@ class GeneratorResidualExtent final : public WebGpuKernel {
     auto activated=c.CreateGPUTensor(x->DataType(),TensorShape{1,tile_channels,capacity_});
     auto conv=c.CreateGPUTensor(x->DataType(),TensorShape{1,channels,capacity_});
     auto coefficients=c.CreateGPUTensor(x->DataType(),TensorShape{channels,6});
+    const bool implicit_convolution=m0_implicit_gemm::Supported(limits,output_tile_channels,true);
+    if(implicit_convolution){c.FillZero(*y);c.FillZero(conv);}
     std::optional<Tensor> packed_columns,packed_flags,register_weights,active_grid;
+    if(implicit_convolution){
+      active_grid.emplace(c.CreateGPUTensor(DataTypeImpl::GetType<uint32_t>(),TensorShape{3}));
+      ORT_RETURN_IF_ERROR(binding(&*active_grid));
+    }
     const uint64_t packed_elements=m0_residual_stages::ResidualPackedElementsV1(tile_channels,kernel);
-    if(M0OutputChannelTiledConvV1()&&m0_residual_stages::ResidualPackedSupportedV1(limits)&&
+    if(!implicit_convolution&&M0OutputChannelTiledConvV1()&&m0_residual_stages::ResidualPackedSupportedV1(limits)&&
         packed_elements*4<=limits.maxStorageBufferBindingSize&&packed_elements*4<=limits.maxBufferSize){
       active_grid.emplace(c.CreateGPUTensor(DataTypeImpl::GetType<uint32_t>(),TensorShape{3}));
       ORT_RETURN_IF_ERROR(binding(&*active_grid));
@@ -190,6 +197,8 @@ class GeneratorResidualExtent final : public WebGpuKernel {
         const uint32_t count=std::min(output_tile_channels,channels-offset);
         ORT_RETURN_IF_ERROR(StorageBudgetWithWindow(c,output_window(accumulator,offset,count),
             {&activated,out,params[6*h+4],params[6*h+5]}));
+        if(implicit_convolution)ORT_RETURN_IF_ERROR(StorageBudgetWithWindows(c,window(x,offset,count),
+            output_window(accumulator,offset,count),{&activated,out,params[6*h+4],params[6*h+5]}));
         if(packed_columns)ORT_RETURN_IF_ERROR(StorageBudgetWithWindow(c,output_window(accumulator,offset,count),
             {&activated,out,params[6*h+4],params[6*h+5],&*packed_columns,&*packed_flags}));
         if(register_weights)ORT_RETURN_IF_ERROR(StorageBudgetWithWindow(c,output_window(accumulator,offset,count),
@@ -240,18 +249,32 @@ class GeneratorResidualExtent final : public WebGpuKernel {
                                   offset,count,tile_channels,identity});
         ORT_RETURN_IF_ERROR(c.RunProgram(statistics));
         ++dispatches;
-        const uint64_t norm_elements=uint64_t(tile_channels)*oc;
-        const uint32_t norm_chunk=m0_residual_stages::ResidualSnakeElementsPerDispatchV1();
+        const bool active_norm=implicit_convolution&&M0FusedNormSnakeV1();
+        const uint64_t norm_elements=uint64_t(active_norm?count:tile_channels)*oc;
+        const uint32_t norm_work=m0_residual_stages::kNormAffineWorkPerElementV1+m0_residual_stages::kSnakeWorkPerElementV1;
+        const uint32_t norm_chunk=active_norm?uint32_t(std::min<uint64_t>(kM0ScheduledProductsPerWindowV1/norm_work,
+            uint64_t(limit)*64)/64*64):m0_residual_stages::ResidualSnakeElementsPerDispatchV1();
         for(uint64_t first=0;first<norm_elements;first+=norm_chunk){
           const uint32_t size=static_cast<uint32_t>(std::min<uint64_t>(norm_chunk,norm_elements-first));
-          GeneratorNormAffine norm;
+          GeneratorNormAffine norm(M0FusedNormSnakeV1(),active_norm);
           norm.AddInput(window(input,offset,count)).AddInputs({{out,ProgramTensorMetadataDependency::None},
               {&coefficients,ProgramTensorMetadataDependency::None}}).AddOutput({normout,ProgramTensorMetadataDependency::None})
               .AddUniformVariables({inputcap,oc,channels,minimum,maximum,modulus,remainder,kernel,dilation,pc,
                                     offset,count,tile_channels,uint32_t(first),size,identity});
           const uint64_t norm_groups=(uint64_t(size)+63)/64;
           const uint64_t nx=std::min(norm_groups,limit),ny=(norm_groups+nx-1)/nx;
-          norm.SetWorkgroupSize(64).SetDispatchGroupSize(uint32_t(nx),uint32_t(ny));
+          norm.SetWorkgroupSize(64);
+          if(!active_norm)norm.SetDispatchGroupSize(uint32_t(nx),uint32_t(ny));
+          if(active_norm){
+            m0_residual_stages::ResidualPointwiseGridV2 grid;
+            grid.AddInput({out,ProgramTensorMetadataDependency::None}).AddOutput({&*active_grid,ProgramTensorMetadataDependency::None})
+                .SetWorkgroupSize(1).SetDispatchGroupSize(1);
+            const m0_residual_stages::ResidualConvSpecV1 grid_spec{inputcap,oc,channels,minimum,maximum,modulus,remainder,kernel,dilation,pc,
+                offset,count,0u,channels,identity};
+            grid_spec.Apply(grid,0,0,uint32_t(first),size);
+            ORT_RETURN_IF_ERROR(c.RunProgram(grid));++dispatches;
+            norm.SetIndirectDispatchTensor(&*active_grid);
+          }
           ORT_RETURN_IF_ERROR(m0_residual_stages::RunHeavyProgram(c,norm,norm_groups*64*(m0_residual_stages::kNormAffineWorkPerElementV1+(norm.FusedSnake()?m0_residual_stages::kSnakeWorkPerElementV1:0))));
           ++dispatches;
           if(!norm.FusedSnake()){
@@ -269,13 +292,20 @@ class GeneratorResidualExtent final : public WebGpuKernel {
           const uint32_t output_count=std::min(output_tile_channels,channels-output_offset);
           const m0_residual_stages::ResidualConvSpecV1 spec{oc,oc,channels,minimum,maximum,modulus,remainder,kernel,dilation,pc,
             offset,count,output_offset,output_count,identity};
+          if(implicit_convolution){
+            const auto prior=window(x,output_offset,output_count);
+            ORT_RETURN_IF_ERROR(m0_implicit_gemm::Run(c,{normout,ProgramTensorMetadataDependency::None},
+                output_window(convout,output_offset,output_count),out,params[6*h+4],params[6*h+5],&*active_grid,
+                spec,dispatches,h==1?&prior:nullptr));
+          }else{
           ORT_RETURN_IF_ERROR(m0_residual_stages::RunResidualConvolutionV1(c,
             ProgramInput{normout,ProgramTensorMetadataDependency::None},output_window(convout,output_offset,output_count),
             out,params[6*h+4],params[6*h+5],packed_columns?&*packed_columns:nullptr,packed_flags?&*packed_flags:nullptr,spec,dispatches,false,0,register_weights?&*register_weights:nullptr,active_grid?&*active_grid:nullptr));
+          }
         }
       }
     }
-    for(uint32_t offset=0;offset<channels;offset+=output_tile_channels){
+    if(!implicit_convolution)for(uint32_t offset=0;offset<channels;offset+=output_tile_channels){
       const uint32_t count=std::min(output_tile_channels,channels-offset);
       GeneratorResidualAdd add;
       add.AddInput({out,ProgramTensorMetadataDependency::None}).AddInput(window(x,offset,count))
@@ -288,7 +318,7 @@ class GeneratorResidualExtent final : public WebGpuKernel {
       <<" GPU_dispatches="<<dispatches
       <<" max_residual_scalar_products_per_dispatch="<<m0_residual_stages::kResidualProductsPerDispatchV1
       <<" max_snake_elements_per_dispatch="<<m0_residual_stages::ResidualSnakeElementsPerDispatchV1()
-      <<" activation_tile_channels="<<tile_channels<<" output_tile_channels="<<output_tile_channels<<" host_payload_reads=0";
+      <<" activation_tile_channels="<<tile_channels<<" output_tile_channels="<<output_tile_channels<<" implicit_convolution="<<implicit_convolution<<" host_payload_reads=0";
     return Status::OK();
   }
  private:

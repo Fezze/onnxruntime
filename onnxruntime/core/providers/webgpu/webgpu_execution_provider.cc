@@ -1099,7 +1099,7 @@ Status WebGpuExecutionProvider::OnRunStart(const onnxruntime::RunOptions& run_op
     ORT_RETURN_IF_NOT(!recording_->command_encoder&&!recording_->compute_pass_encoder&&
         !recording_->has_unsubmitted_work.load(std::memory_order_relaxed)&&
         !recording_->num_pending_dispatches&&recording_->deferred_dispatches.empty()&&
-        !recording_->m0_submission_budget_bytes&&!recording_->m0_queued_scheduled_products&&!recording_->m0_queued_reference_bytes&&recording_->m0_unique_queued_buffers.Empty()&&!recording_->m0_uniform_current&&recording_->m0_uniform_batches.empty(),
+        !recording_->m0_submission_budget_bytes&&!recording_->m0_unchecked_dispatches&&!recording_->m0_queued_scheduled_products&&!recording_->m0_queued_reference_bytes&&recording_->m0_unique_queued_buffers.Empty()&&recording_->m0_retained_queue_buffers.empty()&&!recording_->m0_uniform_current&&recording_->m0_uniform_batches.empty(),
         "RW07 native submission recording not idle");
     submission_budget=context_.DeviceLimits().maxBufferSize;
 #if defined(__ANDROID__)
@@ -1116,7 +1116,7 @@ Status WebGpuExecutionProvider::OnRunStart(const onnxruntime::RunOptions& run_op
     if (planned_queue_bytes) submission_budget = std::min(submission_budget, planned_queue_bytes);
     ORT_RETURN_IF_NOT(submission_budget,"RW07 native submission zero budget");
   }else{
-    ORT_RETURN_IF_NOT(!recording_->m0_submission_budget_bytes&&!recording_->m0_queued_scheduled_products&&!recording_->m0_queued_reference_bytes&&recording_->m0_unique_queued_buffers.Empty()&&!recording_->m0_uniform_current&&recording_->m0_uniform_batches.empty(),
+    ORT_RETURN_IF_NOT(!recording_->m0_submission_budget_bytes&&!recording_->m0_unchecked_dispatches&&!recording_->m0_queued_scheduled_products&&!recording_->m0_queued_reference_bytes&&recording_->m0_unique_queued_buffers.Empty()&&recording_->m0_retained_queue_buffers.empty()&&!recording_->m0_uniform_current&&recording_->m0_uniform_batches.empty(),
         "RW07 native submission profile cannot be abandoned");
   }
   if (strict_ownership) {
@@ -1159,7 +1159,8 @@ Status WebGpuExecutionProvider::OnRunStart(const onnxruntime::RunOptions& run_op
         !recording_->command_encoder&&!recording_->compute_pass_encoder&&
         !recording_->has_unsubmitted_work.load(std::memory_order_relaxed)&&
         !recording_->num_pending_dispatches&&recording_->deferred_dispatches.empty()&&
-        !recording_->m0_queued_scheduled_products&&!recording_->m0_queued_reference_bytes){
+        !recording_->m0_unchecked_dispatches&&!recording_->m0_queued_scheduled_products&&!recording_->m0_queued_reference_bytes&&
+        recording_->m0_retained_queue_buffers.empty()){
       if(!context_.M0EndBoundedSubmissionsV1())context_.M0OwnershipV2().Poison();
     }
     try { LOGS_DEFAULT(INFO) << "M0_RW07_RUN_START_ROLLBACK context_poisoned=" << context_.M0OwnershipV2().Poisoned(); }

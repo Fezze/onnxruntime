@@ -8,6 +8,8 @@
 #include "core/providers/webgpu/webgpu_kernel.h"
 #include "core/providers/webgpu/tensor/m0_fullgpu_signal_programs_v1.h"
 #include "core/providers/webgpu/tensor/m0_fullgpu_residual_stages_v1.h"
+#include "core/providers/webgpu/tensor/m0_fullgpu_implicit_gemm_v1.h"
+#include "core/providers/webgpu/tensor/transpose.h"
 #include "core/providers/webgpu/tensor/m0_fullgpu_recurrence_programs_v3.h"
 #include "core/providers/webgpu/tensor/m0_fullgpu_duration_programs_v5.h"
 #include "core/providers/webgpu/tensor/m0_fullgpu_polar_after1573_v1_programs.h"
@@ -90,7 +92,7 @@ class SignalProgramProbe final : public WebGpuKernel {
  public:
   explicit SignalProgramProbe(const OpKernelInfo& info)
       : WebGpuKernel{info}, stage_(info.GetAttrOrDefault<int64_t>("stage",0)),
-        reuse_(info.GetAttrOrDefault<int64_t>("reuse_coefficients",1)) {}
+        reuse_(info.GetAttrOrDefault<int64_t>("reuse_coefficients",1)),dilation_(info.GetAttrOrDefault<int64_t>("probe_dilation",1)) {}
   Status ComputeInternal(ComputeContext& c) const override {
     // Every genuine Session has an epoch. Ordinary test sessions have no active
     // strict Run; native initialization/execution has a nonzero Run identity.
@@ -98,7 +100,7 @@ class SignalProgramProbe final : public WebGpuKernel {
     ORT_RETURN_IF_NOT(c.KernelContext().M0FullGpuExtentOwnerEpochV1()!=0&&
                           c.KernelContext().M0FullGpuExtentRunIdV2()==0,
                       "M0_PROGRAM_PROBE_REQUIRES_ISOLATED_SESSION");
-    ORT_RETURN_IF_NOT((stage_==1||stage_==2||stage_==3||stage_==5||stage_==6||stage_==7||stage_==8)&&(reuse_==0||reuse_==1||(stage_==6&&(reuse_==2||reuse_==3))),"M0_PROGRAM_PROBE_STAGE");
+    ORT_RETURN_IF_NOT((stage_==1||stage_==2||stage_==3||stage_==5||stage_==6||stage_==7||stage_==8||stage_==9||stage_==10)&&(reuse_==0||reuse_==1||(stage_==6&&reuse_>=2&&reuse_<=5)),"M0_PROGRAM_PROBE_STAGE");
     const auto* x=c.Input<Tensor>(0);const auto* e=c.Input<Tensor>(1);
     const auto& limits=c.DeviceLimits();
     const auto storage=[&](const Tensor* tensor){
@@ -158,6 +160,23 @@ class SignalProgramProbe final : public WebGpuKernel {
       uint32_t planned_channels=0;
       ORT_RETURN_IF_ERROR(m0_residual_stages::ResidualTileChannels(c,capacity,capacity,channels,planned_channels,true));
       ORT_RETURN_IF_NOT(planned_channels==channels,"M0_RESIDUAL_PROBE_FULL_ADMITTED_ACTIVATION_TILE");
+      if(reuse_>=4){
+        ORT_RETURN_IF_NOT(dilation_>=1&&dilation_<=5,"M0_IMPLICIT_PROBE_DILATION");
+        auto args=c.CreateGPUTensor(DataTypeImpl::GetType<uint32_t>(),TensorShape{3});
+        uint64_t dispatches=0;const uint32_t tile=reuse_==5?std::max(1u,channels/2):channels;
+        const uint32_t output_tile=reuse_==5?channels-1:channels;
+        for(uint32_t offset=0;offset<channels;offset+=tile)for(uint32_t out=0;out<channels;out+=output_tile){
+          const uint32_t count=std::min(tile,channels-offset),rows=std::min(output_tile,channels-out);
+          const m0_residual_stages::ResidualConvSpecV1 spec{capacity,capacity,channels,1u,capacity,1u,0u,kernel,uint32_t(dilation_),capacity,
+              offset,count,out,rows,words};
+          const auto input=ProgramInput::FloatBufferWindow(x,ProgramTensorMetadataDependency::None,TensorShape{1,count,capacity},offset*capacity,limits.minStorageBufferOffsetAlignment);
+          const auto skip=ProgramInput::FloatBufferWindow(x,ProgramTensorMetadataDependency::None,TensorShape{1,rows,capacity},out*capacity,limits.minStorageBufferOffsetAlignment);
+          const auto result=ProgramOutput::FloatBufferWindow(output,ProgramTensorMetadataDependency::None,TensorShape{1,rows,capacity},out*capacity,limits.minStorageBufferOffsetAlignment);
+          ORT_RETURN_IF_ERROR(m0_implicit_gemm::Run(c,input,result,e,weight,bias,&args,spec,dispatches,
+              reuse_==5?&skip:nullptr,0,0,0,offset+count==channels&&out+rows==channels));
+        }
+        return Status::OK();
+      }
       const uint64_t elements=m0_residual_stages::ResidualPackedElementsV1(planned_channels,kernel);
       auto columns=c.CreateGPUTensor(x->DataType(),TensorShape{int64_t(elements)});
       auto flags=c.CreateGPUTensor(DataTypeImpl::GetType<uint32_t>(),TensorShape{int64_t(m0_residual_stages::ResidualPackedFlagCapacityV1(elements))});
@@ -168,6 +187,45 @@ class SignalProgramProbe final : public WebGpuKernel {
       uint64_t dispatches=0;
       return m0_residual_stages::RunResidualConvolutionV1(c,{x,ProgramTensorMetadataDependency::None},
           {output,ProgramTensorMetadataDependency::None},e,weight,bias,&columns,&flags,spec,dispatches,true,reuse_==2?128u:reuse_==3?0u:reuse_?64u:32u,&weights,&args);
+    }
+    if(stage_==9){
+      const auto* coefficients=c.Input<Tensor>(2);
+      ORT_RETURN_IF_NOT(x->Shape().NumDimensions()==3&&x->Shape()[0]==1&&storage(coefficients)&&
+          coefficients->Shape()==TensorShape({x->Shape()[1],6}),"M0_ACTIVE_NORM_PROBE_INPUT");
+      const uint32_t channels=uint32_t(x->Shape()[1]),capacity=uint32_t(x->Shape()[2]);
+      auto* y=c.Output(0,x->Shape());c.FillZero(*y);
+      auto args=c.CreateGPUTensor(DataTypeImpl::GetType<uint32_t>(),TensorShape{3});
+      const uint32_t work=m0_residual_stages::kNormAffineWorkPerElementV1+m0_residual_stages::kSnakeWorkPerElementV1;
+      const uint64_t physical=uint64_t(channels)*capacity;
+      const uint32_t chunk=reuse_?uint32_t((uint64_t(capacity)+63)/64*64):
+          uint32_t(std::min<uint64_t>(kM0ScheduledProductsPerWindowV1/work,uint64_t(limits.maxComputeWorkgroupsPerDimension)*64)/64*64);
+      for(uint64_t first=0;first<physical;first+=chunk){
+        const uint32_t count=uint32_t(std::min<uint64_t>(chunk,physical-first));
+        const m0_residual_stages::ResidualConvSpecV1 spec{capacity,capacity,channels,1u,capacity,1u,0u,3u,1u,capacity,0u,channels,0u,channels,words};
+        m0_residual_stages::ResidualPointwiseGridV2 grid;
+        grid.AddInput({e,ProgramTensorMetadataDependency::None}).AddOutput({&args,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(1).SetDispatchGroupSize(1);
+        spec.Apply(grid,0,0,uint32_t(first),count);ORT_RETURN_IF_ERROR(c.RunProgram(grid));
+        m0_residual_stages::GeneratorNormAffine norm(true,true);
+        norm.AddInputs({{x,ProgramTensorMetadataDependency::None},{e,ProgramTensorMetadataDependency::None},{coefficients,ProgramTensorMetadataDependency::None}})
+            .AddOutput({y,ProgramTensorMetadataDependency::None}).SetWorkgroupSize(64).SetIndirectDispatchTensor(&args)
+            .AddUniformVariables({capacity,capacity,channels,1u,capacity,1u,0u,3u,1u,capacity,0u,channels,channels,uint32_t(first),count,words});
+        ORT_RETURN_IF_ERROR(c.RunProgram(norm,uint64_t((count+63)/64)*64*work));
+      }
+      return Status::OK();
+    }
+    if(stage_==10){
+      const auto* weight=c.Input<Tensor>(2);const auto* bias=c.Input<Tensor>(3);
+      ORT_RETURN_IF_NOT(x->Shape().NumDimensions()==3&&x->Shape()[0]==1&&storage(weight)&&storage(bias)&&
+          weight->Shape().NumDimensions()==3&&weight->Shape()[0]==x->Shape()[1],"M0_IMPLICIT_UPSAMPLE_PROBE_INPUT");
+      const uint32_t stage=uint32_t(reuse_),stride=stage?6u:10u,source=uint32_t(x->Shape()[1]);
+      const uint32_t channels=uint32_t(weight->Shape()[1]),pc=uint32_t(x->Shape()[2]),oc=pc*stride+stage;
+      auto* y=c.Output(0,TensorShape{1,channels,oc});c.FillZero(*y);
+      auto transposed=c.CreateGPUTensor(weight->DataType(),TensorShape{channels,weight->Shape()[2],source});
+      const std::array<size_t,3> permutation{1,2,0};ORT_RETURN_IF_ERROR(Transpose::DoTranspose(c,permutation,*weight,transposed));
+      auto args=c.CreateGPUTensor(DataTypeImpl::GetType<uint32_t>(),TensorShape{3});
+      const m0_residual_stages::ResidualConvSpecV1 spec{pc,oc,channels,1u,oc,1u,0u,uint32_t(weight->Shape()[2]),1u,pc,0u,source,0u,channels,words};
+      uint64_t dispatches=0;return m0_implicit_gemm::Run(c,{x,ProgramTensorMetadataDependency::None},{y,ProgramTensorMetadataDependency::None},
+          e,&transposed,bias,&args,spec,dispatches,nullptr,1u,stage,source,true);
     }
     if(stage_==7){
       const auto* speed=c.Input<Tensor>(2);
@@ -284,7 +342,7 @@ class SignalProgramProbe final : public WebGpuKernel {
     return Status::OK();
   }
  private:
-  const int64_t stage_,reuse_;
+  const int64_t stage_,reuse_,dilation_;
 };
 }  // namespace
 KernelCreateInfo CreateM0QualificationSignalProgramProbeV1KernelInfo(){

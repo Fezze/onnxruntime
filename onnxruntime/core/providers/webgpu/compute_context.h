@@ -317,6 +317,16 @@ class ComputeContext final : public ComputeContextBase {
   //
   inline void FillZero(Tensor& dst) {
     auto& recording = ep_.Recording();
+    if(recording.m0_submission_budget_bytes){
+      const auto handle=reinterpret_cast<WGPUBuffer>(dst.MutableDataRaw());
+      if(M0BatchHeavyProgramsV1()){
+        const std::vector<webgpu::M0QueuedBufferBudgetV1::Reference> references{
+            {reinterpret_cast<uintptr_t>(handle),wgpuBufferGetSize(handle)}};
+        ORT_THROW_IF_ERROR(webgpu_context_.M0BeforeEnqueueUniqueV1(ep_.BufferManager(),recording,references));
+      }else{
+        ORT_THROW_IF_ERROR(webgpu_context_.M0BeforeEnqueueV1(ep_.BufferManager(),recording,wgpuBufferGetSize(handle)));
+      }
+    }
     ORT_THROW_IF_ERROR(webgpu_context_.EncodeDeferredDispatches(recording));
     webgpu_context_.EndComputePass(recording);
     auto& command_encoder = webgpu_context_.GetCommandEncoder(recording);
